@@ -1555,10 +1555,17 @@ static Tool g_tool = TOOL_SELECT;
 static bool g_spacePan = false;
 
 static int g_editLastLen = -1;   // auto-list callback: deletion detection across calls
+
+// The clicks that OPENED an editor (select shape → enter edit) must not chain
+// into imgui's double/triple-click detection inside it — otherwise the first
+// caret click counts as click #3 and select-line/select-word fire "randomly".
+static void break_click_chain() { ImGui::GetIO().MouseClickedTime[0] = -1e9; }
+
 static void begin_text_edit(uint64_t id, int caretIdx) {
     g_editText = id; g_editTextTakeFocus = true; g_editEverActive = false;
     g_editLastLen = -1;
     g_editCaretIdx = caretIdx;   // fresh caret every time — no selection carried over
+    break_click_chain();
     Shape* s = find_shape(id);
     g_editPrev = s ? s->text : std::string();
     g_editLabelArrow = 0;
@@ -2755,6 +2762,7 @@ static void CanvasFrame() {
                 g_editLabelArrow = g_downLeaf; g_editTextTakeFocus = true; g_editEverActive = false;
                 g_editCaretIdx = (int)leafS->label.size();   // caret at end, no stale selection
                 g_editPrev = leafS->label;
+                break_click_chain();
             } else if (g_downWasSelected && g_downTarget != g_downLeaf) {
                 // click again on a selected group → drill one level toward the leaf
                 std::vector<uint64_t> chain;   // leaf … outermost
