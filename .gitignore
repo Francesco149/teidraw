@@ -1,0 +1,10 @@
+# build outputs
+/build/
+/dist/*.exe
+
+# nix
+result
+result-*
+
+# local scratch boards / user data
+/scratch/
