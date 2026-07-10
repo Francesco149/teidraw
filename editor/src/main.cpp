@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <map>
 #include <fstream>
 #include <sstream>
 
@@ -39,6 +40,8 @@ using json = nlohmann::json;
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 #include "fonts_embedded.h"   // font_hand/font_sans/font_mono/font_serif (tools/embed.py)
 
@@ -651,6 +654,301 @@ static void reorder_selected(bool front) {
     else       { for (auto& s : moved) g_doc.shapes.push_back(s); for (auto& s : rest) g_doc.shapes.push_back(s); }
 }
 
+// ───────────────────────────── media / textures ────────────────────────────
+static HWND g_hwnd = nullptr;
+
+static std::wstring to_w(const std::string& s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring w(n > 0 ? n - 1 : 0, 0);
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+    return w;
+}
+static std::string from_w(const wchar_t* w) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? n - 1 : 0, 0);
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+struct Tex { ID3D11ShaderResourceView* srv = nullptr; int w = 0, h = 0; };
+static std::map<std::string, Tex> g_texCache;   // project-relative asset path → tex
+
+static ID3D11ShaderResourceView* make_rgba_srv(const unsigned char* px, int w, int h) {
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA sd = { px, (UINT)(w * 4), 0 };
+    ID3D11Texture2D* tex = nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&td, &sd, &tex))) return nullptr;
+    ID3D11ShaderResourceView* srv = nullptr;
+    g_dev->CreateShaderResourceView(tex, nullptr, &srv);
+    tex->Release();
+    return srv;
+}
+
+enum MediaKind { MK_STILL = 0, MK_GIF, MK_VIDEO };
+static std::string lower_ext(const std::string& p) {
+    size_t d = p.find_last_of('.');
+    std::string e = d == std::string::npos ? "" : p.substr(d + 1);
+    for (auto& c : e) c = (char)tolower((unsigned char)c);
+    return e;
+}
+static MediaKind media_kind(const std::string& p) {
+    std::string e = lower_ext(p);
+    if (e == "gif") return MK_GIF;
+    if (e == "mp4" || e == "mov" || e == "webm" || e == "mkv" || e == "avi" || e == "m4v") return MK_VIDEO;
+    return MK_STILL;
+}
+static bool is_media_ext(const std::string& p) {
+    std::string e = lower_ext(p);
+    static const char* ok[] = { "png","jpg","jpeg","bmp","tga","gif","mp4","mov","webm","mkv","avi","m4v", nullptr };
+    for (int i = 0; ok[i]; i++) if (e == ok[i]) return true;
+    return false;
+}
+
+static Tex* get_image_tex(const std::string& asset) {
+    auto it = g_texCache.find(asset);
+    if (it != g_texCache.end()) return &it->second;
+    Tex t;
+    std::string path = g_projDir + "/" + asset;
+    int w = 0, h = 0, n = 0;
+    unsigned char* px = stbi_load(path.c_str(), &w, &h, &n, 4);
+    if (px) { t.srv = make_rgba_srv(px, w, h); t.w = w; t.h = h; stbi_image_free(px); }
+    g_texCache[asset] = t;    // failures cached too — no per-frame retry spam
+    return &g_texCache[asset];
+}
+
+static bool file_exists(const std::string& p) { return GetFileAttributesW(to_w(p).c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+// Copy an external file into the project's assets/ (self-contained project
+// dirs: every board carries its own media). ASCII-sanitized destination names
+// so downstream ANSI file APIs (stb) never trip on unicode.
+static std::string import_asset_file(const std::string& srcPathUtf8) {
+    std::string base = srcPathUtf8;
+    size_t sl = base.find_last_of("/\\");
+    if (sl != std::string::npos) base = base.substr(sl + 1);
+    std::string stem = base, ext;
+    size_t d = base.find_last_of('.');
+    if (d != std::string::npos) { stem = base.substr(0, d); ext = base.substr(d); }
+    std::string clean;
+    for (char c : stem) clean += (isalnum((unsigned char)c) || c == '-' || c == '_') ? c : '-';
+    if (clean.empty()) clean = "asset";
+    std::string rel = "assets/" + clean + ext;
+    for (int i = 2; file_exists(g_projDir + "/" + rel); i++)
+        rel = "assets/" + clean + "-" + std::to_string(i) + ext;
+    if (!CopyFileW(to_w(srcPathUtf8).c_str(), to_w(g_projDir + "/" + rel).c_str(), TRUE))
+        return "";
+    return rel;
+}
+
+static std::string next_paste_name(const char* ext) {
+    for (int i = 1;; i++) {
+        std::string rel = "assets/paste-" + std::to_string(i) + ext;
+        if (!file_exists(g_projDir + "/" + rel)) return rel;
+    }
+}
+
+// Default display size: fit within a 480-world-unit box, never upscale.
+static ImVec2 default_display_size(int w, int h) {
+    if (w <= 0 || h <= 0) return ImVec2(320, 240);
+    float k = fminf(1.f, 480.f / (float)(w > h ? w : h));
+    return ImVec2(w * k, h * k);
+}
+
+static uint64_t create_image_shape(const std::string& rel, ImVec2 centerW) {
+    Tex* t = get_image_tex(rel);
+    Shape s; s.id = new_id(); s.type = SH_IMAGE; s.asset = rel;
+    s.size = default_display_size(t->w, t->h);
+    s.pos = centerW - s.size * 0.5f;
+    g_doc.shapes.push_back(s);
+    return s.id;
+}
+
+static uint64_t hit_test(ImVec2 w);   // fwd
+
+// Dropping media onto an existing image replaces its contents in place
+// (the sketch-evolves workflow: paste a rough image, replace it later).
+static void replace_image_contents(Shape& s, const std::string& rel) {
+    s.asset = rel;
+    Tex* t = get_image_tex(rel);
+    if (t->w > 0 && t->h > 0) {
+        // keep the frame's area + center, adopt the new aspect
+        float area = fmaxf(s.size.x * s.size.y, 1.f);
+        ImVec2 c = s.pos + s.size * 0.5f;
+        float aspect = (float)t->w / (float)t->h;
+        s.size.x = sqrtf(area * aspect);
+        s.size.y = s.size.x / aspect;
+        s.pos = c - s.size * 0.5f;
+    }
+}
+
+static void import_files_at(const std::vector<std::string>& paths, ImVec2 atW) {
+    ImVec2 cursor = atW;
+    bool any = false;
+    for (auto& p : paths) {
+        if (!is_media_ext(p)) continue;
+        std::string rel = import_asset_file(p);
+        if (rel.empty()) continue;
+        uint64_t hitId = paths.size() == 1 ? hit_test(atW) : 0;
+        Shape* hitS = find_shape(hitId);
+        if (hitS && hitS->type == SH_IMAGE && media_kind(rel) == MK_STILL) {
+            replace_image_contents(*hitS, rel);
+        } else {
+            uint64_t id = create_image_shape(rel, cursor);
+            g_sel.clear(); g_sel.push_back(id);
+            cursor = cursor + ImVec2(32.f / g_cam.zoom, 32.f / g_cam.zoom);
+        }
+        any = true;
+    }
+    if (any) push_undo();
+}
+
+// pending drop from WM_DROPFILES, processed inside the frame
+static std::vector<std::string> g_dropFiles;
+static ImVec2 g_dropPoint;
+
+// ── clipboard ──
+static UINT fmt_shapes() { static UINT f = RegisterClipboardFormatA("teidraw_shapes"); return f; }
+static UINT fmt_png()    { static UINT f = RegisterClipboardFormatA("PNG"); return f; }
+
+static void copy_selection_to_clipboard(bool cut) {
+    if (g_sel.empty()) return;
+    std::vector<uint64_t> all = g_sel;
+    for (auto id : g_sel) { Shape* s = find_shape(id); if (s && s->type == SH_GROUP) collect_members(id, all); }
+    json arr = json::array();
+    for (auto& s : g_doc.shapes) {   // doc order preserves z
+        for (auto id : all) if (id == s.id) { arr.push_back(shape_to_json(s)); break; }
+    }
+    std::string payload = arr.dump();
+    if (!OpenClipboard(g_hwnd)) return;
+    EmptyClipboard();
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, payload.size() + 1);
+    if (hg) {
+        memcpy(GlobalLock(hg), payload.c_str(), payload.size() + 1);
+        GlobalUnlock(hg);
+        SetClipboardData(fmt_shapes(), hg);
+    }
+    CloseClipboard();
+    if (cut) { delete_shapes(g_sel); push_undo(); }
+}
+
+static void paste_shapes_json(const std::string& payload, ImVec2 atW) {
+    json arr = json::parse(payload, nullptr, false);
+    if (arr.is_discarded() || !arr.is_array() || arr.empty()) return;
+    std::vector<Shape> in;
+    for (auto& js : arr) in.push_back(shape_from_json(js));
+    // center the batch on the paste point
+    WRect b; bool first = true;
+    for (auto& s : in) if (s.type != SH_GROUP) {
+        // bounds of foreign shapes: geometric fields only (no doc lookups for binds)
+        WRect r;
+        if (s.type == SH_ARROW) { r.mn = r.mx = s.a.p; r.include(s.b.p); }
+        else { r.mn = s.pos; r.mx = s.pos + (s.type == SH_IMAGE ? s.size : text_extent(s)); }
+        if (first) { b = r; first = false; } else b.include(r);
+    }
+    ImVec2 off = first ? ImVec2(0, 0) : atW - b.center();
+    std::vector<std::pair<uint64_t, uint64_t>> remap;
+    for (auto& s : in) { uint64_t old = s.id; s.id = new_id(); remap.push_back({ old, s.id }); }
+    auto remapped = [&](uint64_t old) -> uint64_t {
+        for (auto& r : remap) if (r.first == old) return r.second;
+        return 0;
+    };
+    g_sel.clear();
+    for (auto& s : in) {
+        if (s.parent) s.parent = remapped(s.parent);
+        if (s.type == SH_ARROW) {
+            auto fix = [&](ArrowEnd& e) {
+                if (e.bind) { uint64_t nb = remapped(e.bind); if (nb) { e.bind = nb; return; } e.bind = 0; }
+                e.p = e.p + off;
+            };
+            fix(s.a); fix(s.b);
+        } else s.pos = s.pos + off;
+        g_doc.shapes.push_back(s);
+        if (!s.parent) g_sel.push_back(s.id);
+    }
+    push_undo();
+}
+
+static void paste_clipboard(ImVec2 atW) {
+    if (!OpenClipboard(g_hwnd)) return;
+    bool done = false;
+
+    if (HANDLE h = GetClipboardData(fmt_shapes())) {           // 1) our own shapes
+        const char* p = (const char*)GlobalLock(h);
+        if (p) { std::string payload(p); GlobalUnlock(h); CloseClipboard(); paste_shapes_json(payload, atW); return; }
+    }
+    if (HANDLE h = GetClipboardData(fmt_png())) {              // 2) PNG bytes (browsers etc.)
+        void* p = GlobalLock(h);
+        SIZE_T n = GlobalSize(h);
+        if (p && n) {
+            std::string rel = next_paste_name(".png");
+            std::ofstream f(g_projDir + "/" + rel, std::ios::binary);
+            f.write((const char*)p, (std::streamsize)n); f.close();
+            GlobalUnlock(h);
+            uint64_t id = create_image_shape(rel, atW);
+            g_sel.clear(); g_sel.push_back(id);
+            push_undo(); done = true;
+        } else if (p) GlobalUnlock(h);
+    }
+    if (!done) if (HANDLE h = GetClipboardData(CF_DIB)) {      // 3) DIB → decode via stb (fake BMP header)
+        BITMAPINFOHEADER* bi = (BITMAPINFOHEADER*)GlobalLock(h);
+        if (bi) {
+            SIZE_T n = GlobalSize(h);
+            std::vector<unsigned char> bmp(14 + n);
+            bmp[0] = 'B'; bmp[1] = 'M';
+            uint32_t total = (uint32_t)(14 + n);
+            memcpy(&bmp[2], &total, 4);
+            uint32_t maskBytes = bi->biCompression == 3 /*BI_BITFIELDS*/ ? 12 : 0;
+            uint32_t pxOff = 14 + bi->biSize + maskBytes +
+                             (bi->biBitCount <= 8 ? (bi->biClrUsed ? bi->biClrUsed : (1u << bi->biBitCount)) * 4 : 0);
+            memcpy(&bmp[10], &pxOff, 4);
+            memcpy(&bmp[14], bi, n);
+            GlobalUnlock(h);
+            int w = 0, hh = 0, comp = 0;
+            unsigned char* px = stbi_load_from_memory(bmp.data(), (int)bmp.size(), &w, &hh, &comp, 4);
+            if (px) {
+                std::string rel = next_paste_name(".png");
+                stbi_write_png((g_projDir + "/" + rel).c_str(), w, hh, 4, px, w * 4);
+                stbi_image_free(px);
+                uint64_t id = create_image_shape(rel, atW);
+                g_sel.clear(); g_sel.push_back(id);
+                push_undo(); done = true;
+            }
+        }
+    }
+    if (!done) if (HANDLE h = GetClipboardData(CF_HDROP)) {    // 4) copied files
+        HDROP hd = (HDROP)h;
+        UINT n = DragQueryFileW(hd, 0xFFFFFFFF, nullptr, 0);
+        std::vector<std::string> paths;
+        for (UINT i = 0; i < n; i++) {
+            wchar_t buf[MAX_PATH * 2];
+            if (DragQueryFileW(hd, i, buf, MAX_PATH * 2)) paths.push_back(from_w(buf));
+        }
+        CloseClipboard();
+        import_files_at(paths, atW);
+        return;
+    }
+    if (!done) if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {   // 5) plain text → text shape
+        wchar_t* p = (wchar_t*)GlobalLock(h);
+        if (p) {
+            std::string txt = from_w(p);
+            GlobalUnlock(h);
+            // normalize CRLF
+            std::string t2; for (char c : txt) if (c != '\r') t2 += c;
+            if (!t2.empty()) {
+                Shape s; s.id = new_id(); s.type = SH_TEXT; s.text = t2;
+                ImVec2 e = text_extent(s);
+                s.pos = atW - e * 0.5f;
+                g_doc.shapes.push_back(s);
+                g_sel.clear(); g_sel.push_back(s.id);
+                push_undo();
+            }
+        }
+    }
+    CloseClipboard();
+}
+
 // ─────────────────────────────── hit testing ───────────────────────────────
 static float screen_px(float px) { return px / g_cam.zoom; }   // px → world units
 
@@ -1032,15 +1330,29 @@ static void CanvasFrame() {
     dl->AddRectFilled(vp->Pos, vp->Pos + vp->Size, g_th.canvasBg);
     DrawGrid(dl, vp->Size);
 
+    // files dropped from explorer land here (point captured at WM_DROPFILES)
+    if (!g_dropFiles.empty()) {
+        import_files_at(g_dropFiles, S2W(g_dropPoint));
+        g_dropFiles.clear();
+    }
+
     // ── draw shapes (doc order = z) ──
     for (auto& s : g_doc.shapes) {
         if (s.id == g_editText) continue;    // editor overlay draws it
         switch (s.type) {
         case SH_TEXT:  draw_text_shape(dl, s); break;
         case SH_ARROW: draw_arrow_shape(dl, s); break;
-        case SH_IMAGE: {   // placeholder until M2 media lands
-            WRect b = shape_bounds(s);
-            dl->AddRectFilled(W2S(b.mn), W2S(b.mx), IM_COL32(120, 120, 128, 60), 6.f);
+        case SH_IMAGE: {
+            ImVec2 mn = W2S(s.pos), mx = W2S(s.pos + s.size);
+            Tex* t = get_image_tex(s.asset);
+            if (t->srv) {
+                dl->AddImageRounded((ImTextureID)(intptr_t)t->srv, mn, mx,
+                                    ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, 5.f);
+            } else {
+                dl->AddRectFilled(mn, mx, IM_COL32(120, 120, 128, 50), 5.f);
+                dl->AddRect(mn, mx, IM_COL32(120, 120, 128, 120), 5.f);
+                dl->AddText(nullptr, 0.f, mn + ImVec2(10, 10), g_th.textDim, s.asset.c_str());
+            }
         } break;
         case SH_GROUP: break;
         }
@@ -1077,6 +1389,12 @@ static void CanvasFrame() {
             g_sel.clear(); for (auto& s : g_doc.shapes) if (!s.parent) g_sel.push_back(s.id);
         }
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D)) { duplicate_selected(); push_undo(); }
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C)) copy_selection_to_clipboard(false);
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X)) copy_selection_to_clipboard(true);
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V)) {
+            ImVec2 at = uiHot ? S2W(vp->Size * 0.5f) : S2W(io.MousePos);
+            paste_clipboard(at);
+        }
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G)) {
             if (io.KeyShift) ungroup_selected(); else group_selected();
             push_undo();
@@ -1325,6 +1643,17 @@ static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SYSCOMMAND:
         if ((w & 0xfff0) == SC_KEYMENU) return 0;   // no alt menu beep
         break;
+    case WM_DROPFILES: {
+        HDROP hd = (HDROP)w;
+        POINT pt; DragQueryPoint(hd, &pt);
+        g_dropPoint = ImVec2((float)pt.x, (float)pt.y);
+        UINT n = DragQueryFileW(hd, 0xFFFFFFFF, nullptr, 0);
+        for (UINT i = 0; i < n; i++) {
+            wchar_t buf[MAX_PATH * 2];
+            if (DragQueryFileW(hd, i, buf, MAX_PATH * 2)) g_dropFiles.push_back(from_w(buf));
+        }
+        DragFinish(hd);
+    } return 0;
     case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(h, m, w, l);
@@ -1347,6 +1676,8 @@ int main(int argc, char** argv) {
     HWND hwnd = CreateWindowW(L"teidraw", L"teidraw", WS_OVERLAPPEDWINDOW,
                               CW_USEDEFAULT, CW_USEDEFAULT, 1600, 1000, nullptr, nullptr, wc.hInstance, nullptr);
     if (!CreateDeviceD3D(hwnd)) { fprintf(stderr, "teidraw: D3D11 init failed\n"); return 1; }
+    g_hwnd = hwnd;
+    DragAcceptFiles(hwnd, TRUE);
     ShowWindow(hwnd, SW_SHOWMAXIMIZED);
     UpdateWindow(hwnd);
 
