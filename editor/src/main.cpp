@@ -274,9 +274,11 @@ struct Shape {
     int   tsize = kDefaultTextSize;
     float scale = 1.f;      // continuous scale from corner-resize (multiplies font px)
     ImVec2 pos{0, 0};       // text/image top-left (world)
-    // image / video (M2)
+    // image / video
     std::string asset;
     ImVec2 size{0, 0};
+    ImVec4 crop{0, 0, 1, 1};    // visible sub-rect of the source (u0,v0,u1,v1)
+    float loopA = -1, loopB = -1;   // video A-B loop points (seconds; -1 = unset)
     // arrow
     ArrowEnd a, b;
     float bend = 0.f;       // signed offset of the on-curve midpoint ⊥ to the chord
@@ -418,6 +420,10 @@ static json shape_to_json(const Shape& s) {
     case SH_IMAGE:
         j["asset"] = s.asset; j["x"] = s.pos.x; j["y"] = s.pos.y;
         j["w"] = s.size.x; j["h"] = s.size.y;
+        if (s.crop.x != 0 || s.crop.y != 0 || s.crop.z != 1 || s.crop.w != 1)
+            j["crop"] = { s.crop.x, s.crop.y, s.crop.z, s.crop.w };
+        if (s.loopA >= 0) j["loopA"] = s.loopA;
+        if (s.loopB >= 0) j["loopB"] = s.loopB;
         break;
     case SH_ARROW: {
         auto end = [](const ArrowEnd& e) {
@@ -448,6 +454,10 @@ static Shape shape_from_json(const json& j) {
         s.asset = j.value("asset", std::string());
         s.pos = ImVec2(j.value("x", 0.f), j.value("y", 0.f));
         s.size = ImVec2(j.value("w", 0.f), j.value("h", 0.f));
+        if (j.contains("crop") && j["crop"].is_array() && j["crop"].size() == 4)
+            s.crop = ImVec4(j["crop"][0], j["crop"][1], j["crop"][2], j["crop"][3]);
+        s.loopA = j.value("loopA", -1.f);
+        s.loopB = j.value("loopB", -1.f);
         break;
     case SH_ARROW: {
         auto end = [](const json& k) {
@@ -772,15 +782,34 @@ static uint64_t hit_test(ImVec2 w);   // fwd
 static void replace_image_contents(Shape& s, const std::string& rel) {
     s.asset = rel;
     Tex* t = get_image_tex(rel);
-    if (t->w > 0 && t->h > 0) {
+    if (t->w <= 0 || t->h <= 0) return;
+    bool wasCropped = s.crop.x != 0 || s.crop.y != 0 || s.crop.z != 1 || s.crop.w != 1;
+    float ia = (float)t->w / (float)t->h;
+    if (wasCropped) {
+        // the frame was deliberate: keep it exactly, cover-crop the new image
+        // into it (centered), which also guarantees the crop stays in bounds
+        float fa = s.size.x / fmaxf(s.size.y, 0.001f);
+        if (ia > fa) { float cw = fa / ia; s.crop = ImVec4(0.5f - cw * 0.5f, 0, 0.5f + cw * 0.5f, 1); }
+        else         { float ch = ia / fa; s.crop = ImVec4(0, 0.5f - ch * 0.5f, 1, 0.5f + ch * 0.5f); }
+    } else {
         // keep the frame's area + center, adopt the new aspect
         float area = fmaxf(s.size.x * s.size.y, 1.f);
         ImVec2 c = s.pos + s.size * 0.5f;
-        float aspect = (float)t->w / (float)t->h;
-        s.size.x = sqrtf(area * aspect);
-        s.size.y = s.size.x / aspect;
+        s.size.x = sqrtf(area * ia);
+        s.size.y = s.size.x / ia;
         s.pos = c - s.size * 0.5f;
+        s.crop = ImVec4(0, 0, 1, 1);
     }
+    s.loopA = s.loopB = -1;
+}
+
+// The (world) rect the FULL source image projects to, given the current
+// display rect + crop window. Fixed while a crop drag is in progress.
+static WRect image_full_rect(const Shape& s) {
+    ImVec2 cs(fmaxf(s.crop.z - s.crop.x, 0.001f), fmaxf(s.crop.w - s.crop.y, 0.001f));
+    ImVec2 fsz(s.size.x / cs.x, s.size.y / cs.y);
+    ImVec2 fpos(s.pos.x - fsz.x * s.crop.x, s.pos.y - fsz.y * s.crop.y);
+    return { fpos, fpos + fsz };
 }
 
 static void import_files_at(const std::vector<std::string>& paths, ImVec2 atW) {
@@ -1049,7 +1078,7 @@ static void draw_arrow_shape(ImDrawList* dl, const Shape& s, bool ghostEnd = fal
 }
 
 // ─────────────────────────── canvas interaction ────────────────────────────
-enum DragMode { DM_NONE = 0, DM_PENDING, DM_MOVE, DM_MARQUEE, DM_HANDLE,
+enum DragMode { DM_NONE = 0, DM_PENDING, DM_MOVE, DM_MARQUEE, DM_HANDLE, DM_CROP,
                 DM_ARROW_A, DM_ARROW_B, DM_BEND, DM_NEW_ARROW, DM_PAN_R };
 static DragMode g_drag = DM_NONE;
 static ImVec2   g_dragStartW, g_dragStartS;    // world/screen at mousedown
@@ -1229,6 +1258,17 @@ static void DrawContextMenu() {
         if (haveGroup && ImGui::MenuItem("ungroup", "Ctrl+Shift+G")) { ungroup_selected(); push_undo(); }
         if (ImGui::MenuItem("bring to front", "]")) { reorder_selected(true); push_undo(); }
         if (ImGui::MenuItem("send to back", "[")) { reorder_selected(false); push_undo(); }
+        bool haveCrop = false;
+        for (auto id : g_sel) { Shape* s = find_shape(id);
+            if (s && s->type == SH_IMAGE && (s->crop.x != 0 || s->crop.y != 0 || s->crop.z != 1 || s->crop.w != 1)) haveCrop = true; }
+        if (haveCrop && ImGui::MenuItem("reset crop")) {
+            for (auto id : g_sel) { Shape* s = find_shape(id);
+                if (!s || s->type != SH_IMAGE) continue;
+                WRect F = image_full_rect(*s);
+                s->pos = F.mn; s->size = F.size(); s->crop = ImVec4(0, 0, 1, 1);
+            }
+            push_undo();
+        }
         if (haveText) {
             ImGui::Separator();
             if (ImGui::BeginMenu("font")) {
@@ -1347,7 +1387,8 @@ static void CanvasFrame() {
             Tex* t = get_image_tex(s.asset);
             if (t->srv) {
                 dl->AddImageRounded((ImTextureID)(intptr_t)t->srv, mn, mx,
-                                    ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, 5.f);
+                                    ImVec2(s.crop.x, s.crop.y), ImVec2(s.crop.z, s.crop.w),
+                                    IM_COL32_WHITE, 5.f);
             } else {
                 dl->AddRectFilled(mn, mx, IM_COL32(120, 120, 128, 50), 5.f);
                 dl->AddRect(mn, mx, IM_COL32(120, 120, 128, 120), 5.f);
@@ -1459,6 +1500,16 @@ static void CanvasFrame() {
                 if (vlen(io.MousePos - agz.pb) < r) { g_drag = DM_ARROW_B; goto down_done; }
                 if (vlen(io.MousePos - agz.mid) < r) { g_drag = DM_BEND; goto down_done; }
             }
+            if (hoverHandle >= 0 && io.KeyCtrl && g_sel.size() == 1) {
+                // ctrl+corner on a single image = crop
+                Shape* s = find_shape(g_sel[0]);
+                if (s && s->type == SH_IMAGE) {
+                    g_drag = DM_CROP; g_handleIdx = hoverHandle;
+                    g_handleStartShapes.clear();
+                    g_handleStartShapes.push_back({ s->id, *s });
+                    goto down_done;
+                }
+            }
             if (hoverHandle >= 0) {
                 g_drag = DM_HANDLE; g_handleIdx = hoverHandle;
                 g_handleStartBounds = selection_bounds();
@@ -1548,6 +1599,33 @@ static void CanvasFrame() {
         ImGui::SetMouseCursor(g_handleIdx % 2 == 0 ? ImGuiMouseCursor_ResizeNWSE : ImGuiMouseCursor_ResizeNESW);
     }
 
+    if (g_drag == DM_CROP && !g_handleStartShapes.empty()) {
+        Shape* s = find_shape(g_handleStartShapes[0].first);
+        const Shape& snap = g_handleStartShapes[0].second;
+        if (s) {
+            WRect F = image_full_rect(snap);   // full-image projection stays fixed
+            // ghost: the whole source at low alpha, crop region drawn normally after
+            Tex* t = get_image_tex(s->asset);
+            if (t->srv)
+                dl->AddImage((ImTextureID)(intptr_t)t->srv, W2S(F.mn), W2S(F.mx),
+                             ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, 80));
+            dl->AddRect(W2S(F.mn), W2S(F.mx), g_th.selStroke, 0, 0, 1.f);
+            // drag the grabbed corner of the display rect, clamped inside F
+            ImVec2 mn = snap.pos, mx = snap.pos + snap.size;
+            ImVec2 p(fminf(fmaxf(mw.x, F.mn.x), F.mx.x), fminf(fmaxf(mw.y, F.mn.y), F.mx.y));
+            float minSz = 8.f;
+            if (g_handleIdx == 0)      { mn.x = fminf(p.x, mx.x - minSz); mn.y = fminf(p.y, mx.y - minSz); }
+            else if (g_handleIdx == 1) { mx.x = fmaxf(p.x, mn.x + minSz); mn.y = fminf(p.y, mx.y - minSz); }
+            else if (g_handleIdx == 2) { mx.x = fmaxf(p.x, mn.x + minSz); mx.y = fmaxf(p.y, mn.y + minSz); }
+            else                       { mn.x = fminf(p.x, mx.x - minSz); mx.y = fmaxf(p.y, mn.y + minSz); }
+            s->pos = mn; s->size = mx - mn;
+            ImVec2 fsz = F.size();
+            s->crop = ImVec4((mn.x - F.mn.x) / fsz.x, (mn.y - F.mn.y) / fsz.y,
+                             (mx.x - F.mn.x) / fsz.x, (mx.y - F.mn.y) / fsz.y);
+            ImGui::SetMouseCursor(g_handleIdx % 2 == 0 ? ImGuiMouseCursor_ResizeNWSE : ImGuiMouseCursor_ResizeNESW);
+        }
+    }
+
     if (g_drag == DM_ARROW_A || g_drag == DM_ARROW_B || g_drag == DM_NEW_ARROW || g_drag == DM_BEND) {
         Shape* s = find_shape(g_drag == DM_NEW_ARROW ? g_newArrowId : (g_sel.empty() ? 0 : g_sel[0]));
         if (s && s->type == SH_ARROW) {
@@ -1611,8 +1689,8 @@ static void CanvasFrame() {
             g_lastClickTime = now; g_lastClickPos = io.MousePos; g_lastClickLeaf = g_downLeaf;
         }
 
-        if (g_drag == DM_MOVE || g_drag == DM_HANDLE || g_drag == DM_ARROW_A ||
-            g_drag == DM_ARROW_B || g_drag == DM_BEND)
+        if (g_drag == DM_MOVE || g_drag == DM_HANDLE || g_drag == DM_CROP ||
+            g_drag == DM_ARROW_A || g_drag == DM_ARROW_B || g_drag == DM_BEND)
             push_undo();
 
         if (g_drag == DM_NEW_ARROW) {
