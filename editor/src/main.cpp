@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <fstream>
 #include <sstream>
 
@@ -334,6 +335,7 @@ struct Doc {
 static Doc g_doc;
 static std::string g_projDir;    // project dir (board.json + assets/ + undo.jsonl)
 
+static void delete_shapes(const std::vector<uint64_t>& ids);   // fwd (load-time sanitize)
 static Shape* find_shape(uint64_t id) {
     if (!id) return nullptr;
     for (auto& s : g_doc.shapes) if (s.id == id) return &s;
@@ -587,6 +589,28 @@ static bool doc_from_json_string(const std::string& str, bool restoreCam) {
     Doc d; d.nextId = j.value("nextId", 1ULL);
     for (auto& js : j.value("shapes", json::array())) d.shapes.push_back(shape_from_json(js));
     g_doc = std::move(d);
+    // ── sanitize ──
+    // External edits or old bugs can leave a stale nextId (→ the app then
+    // mints DUPLICATE ids: find_shape resolves the wrong shape, selections go
+    // haywire) or invisible whitespace-only texts that marquees can catch.
+    // Repair here so no session inherits the damage.
+    for (auto& s : g_doc.shapes) if (s.id >= g_doc.nextId) g_doc.nextId = s.id + 1;
+    {
+        std::set<uint64_t> seen;
+        for (auto& s : g_doc.shapes) {
+            if (seen.count(s.id)) s.id = g_doc.nextId++;   // keep the first; later dupe gets a fresh id
+            else seen.insert(s.id);
+        }
+    }
+    {
+        std::vector<uint64_t> dead;
+        for (auto& s : g_doc.shapes) if (s.type == SH_TEXT && s.id != g_editText) {
+            bool empty = true;
+            for (char c : s.text) if (!isspace((unsigned char)c)) { empty = false; break; }
+            if (empty) dead.push_back(s.id);
+        }
+        if (!dead.empty()) delete_shapes(dead);
+    }
     // legacy boards predating stored group rotation: derive the frame once
     // from a uniform member rotation, so later per-child edits can't lose it
     for (auto& s : g_doc.shapes) if (s.type == SH_GROUP && s.rot == 0.f) {
