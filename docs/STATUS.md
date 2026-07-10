@@ -1,39 +1,22 @@
 # STATUS — live front
 
-*Updated: 2026-07-10 (session 2)*
+*Updated: 2026-07-10 (end of session 3). History lives in `git log` — this
+file only describes NOW.*
 
 ## Where things stand
-M0+M1+M2 landed and `--shot`-verified: the app is a working whiteboard —
-text/arrows/images/gifs/videos/groups, smart selection, crop, clipboard,
-autosave + cross-session undo, dark/light, flip-model low-latency swapchain.
-Single TU, builds clean (no warnings) with the flake toolchain.
-Session 2 (after first hands-on pass, "UX is solid"): fixed text-tool clicks
-instantly committing the empty editor (focus-frame race); click semantics are
-now select-first / edit-on-second-click; added **rotation** (drag the ring
-just outside a corner handle, shift = 15° steps) across render/bounds/hit/
-gizmos/crop/arrow-anchors, groups rotate about the selection center.
-Session 3: arrows stay **rigid under rotation** (trim now tests the target's
-OBB in its local frame — the rotated AABB used to bulge and eat the line);
-marquee selects on **partial overlap**; **auto lists** in the text editor
-("- "/"* " → "• ", Enter continues bullets and increments "12. " numbering,
-Enter on an empty item ends the list — bullet glyph verified in all 4 fonts);
-**rotated text edits in place**: the pointer is inverse-rotated into the
-editor's local space each frame (canvas input suspended meanwhile) and the
-editor's draw output (glyphs/caret/selection) is rotated back + clip rects
-opened, so the shape never snaps straight while editing.
-Session 3b: backspace on an empty list item deletes the marker AND joins the
-previous line (deletion detected via buffer-length tracking in the edit
-callback); fixed the one-line-short editor box after Enter (CalcTextSize
-drops a trailing empty line → transient scrollbar) + scrollbar hidden in the
-overlay; the selection box turns rigidly during multi-selection rotation
-(corners captured at gesture start) instead of re-fitting a bulging AABB;
-**zoom commands** Shift+1 fit / Shift+2 selection / Shift+0 100%, all flying
-the camera with a 180 ms ease-out (log-zoom lerp; any wheel/pan cancels).
-Session 3c: selection-box heuristic — if every rotatable leaf in a selection
-(or group) shares one nonzero rotation, the box renders as an OBB in that
-shared frame (fit in the rotated frame, rotated back; arrows tag along), so
-rotated groups keep their tilt when re-selected instead of snapping to an
-axis-aligned AABB. Groups don't store rotation; it's derived from members.
+The app is a daily-drivable whiteboard, hands-on tested by the user ("UX is
+solid", "feels good"): text / arrows / images / gifs / videos / groups, smart
+selection (group drill, select-then-edit text), rotation everywhere (ring
+outside the corner handles, shift = 15° steps; groups store a persistent
+frame; rotated text edits in place via pointer remap + draw-output rotation),
+crop with ghost, marquee on partial overlap, auto bullet/numbered lists with
+backspace-join, clipboard in/out, autosave + cross-session undo, dark/light,
+**style panel** (12 theme-aware palette indices · S/M/L/XL = 24/40/56/80 with
+M default · text align L/C/R · opacity 5–100%), zoom commands (Shift+1 fit /
+Shift+2 selection / Shift+0 100%) flying an ease-in-out-quart 0.28s camera
+(context-menu toggle, persisted), flip-model low-latency swapchain. Board
+format **v2** (v1 tsize indices migrate at load); loads sanitize duplicate
+ids / stale nextId / empty texts. Single TU, builds warning-free.
 
 ## Build & verify
 ```
@@ -41,29 +24,27 @@ nix develop --command make -C editor            # build/teidraw.exe
 ./build/teidraw.exe scratch                     # interactive on the Win host
 ./build/teidraw.exe scratch --shot build/s.png --frames 8   # headless verify
 ```
-`scratch/` currently holds a demo board exercising every shape type
-(text families/sizes, bound+curved+labeled arrows, group, image w/ crop,
-mp4, gif).
+`scratch/` is the user's live test board — do NOT script-edit it (and NEVER
+write nextId from a script; the load-time sanitizer exists because that
+minted duplicate ids once). Use a throwaway dir under the scratchpad for
+render tests.
 
 ## NEXT TASK → M3 (docs/ROADMAP.md)
-Suggested order:
-1. **LLM export** — copy-as-PNG (clipboard CF_DIB/PNG of board or selection,
-   plus `--export out.png` CLI rendering the board bounds offscreen) and a
-   text outline dump (`--export-txt` / context menu "copy as text").
-2. Board picker + global settings (%APPDATA%), undo-limit option.
-3. Snapping guides + nudge keys + shift axis-lock.
+1. **LLM export** — copy-as-PNG (clipboard, board or selection; plus
+   `--export out.png` CLI rendering board bounds offscreen) and a text
+   outline dump (`--export-txt` / context menu "copy as text").
+2. Board picker + global settings file (%APPDATA%), undo-limit option.
+3. Snapping guides + arrow-key nudge + shift axis-lock drag.
 
 ## Known rough edges / to keep in mind
-- While editing a rotated text, clicks on OTHER ui (toolbar etc.) route with
-  the remapped pointer — mostly they just commit the edit; harmless but noted.
-- The rotated-editor draw-output rotation reaches into the InputTextMultiline
-  child window (`FindWindowByName("<win>/##t")` + vertex transform + clip-rect
-  patch) — re-verify if the imgui pin ever moves.
-- Default board dir is `./scratch` relative to cwd — double-clicking the exe
-  on Windows creates it next to the exe; fine until the board picker lands.
-- Video overlay steals canvas input while visible (by design via imgui
-  hover); check it doesn't fight the move-drag on small videos.
+- While editing a rotated text, clicks on other UI route with the remapped
+  pointer — they mostly just commit the edit; harmless but noted.
+- The rotated-editor trick reaches into the InputTextMultiline child window
+  (`FindWindowByName("<win>/##t")` + vertex transform + clip-rect patch) —
+  re-verify if the imgui pin (1.92.4) ever moves.
+- Text align affects committed rendering only; the edit overlay is
+  left-aligned while typing.
+- Default board dir is `./scratch` relative to cwd; fine until the picker.
 - Escape-while-crop-dragging commits instead of canceling.
-- No audio on videos yet (M4).
-- imgui deprecation horizon: dynamic-font API is 1.92-stable; if bumping the
-  pin, re-check `PushFont(font, px)` + backend `RendererHasTextures`.
+- No audio on videos yet (M4). Faux bold is double-strike, not a real weight
+  (real SemiBold statics would be the upgrade if it ever looks mushy).

@@ -214,16 +214,57 @@ static void ApplyTheme() {
     c[ImGuiCol_HeaderActive]   = v4(g_th.accent); c[ImGuiCol_HeaderActive].w = 0.35f;
 }
 
+// ── ink palette ──
+// 12 slots, tuned per theme so a violet reads as violet on both backgrounds.
+// Slot 0 = the theme's default ink. Shapes store the INDEX, not the color, so
+// boards restyle themselves when the theme flips.
+static const ImU32 kPaletteDark[12] = {
+    0,                              // 0: theme ink (resolved at draw)
+    IM_COL32(148, 152, 162, 255),   // grey
+    IM_COL32(196, 154, 108, 255),   // brown
+    IM_COL32(178, 132, 255, 255),   // violet
+    IM_COL32( 96, 146, 255, 255),   // blue
+    IM_COL32( 84, 196, 236, 255),   // cyan
+    IM_COL32( 52, 211, 153, 255),   // green
+    IM_COL32(163, 230,  53, 255),   // lime
+    IM_COL32(250, 204,  21, 255),   // yellow
+    IM_COL32(251, 146,  60, 255),   // orange
+    IM_COL32(248, 113, 113, 255),   // red
+    IM_COL32(244, 114, 182, 255),   // pink
+};
+static const ImU32 kPaletteLight[12] = {
+    0,
+    IM_COL32(107, 114, 128, 255),
+    IM_COL32(146, 105,  60, 255),
+    IM_COL32(124,  58, 237, 255),
+    IM_COL32( 37,  99, 235, 255),
+    IM_COL32(  8, 145, 178, 255),
+    IM_COL32(  5, 150, 105, 255),
+    IM_COL32(101, 163,  13, 255),
+    IM_COL32(202, 138,   4, 255),
+    IM_COL32(234,  88,  12, 255),
+    IM_COL32(220,  38,  38, 255),
+    IM_COL32(219,  39, 119, 255),
+};
+static ImU32 palette_color(int idx) {
+    if (idx <= 0 || idx >= 12) return g_th.textMain;
+    return (g_darkMode ? kPaletteDark : kPaletteLight)[idx];
+}
+static ImU32 with_opacity(ImU32 c, float op) {
+    int a = (int)((c >> 24) * (op < 0 ? 0 : op > 1 ? 1 : op));
+    return (c & 0x00FFFFFF) | ((ImU32)a << 24);
+}
+
 // ───────────────────────────────── fonts ───────────────────────────────────
 // Four families, dynamic atlas (imgui ≥1.92): glyphs rasterize on demand at
 // whatever pixel size we push, so canvas text is crisp at every zoom level.
 enum FontFamily { FF_HAND = 0, FF_SANS, FF_MONO, FF_SERIF, FF_COUNT };
 static ImFont* g_fonts[FF_COUNT] = {};
 static const char* kFamilyName[FF_COUNT] = { "hand", "sans", "mono", "serif" };
-// four canvas text sizes, big-by-default (L) per the main use case
-static const float kTextSizes[4] = { 20.f, 28.f, 40.f, 56.f };
+// four canvas text sizes, big-by-default (M = the old L) per the main use case
+static const float kTextSizes[4] = { 24.f, 40.f, 56.f, 80.f };
 static const char* kTextSizeName[4] = { "S", "M", "L", "XL" };
-static const int   kDefaultTextSize = 2;   // L
+static const int   kDefaultTextSize = 1;   // M (40px)
 // Glyphs above this rasterized px size get drawn as scaled-up smaller glyphs
 // (keeps the dynamic atlas from ballooning when zoomed way in).
 static const float kMaxGlyphPx = 320.f;
@@ -231,6 +272,7 @@ static const float kMaxGlyphPx = 320.f;
 static void LoadFonts() {
     ImGuiIO& io = ImGui::GetIO();
     ImFontConfig cfg; cfg.FontDataOwnedByAtlas = false;
+    cfg.RasterizerMultiply = 1.35f;   // heavier coverage — reads bolder everywhere
     struct { const unsigned char* data; unsigned int len; const char* name; } specs[FF_COUNT] = {
         { font_hand,  font_hand_len,  "hand"  },
         { font_sans,  font_sans_len,  "sans"  },
@@ -267,15 +309,18 @@ static void ZoomAt(ImVec2 pivot, float factor) {
     g_cam.zoom = z;
 }
 
+static bool g_zoomAnim_fwd();   // g_zoomAnim lives with the doc state below
 static void start_cam_anim(ImVec2 pan1, float z1) {
+    if (!g_zoomAnim_fwd()) { g_cam.pan = pan1; g_cam.zoom = z1; g_camAnim.active = false; return; }
     g_camAnim = { true, ImGui::GetTime(), g_cam.pan, pan1, g_cam.zoom, z1 };
 }
 static void tick_cam_anim() {
     if (!g_camAnim.active) return;
-    const float dur = 0.18f;
+    const float dur = 0.28f;
     float u = (float)((ImGui::GetTime() - g_camAnim.t0) / dur);
     if (u >= 1.f) { u = 1.f; g_camAnim.active = false; }
-    float e = 1.f - powf(1.f - u, 3.f);   // ease-out cubic
+    // ease-in-out quart: gentle start, gentle landing — no snap at either end
+    float e = u < 0.5f ? 8.f * u * u * u * u : 1.f - powf(-2.f * u + 2.f, 4.f) * 0.5f;
     g_cam.zoom = expf(logf(g_camAnim.z0) + (logf(g_camAnim.z1) - logf(g_camAnim.z0)) * e);
     g_cam.pan = g_camAnim.pan0 + (g_camAnim.pan1 - g_camAnim.pan0) * e;
 }
@@ -310,7 +355,10 @@ struct Shape {
     uint64_t id = 0;
     ShapeType type = SH_TEXT;
     uint64_t parent = 0;    // enclosing group id (0 = top level)
+    int   col = 0;          // palette index (0 = theme default ink)
+    float opacity = 1.f;
     // text
+    int   align = 0;        // 0 left · 1 center · 2 right
     std::string text;
     int   family = FF_HAND;
     int   tsize = kDefaultTextSize;
@@ -502,12 +550,15 @@ static json shape_to_json(const Shape& s) {
     json j;
     j["id"] = s.id; j["type"] = (int)s.type;
     if (s.parent) j["parent"] = s.parent;
+    if (s.col) j["col"] = s.col;
+    if (s.opacity != 1.f) j["op"] = s.opacity;
     switch (s.type) {
     case SH_TEXT:
         j["text"] = s.text; j["family"] = s.family; j["tsize"] = s.tsize;
         if (s.scale != 1.f) j["scale"] = s.scale;
         j["x"] = s.pos.x; j["y"] = s.pos.y;
         if (s.rot != 0.f) j["rot"] = s.rot;
+        if (s.align) j["algn"] = s.align;
         break;
     case SH_IMAGE:
         j["asset"] = s.asset; j["x"] = s.pos.x; j["y"] = s.pos.y;
@@ -538,6 +589,9 @@ static Shape shape_from_json(const json& j) {
     Shape s;
     s.id = j.value("id", 0ULL); s.type = (ShapeType)j.value("type", 0);
     s.parent = j.value("parent", 0ULL);
+    s.col = j.value("col", 0);
+    s.opacity = j.value("op", 1.f);
+    s.align = j.value("algn", 0);
     switch (s.type) {
     case SH_TEXT:
         s.text = j.value("text", std::string());
@@ -574,9 +628,12 @@ static Shape shape_from_json(const json& j) {
     }
     return s;
 }
+static bool g_zoomAnim = true;   // eased camera flights for the zoom commands
+static bool g_zoomAnim_fwd() { return g_zoomAnim; }
 static std::string doc_to_json_string() {
     json j;
-    j["v"] = 1; j["nextId"] = g_doc.nextId; j["dark"] = g_darkMode;
+    j["v"] = 2; j["nextId"] = g_doc.nextId; j["dark"] = g_darkMode;
+    j["zoomAnim"] = g_zoomAnim;
     j["cam"] = { {"x", g_cam.pan.x}, {"y", g_cam.pan.y}, {"z", g_cam.zoom} };
     json arr = json::array();
     for (auto& s : g_doc.shapes) arr.push_back(shape_to_json(s));
@@ -589,6 +646,11 @@ static bool doc_from_json_string(const std::string& str, bool restoreCam) {
     Doc d; d.nextId = j.value("nextId", 1ULL);
     for (auto& js : j.value("shapes", json::array())) d.shapes.push_back(shape_from_json(js));
     g_doc = std::move(d);
+    // v1 → v2: the size ladder moved up one notch (old L=40px is the new M);
+    // shift stored indices so every text keeps its pixel size
+    if (j.value("v", 1) < 2)
+        for (auto& s : g_doc.shapes)
+            if (s.type == SH_TEXT && s.tsize > 0) s.tsize--;
     // ── sanitize ──
     // External edits or old bugs can leave a stale nextId (→ the app then
     // mints DUPLICATE ids: find_shape resolves the wrong shape, selections go
@@ -622,6 +684,7 @@ static bool doc_from_json_string(const std::string& str, bool restoreCam) {
         g_cam.zoom = j["cam"].value("z", 1.f);
     }
     if (j.contains("dark") && restoreCam) { g_darkMode = j["dark"]; }
+    if (restoreCam) g_zoomAnim = j.value("zoomAnim", true);
     // drop selection entries that no longer exist
     std::vector<uint64_t> keep;
     for (auto id : g_sel) if (find_shape(id)) keep.push_back(id);
@@ -1359,21 +1422,45 @@ static uint64_t resolve_target(uint64_t leaf) {
 // ─────────────────────────────── rendering ─────────────────────────────────
 static float g_dpi = 1.f;
 
+static ImU32 shape_ink(const Shape& s) { return with_opacity(palette_color(s.col), s.opacity); }
+
+// double-strike faux bold: second pass offset a fraction of the glyph size
+static void add_text_bold(ImDrawList* dl, ImFont* f, float px, ImVec2 p, ImU32 col,
+                          const char* b, const char* e = nullptr) {
+    dl->AddText(f, px, p, col, b, e);
+    dl->AddText(f, px, ImVec2(p.x + px * 0.03f, p.y), col, b, e);
+}
+
 static void draw_text_shape(ImDrawList* dl, const Shape& s) {
     float px = text_px(s) * g_cam.zoom;
     ImVec2 sp = W2S(s.pos);
-    ImU32 col = g_th.textMain;
+    ImU32 col = shape_ink(s);
+    ImFont* f = g_fonts[s.family];
+    float rp = fminf(px, kMaxGlyphPx);   // raster size; geometry scales the rest
+    float k = px / rp;
     int vtx0 = dl->VtxBuffer.Size;
-    if (px <= kMaxGlyphPx) {
-        dl->AddText(g_fonts[s.family], px, sp, col, s.text.c_str());
-    } else {
-        // zoomed way in: draw at capped raster size, scale geometry up
-        float k = px / kMaxGlyphPx;
-        dl->AddText(g_fonts[s.family], kMaxGlyphPx, ImVec2(0, 0), col, s.text.c_str());
-        for (int i = vtx0; i < dl->VtxBuffer.Size; i++) {
-            ImDrawVert& v = dl->VtxBuffer[i];
-            v.pos.x = v.pos.x * k + sp.x; v.pos.y = v.pos.y * k + sp.y;
+    // draw line by line at the origin so alignment offsets are easy, then
+    // scale+translate (and rotate) the whole vertex range into place
+    ImGui::PushFont(f, rp);
+    float totalW = ImGui::CalcTextSize(s.text.c_str()).x;
+    const char* b = s.text.c_str();
+    const char* end = b + s.text.size();
+    float y = 0;
+    while (b < end) {
+        const char* e = (const char*)memchr(b, '\n', end - b);
+        if (!e) e = end;
+        if (e > b) {
+            float w = ImGui::CalcTextSize(b, e).x;
+            float x = s.align == 1 ? (totalW - w) * 0.5f : s.align == 2 ? (totalW - w) : 0.f;
+            add_text_bold(dl, f, rp, ImVec2(x, y), col, b, e);
         }
+        y += rp;
+        b = e < end ? e + 1 : end;
+    }
+    ImGui::PopFont();
+    for (int i = vtx0; i < dl->VtxBuffer.Size; i++) {
+        ImDrawVert& v = dl->VtxBuffer[i];
+        v.pos.x = v.pos.x * k + sp.x; v.pos.y = v.pos.y * k + sp.y;
     }
     if (s.rot != 0.f) {
         ImVec2 c = W2S(shape_local_rect(s).center());
@@ -1390,15 +1477,15 @@ static void draw_text_shape(ImDrawList* dl, const Shape& s) {
 static void draw_arrow_shape(ImDrawList* dl, const Shape& s, bool ghostEnd = false) {
     std::vector<ImVec2> pl; arrow_polyline(s, pl);
     if (pl.size() < 2) return;
-    float thick = fmaxf(2.f * g_cam.zoom, 1.2f);
-    ImU32 col = g_th.textMain;
+    float thick = fmaxf(2.75f * g_cam.zoom, 1.7f);
+    ImU32 col = shape_ink(s);
     std::vector<ImVec2> sp(pl.size());
     for (size_t i = 0; i < pl.size(); i++) sp[i] = W2S(pl[i]);
     // reserve room at the tip for the head
     ImVec2 tip = sp.back();
     ImVec2 dir = sp[sp.size() - 1] - sp[sp.size() - 2];
     float dl2 = vlen(dir); if (dl2 > 0.0001f) dir = dir * (1.f / dl2);
-    float head = fminf(fmaxf(10.f * g_cam.zoom, 8.f), 26.f);
+    float head = fminf(fmaxf(11.f * g_cam.zoom, 9.f), 28.f);
     // shorten polyline by head length
     float remain = head * 0.8f;
     while (sp.size() > 1 && remain > 0) {
@@ -1420,7 +1507,7 @@ static void draw_arrow_shape(ImDrawList* dl, const Shape& s, bool ghostEnd = fal
         ImVec2 pad(6.f * g_cam.zoom, 3.f * g_cam.zoom);
         ImVec2 mn = mid - ext * 0.5f - pad, mx = mid + ext * 0.5f + pad;
         dl->AddRectFilled(mn, mx, g_th.canvasBg, 4.f * g_cam.zoom);
-        dl->AddText(g_fonts[s.family], lpx, mid - ext * 0.5f, g_th.textMain, s.label.c_str());
+        add_text_bold(dl, g_fonts[s.family], lpx, mid - ext * 0.5f, col, s.label.c_str());
     }
 }
 
@@ -1474,9 +1561,29 @@ static void end_text_edit(bool commit) {
     g_editText = 0;
 }
 
+// the "current style": what the style panel shows with nothing selected, and
+// what new shapes are born with (tldraw behavior)
+static int   g_curCol = 0, g_curSize = kDefaultTextSize, g_curAlign = 0;
+static float g_curOpacity = 1.f;
+
+// run fn over every non-group shape in the selection (descending into groups);
+// returns whether anything was touched
+template <typename F>
+static bool apply_to_selection(F fn) {
+    if (g_sel.empty()) return false;
+    std::vector<uint64_t> all = g_sel;
+    for (auto id : g_sel) { Shape* s = find_shape(id); if (s && s->type == SH_GROUP) collect_members(id, all); }
+    bool any = false;
+    for (auto id : all) {
+        Shape* s = find_shape(id);
+        if (s && s->type != SH_GROUP) { fn(*s); any = true; }
+    }
+    return any;
+}
+
 static uint64_t create_text_at(ImVec2 w) {
     Shape s; s.id = new_id(); s.type = SH_TEXT; s.pos = w;
-    s.tsize = kDefaultTextSize;
+    s.tsize = g_curSize; s.col = g_curCol; s.align = g_curAlign; s.opacity = g_curOpacity;
     // place so the caret sits at the click (top-left minus half a line feels right)
     s.pos.y -= kTextSizes[s.tsize] * 0.5f;
     g_doc.shapes.push_back(s);
@@ -1682,6 +1789,102 @@ static void DrawZoomPill() {
     ImGui::End();
 }
 
+// ── style panel (top right): palette · text size · align · opacity ──
+// With a selection it restyles it; always updates the current style that new
+// shapes are born with.
+static void DrawStylePanel() {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->Size.x - 16.f, 16.f), ImGuiCond_Always, ImVec2(1.f, 0.f));
+    ImGui::Begin("##style", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+
+    // panel reflects the first styleable selected shape, else the defaults
+    int curCol = g_curCol, curSize = g_curSize, curAlign = g_curAlign;
+    float curOp = g_curOpacity;
+    bool haveText = g_sel.empty();   // no selection → size/align rows always shown
+    for (auto id : g_sel) {
+        std::vector<uint64_t> all{ id };
+        Shape* g = find_shape(id);
+        if (g && g->type == SH_GROUP) collect_members(id, all);
+        for (auto mid : all) {
+            Shape* s = find_shape(mid);
+            if (!s || s->type == SH_GROUP) continue;
+            curCol = s->col; curOp = s->opacity;
+            if (s->type == SH_TEXT) { curSize = s->tsize; curAlign = s->align; haveText = true; }
+            goto found;
+        }
+    }
+found:;
+    for (auto id : g_sel) { Shape* s = find_shape(id); if (s && s->type == SH_TEXT) haveText = true; }
+
+    ImDrawList* wdl = ImGui::GetWindowDrawList();
+    const float cell = 24.f;
+    for (int i = 0; i < 12; i++) {
+        if (i % 6) ImGui::SameLine(0.f, 4.f);
+        char bid[16]; snprintf(bid, sizeof bid, "##col%d", i);
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        bool clicked = ImGui::InvisibleButton(bid, ImVec2(cell, cell));
+        ImVec2 c = p + ImVec2(cell * 0.5f, cell * 0.5f);
+        wdl->AddCircleFilled(c, 8.f, i == 0 ? g_th.textMain : palette_color(i));
+        if (i == curCol) wdl->AddCircle(c, 10.5f, g_th.accent, 0, 2.f);
+        else if (ImGui::IsItemHovered()) wdl->AddCircle(c, 10.5f, g_th.textDim, 0, 1.5f);
+        if (clicked) {
+            g_curCol = i;
+            if (apply_to_selection([&](Shape& s) { if (s.type != SH_IMAGE) s.col = i; })) push_undo();
+        }
+    }
+
+    if (haveText) {
+        for (int z = 0; z < 4; z++) {
+            if (z) ImGui::SameLine(0.f, 4.f);
+            bool active = (curSize == z);
+            if (active) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImGui::ColorConvertU32ToFloat4(g_th.accent));
+                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, 255));
+            }
+            char lbl[16]; snprintf(lbl, sizeof lbl, "%s##ts%d", kTextSizeName[z], z);
+            if (ImGui::Button(lbl, ImVec2(38, 24))) {
+                g_curSize = z;
+                if (apply_to_selection([&](Shape& s) { if (s.type == SH_TEXT) { s.tsize = z; s.scale = 1.f; } })) push_undo();
+            }
+            if (active) ImGui::PopStyleColor(2);
+        }
+        // align: three little line-stacks (left / center / right)
+        for (int a = 0; a < 3; a++) {
+            if (a) ImGui::SameLine(0.f, 4.f);
+            char bid[16]; snprintf(bid, sizeof bid, "##al%d", a);
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            bool clicked = ImGui::InvisibleButton(bid, ImVec2(52.f, 24.f));
+            bool active = (curAlign == a);
+            if (active || ImGui::IsItemHovered())
+                wdl->AddRectFilled(p, p + ImVec2(52, 24), active ? with_opacity(g_th.accent, 0.9f)
+                                                                 : IM_COL32(128, 128, 128, 40), 5.f);
+            ImU32 lc = active ? IM_COL32(255, 255, 255, 255) : g_th.textDim;
+            float ws[3] = { 30.f, 20.f, 26.f };
+            for (int L = 0; L < 3; L++) {
+                float y = p.y + 6.f + L * 6.f;
+                float x = a == 0 ? p.x + 11.f : a == 1 ? p.x + 26.f - ws[L] * 0.5f : p.x + 41.f - ws[L];
+                wdl->AddRectFilled(ImVec2(x, y), ImVec2(x + ws[L], y + 2.5f), lc, 1.f);
+            }
+            if (clicked) {
+                g_curAlign = a;
+                if (apply_to_selection([&](Shape& s) { if (s.type == SH_TEXT) s.align = a; })) push_undo();
+            }
+        }
+    }
+
+    float op = curOp * 100.f;
+    ImGui::SetNextItemWidth(6 * cell + 5 * 4.f);
+    if (ImGui::SliderFloat("##opacity", &op, 5.f, 100.f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp)) {
+        g_curOpacity = op / 100.f;
+        apply_to_selection([&](Shape& s) { s.opacity = g_curOpacity; });
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) push_undo();
+
+    ImGui::End();
+}
+
 // right-click context menu; content adapts to what's under/selected
 static ImVec2 g_ctxWorldPos;
 static void DrawContextMenu() {
@@ -1748,6 +1951,9 @@ static void DrawContextMenu() {
         ImGui::Separator();
         if (ImGui::MenuItem(g_darkMode ? "light mode" : "dark mode", "Ctrl+Shift+D")) {
             g_darkMode = !g_darkMode; ApplyTheme(); g_saveDueAt = ImGui::GetTime() + 0.4;
+        }
+        if (ImGui::MenuItem("zoom animation", nullptr, g_zoomAnim)) {
+            g_zoomAnim = !g_zoomAnim; g_saveDueAt = ImGui::GetTime() + 0.4;
         }
     }
     ImGui::EndPopup();
@@ -1956,6 +2162,7 @@ static void DrawTextEditOverlay() {
     ImGui::SetNextWindowPos(winPos - ImVec2(8, 8));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(shape_ink(*s)));
     ImGui::PushStyleColor(ImGuiCol_FrameBg, isLabel ? ImGui::ColorConvertU32ToFloat4(g_th.canvasBg) : ImVec4(0, 0, 0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 8));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
@@ -2001,7 +2208,7 @@ static void DrawTextEditOverlay() {
     // focus takes a frame to land: never evaluate commit conditions before the
     // item has actually been active, or the creating click kills the editor
     bool deactivated = g_editEverActive && ImGui::IsItemDeactivated();
-    if (!g_editEverActive) { g_editPrev = *str; ImGui::End(); ImGui::PopStyleVar(3); ImGui::PopStyleColor(3); ImGui::PopFont(); return; }
+    if (!g_editEverActive) { g_editPrev = *str; ImGui::End(); ImGui::PopStyleVar(3); ImGui::PopStyleColor(4); ImGui::PopFont(); return; }
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         // imgui's escape reverts the buffer to its value at activation; we want
         // escape = commit-what-you-see, so restore last frame's text
@@ -2017,7 +2224,7 @@ static void DrawTextEditOverlay() {
     }
     ImGui::End();
     ImGui::PopStyleVar(3);
-    ImGui::PopStyleColor(3);
+    ImGui::PopStyleColor(4);
     ImGui::PopFont();
 }
 
@@ -2053,16 +2260,17 @@ static void CanvasFrame() {
 #ifdef TEI_LIBAV
             else srv = video_srv(s, mk);
 #endif
+            ImU32 tint = with_opacity(IM_COL32_WHITE, s.opacity);
             if (srv && s.rot == 0.f) {
                 dl->AddImageRounded((ImTextureID)(intptr_t)srv, mn, mx,
                                     ImVec2(s.crop.x, s.crop.y), ImVec2(s.crop.z, s.crop.w),
-                                    IM_COL32_WHITE, 5.f);
+                                    tint, 5.f);
             } else if (srv) {
                 ImVec2 c[4]; shape_obb(s, c);
                 ImVec2 sc[4]; for (int i = 0; i < 4; i++) sc[i] = W2S(c[i]);
                 dl->AddImageQuad((ImTextureID)(intptr_t)srv, sc[0], sc[1], sc[2], sc[3],
                                  ImVec2(s.crop.x, s.crop.y), ImVec2(s.crop.z, s.crop.y),
-                                 ImVec2(s.crop.z, s.crop.w), ImVec2(s.crop.x, s.crop.w));
+                                 ImVec2(s.crop.z, s.crop.w), ImVec2(s.crop.x, s.crop.w), tint);
             } else {
                 dl->AddRectFilled(mn, mx, IM_COL32(120, 120, 128, 50), 5.f);
                 dl->AddRect(mn, mx, IM_COL32(120, 120, 128, 120), 5.f);
@@ -2177,6 +2385,7 @@ static void CanvasFrame() {
             g_drag = DM_NONE;
         } else if (g_tool == TOOL_ARROW) {
             Shape s; s.id = new_id(); s.type = SH_ARROW;
+            s.col = g_curCol; s.opacity = g_curOpacity;
             try_bind(s.a, mw, s.id); s.b.p = mw;
             g_doc.shapes.push_back(s);
             g_newArrowId = s.id;
@@ -2536,6 +2745,7 @@ int main(int argc, char** argv) {
         DrawVideoOverlay();
         DrawTextEditOverlay();
         DrawToolbar();
+        DrawStylePanel();
         DrawZoomPill();
         sweep_play_states();
 
