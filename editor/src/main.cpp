@@ -2162,10 +2162,16 @@ static int TextEditCallback(ImGuiInputTextCallbackData* d) {
 static std::vector<float> g_editLineDx;        // per-line x offsets, committed layout
 static bool  g_editShiftActive = false;
 static float g_editShiftTopY = 0.f, g_editShiftPx = 1.f;
-// Align-while-editing (per-line vertex shift + pointer remap) is OFF: the
-// remap caused phantom drag-selections (user report). Stretch goal — revisit
-// after the M3 LLM export; the bold strike + rotation WYSIWYG stay on.
+// WYSIWYG-transform editing is OFF (both parts): any pre-frame pointer remap
+// (per-line align shift AND the rotation remap) makes imgui's InputText see
+// jittering coordinates while the button is held → phantom drag-selections
+// (user reports, confirmed rotation-only after the align revert). Rotated
+// text edits axis-aligned as a placeholder. The real fix is a custom
+// stb_textedit-based editor that owns its hit-testing — scoped for later,
+// after the M3 LLM export. The draw-side transforms below are proven and
+// stay for that future editor.
 static const bool kWysiwygAlignEdit = false;
+static const bool kWysiwygRotEdit = false;
 
 // map a canvas click to a byte offset in the shape's text (committed layout:
 // alignment + list-pinning + rotation aware) so the editor opens with the
@@ -2247,7 +2253,7 @@ static void DrawTextEditOverlay() {
         anchor = W2S(pl.empty() ? arrow_end_pos(s->a) : pl[pl.size() / 2]);
     } else anchor = W2S(s->pos);
 
-    bool rotated = !isLabel && s->rot != 0.f;
+    bool rotated = !isLabel && s->rot != 0.f && kWysiwygRotEdit;
     ImVec2 rotC = W2S(shape_local_rect(*s).center());   // rotation pivot (screen)
     float  rotA = s->rot;
 
@@ -2899,7 +2905,7 @@ int main(int argc, char** argv) {
         if (g_editText) {
             Shape* es = find_shape(g_editText);
             if (es) {
-                if (es->rot != 0.f) {
+                if (es->rot != 0.f && kWysiwygRotEdit) {
                     ImVec2 c = W2S(shape_local_rect(*es).center());
                     io.MousePos = rot_about(io.MousePos, c, -es->rot);
                     g_editRemap = true;
