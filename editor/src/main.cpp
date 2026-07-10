@@ -528,6 +528,7 @@ static uint64_t g_editText = 0;     // text shape being edited
 static bool     g_editTextTakeFocus = false;
 static bool     g_editEverActive = false;   // editor item has held focus at least once
 static bool     g_editRemap = false;        // pointer is remapped into a rotated editor's local space
+static int      g_editCaretIdx = -1;        // byte offset to force the caret to on open (-1 = leave alone)
 static std::string g_editPrev;      // last-frame text (escape-revert workaround)
 static uint64_t g_editLabelArrow = 0;   // arrow whose label is being edited
 
@@ -1554,9 +1555,10 @@ static Tool g_tool = TOOL_SELECT;
 static bool g_spacePan = false;
 
 static int g_editLastLen = -1;   // auto-list callback: deletion detection across calls
-static void begin_text_edit(uint64_t id) {
+static void begin_text_edit(uint64_t id, int caretIdx) {
     g_editText = id; g_editTextTakeFocus = true; g_editEverActive = false;
     g_editLastLen = -1;
+    g_editCaretIdx = caretIdx;   // fresh caret every time — no selection carried over
     Shape* s = find_shape(id);
     g_editPrev = s ? s->text : std::string();
     g_editLabelArrow = 0;
@@ -2153,6 +2155,50 @@ static int TextEditCallback(ImGuiInputTextCallbackData* d) {
 static std::vector<float> g_editLineDx;        // per-line x offsets, committed layout
 static bool  g_editShiftActive = false;
 static float g_editShiftTopY = 0.f, g_editShiftPx = 1.f;
+// Align-while-editing (per-line vertex shift + pointer remap) is OFF: the
+// remap caused phantom drag-selections (user report). Stretch goal — revisit
+// after the M3 LLM export; the bold strike + rotation WYSIWYG stay on.
+static const bool kWysiwygAlignEdit = false;
+
+// map a canvas click to a byte offset in the shape's text (committed layout:
+// alignment + list-pinning + rotation aware) so the editor opens with the
+// caret exactly under the mouse
+static int caret_index_from_click(const Shape& s, ImVec2 clickW) {
+    if (s.text.empty()) return 0;
+    WRect lr = shape_local_rect(s);
+    ImVec2 p = s.rot != 0.f ? rot_about(clickW, lr.center(), -s.rot) : clickW;
+    float lh = text_px(s);
+    ImGui::PushFont(g_fonts[s.family], lh);
+    float totalW = ImGui::CalcTextSize(s.text.c_str()).x;
+    const char* base = s.text.c_str();
+    const char* end = base + s.text.size();
+    int line = (int)floorf((p.y - lr.mn.y) / lh);
+    const char* b = base;
+    for (int li = 0; li < line; li++) {
+        const char* nl = (const char*)memchr(b, '\n', end - b);
+        if (!nl) break;
+        b = nl + 1;
+    }
+    const char* e = (const char*)memchr(b, '\n', end - b);
+    if (!e) e = end;
+    float dx = 0.f;
+    if (s.align && !is_list_line(b, e)) {
+        float w = ImGui::CalcTextSize(b, e).x;
+        dx = s.align == 1 ? (totalW - w) * 0.5f : (totalW - w);
+    }
+    float x = (p.x - lr.mn.x) - dx;
+    const char* c = b;
+    while (c < e) {   // nearest inter-character boundary wins
+        int cl = (*c & 0x80) == 0 ? 1 : (*c & 0xE0) == 0xC0 ? 2 : (*c & 0xF0) == 0xE0 ? 3 : 4;
+        const char* n = (c + cl > e) ? e : c + cl;
+        float w0 = ImGui::CalcTextSize(b, c).x;
+        float w1 = ImGui::CalcTextSize(b, n).x;
+        if (x < (w0 + w1) * 0.5f) break;
+        c = n;
+    }
+    ImGui::PopFont();
+    return (int)(c - base);
+}
 
 static void edit_line_offsets(const std::string& text, ImFont* f, float px, int align, std::vector<float>& out) {
     out.clear();
@@ -2226,9 +2272,25 @@ static void DrawTextEditOverlay() {
     // the editor's finished vertices (glyphs, caret, selection quads shift
     // with their line)  3) everything rotated into place for rotated shapes.
     // The pointer was remapped inversely before NewFrame (main loop).
+    // force the caret to the opening click (also guarantees no selection is
+    // carried over from a previous edit of any shape — same widget id)
+    if (g_editCaretIdx >= 0) {
+        if (ImGuiInputTextState* st = ImGui::GetInputTextState(ImGui::GetItemID())) {
+            // STB_TexteditState's public head (cursor/select_start/select_end
+            // are its first members); the full type isn't visible outside
+            // imgui_widgets.cpp, so poke it through a mirror of that head
+            struct StbHead { int cursor, select_start, select_end; };
+            StbHead* stb = reinterpret_cast<StbHead*>(st->Stb);
+            int ci = g_editCaretIdx > (int)str->size() ? (int)str->size() : g_editCaretIdx;
+            stb->cursor = stb->select_start = stb->select_end = ci;
+            st->CursorFollow = true;
+            st->CursorAnimReset();
+            g_editCaretIdx = -1;   // state exists ⇒ item is live; consumed
+        }
+    }
     ImVec2 itemMin = ImGui::GetItemRectMin();
     ImU32 ink = shape_ink(*s);
-    if (!isLabel) edit_line_offsets(*str, font, px, s->align, g_editLineDx);
+    if (!isLabel && kWysiwygAlignEdit) edit_line_offsets(*str, font, px, s->align, g_editLineDx);
     else g_editLineDx.clear();
     int nLines = (int)g_editLineDx.size();
     bool anyShift = false;
@@ -2475,7 +2537,7 @@ static void CanvasFrame() {
         if (g_tool == TOOL_TEXT) {
             uint64_t id = create_text_at(mw);
             g_sel.clear(); g_sel.push_back(id);
-            begin_text_edit(id);
+            begin_text_edit(id, 0);
             g_tool = TOOL_SELECT;
             g_drag = DM_NONE;
         } else if (g_tool == TOOL_ARROW) {
@@ -2691,6 +2753,7 @@ static void CanvasFrame() {
                 // double-click arrow → edit its label
                 g_sel.clear(); g_sel.push_back(g_downLeaf);
                 g_editLabelArrow = g_downLeaf; g_editTextTakeFocus = true; g_editEverActive = false;
+                g_editCaretIdx = (int)leafS->label.size();   // caret at end, no stale selection
                 g_editPrev = leafS->label;
             } else if (g_downWasSelected && g_downTarget != g_downLeaf) {
                 // click again on a selected group → drill one level toward the leaf
@@ -2705,8 +2768,8 @@ static void CanvasFrame() {
                     }
             } else if (leafS && leafS->type == SH_TEXT && g_downTarget == g_downLeaf &&
                        g_downWasSelected && g_sel.size() == 1) {
-                // click on already-selected text → edit (first click only selects)
-                begin_text_edit(g_downLeaf);
+                // click on already-selected text → edit, caret under the click
+                begin_text_edit(g_downLeaf, caret_index_from_click(*leafS, mw));
             } else {
                 g_sel.clear(); g_sel.push_back(g_downTarget);
             }

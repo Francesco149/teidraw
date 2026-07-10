@@ -40,12 +40,16 @@ render tests.
 - While editing a remapped text (rotated OR center/right-aligned multiline),
   clicks on other UI route with the remapped pointer — they mostly just
   commit the edit; harmless but noted.
-- **Editing is fully WYSIWYG** (bold strike + per-line align offsets +
-  rotation applied to the editor's finished vertices; pointer inverse-mapped
-  per line pre-NewFrame). Surveyed 2026-07: NO off-the-shelf imgui rich-text
-  editor exists (only code editors: ImGuiColorTextEdit / ImTextEdit), so this
-  in-house transform IS the approach. If the user reports jank, the agreed
-  fallback = left-aligned editing: make edit_line_offsets fill zeros.
+- Editing WYSIWYG: bold strike + rotation are ON; **per-line align-while-
+  editing is OFF** (`kWysiwygAlignEdit=false`) — its pointer remap caused
+  phantom drag-selections (user report 2026-07-11). STRETCH GOAL, revisit
+  AFTER the M3 LLM export: likely needs the remap applied inside the widget's
+  hit-testing rather than globally pre-frame, or the custom stb_textedit
+  editor. Surveyed 2026-07: NO off-the-shelf imgui rich-text editor exists
+  (only code editors: ImGuiColorTextEdit / ImTextEdit) — in-house is the way.
+- Editors always open with the caret at the click (caret_index_from_click →
+  ImGuiInputTextState public-head poke) and never inherit a previous edit's
+  selection. If the caret ever lands off by a char, suspect that mapping.
 - The editor transforms reach into the InputTextMultiline child window
   (`FindWindowByName("<win>/##t")` + per-quad vertex shifts + clip-rect
   patch) — re-verify if the imgui pin (1.92.4) ever moves.
