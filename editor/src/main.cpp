@@ -349,6 +349,22 @@ static void collect_members(uint64_t gid, std::vector<uint64_t>& out) {
         if (s.parent == gid) { out.push_back(s.id); if (s.type == SH_GROUP) collect_members(s.id, out); }
 }
 
+// do all rotatable members of a group share one rotation? (used to seed a new
+// group's frame and to migrate legacy boards to stored group rotation)
+static bool members_common_rot(uint64_t gid, float* out) {
+    std::vector<uint64_t> m; collect_members(gid, m);
+    bool any = false; float r = 0;
+    for (auto id : m) {
+        Shape* c = find_shape(id);
+        if (!c || (c->type != SH_TEXT && c->type != SH_IMAGE)) continue;
+        if (!any) { r = c->rot; any = true; }
+        else if (fabsf(c->rot - r) > 0.001f) return false;
+    }
+    if (!any) return false;
+    *out = r;
+    return true;
+}
+
 // ── shape geometry ──
 static float text_px(const Shape& s) { return kTextSizes[s.tsize] * s.scale; }
 
@@ -510,7 +526,9 @@ static json shape_to_json(const Shape& s) {
         if (s.bend != 0.f) j["bend"] = s.bend;
         if (!s.label.empty()) j["label"] = s.label;
     } break;
-    case SH_GROUP: break;
+    case SH_GROUP:
+        if (s.rot != 0.f) j["rot"] = s.rot;   // the group's persistent frame
+        break;
     }
     return j;
 }
@@ -548,7 +566,9 @@ static Shape shape_from_json(const json& j) {
         s.bend = j.value("bend", 0.f);
         s.label = j.value("label", std::string());
     } break;
-    case SH_GROUP: break;
+    case SH_GROUP:
+        s.rot = j.value("rot", 0.f);
+        break;
     }
     return s;
 }
@@ -567,6 +587,12 @@ static bool doc_from_json_string(const std::string& str, bool restoreCam) {
     Doc d; d.nextId = j.value("nextId", 1ULL);
     for (auto& js : j.value("shapes", json::array())) d.shapes.push_back(shape_from_json(js));
     g_doc = std::move(d);
+    // legacy boards predating stored group rotation: derive the frame once
+    // from a uniform member rotation, so later per-child edits can't lose it
+    for (auto& s : g_doc.shapes) if (s.type == SH_GROUP && s.rot == 0.f) {
+        float r;
+        if (members_common_rot(s.id, &r) && fabsf(r) > 0.0001f) s.rot = r;
+    }
     if (restoreCam && j.contains("cam")) {
         g_cam.pan = ImVec2(j["cam"].value("x", 0.f), j["cam"].value("y", 0.f));
         g_cam.zoom = j["cam"].value("z", 1.f);
@@ -713,9 +739,12 @@ static void duplicate_selected() {
 static void group_selected() {
     if (g_sel.size() < 2) return;
     Shape g; g.id = new_id(); g.type = SH_GROUP;
+    uint64_t gid = g.id;
     g_doc.shapes.push_back(g);
-    for (auto id : g_sel) { Shape* s = find_shape(id); if (s) s->parent = g.id; }
-    g_sel.clear(); g_sel.push_back(g.id); g_drill = 0;
+    for (auto id : g_sel) { Shape* s = find_shape(id); if (s) s->parent = gid; }
+    float r;   // grouping same-tilt shapes: adopt that tilt as the group's frame
+    if (members_common_rot(gid, &r) && fabsf(r) > 0.0001f) find_shape(gid)->rot = r;
+    g_sel.clear(); g_sel.push_back(gid); g_drill = 0;
 }
 static void ungroup_selected() {
     std::vector<uint64_t> newSel;
@@ -1475,12 +1504,13 @@ static void DrawGrid(ImDrawList* dl, ImVec2 size) {
 // tilt when re-selected instead of snapping to an axis-aligned box. Arrows
 // carry no rotation of their own and just tag along.
 static bool selection_common_rot(float* out) {
-    std::vector<uint64_t> all = g_sel;
-    for (auto id : g_sel) { Shape* s = find_shape(id); if (s && s->type == SH_GROUP) collect_members(id, all); }
+    // each selected TOP-LEVEL entry contributes its frame: texts/images their
+    // own rot, groups their STORED rot (so a group keeps its tilt even after
+    // a child inside was rotated independently); arrows just tag along
     bool any = false; float r = 0;
-    for (auto id : all) {
+    for (auto id : g_sel) {
         Shape* s = find_shape(id);
-        if (!s || (s->type != SH_TEXT && s->type != SH_IMAGE)) continue;
+        if (!s || s->type == SH_ARROW) continue;
         if (!any) { r = s->rot; any = true; }
         else if (fabsf(s->rot - r) > 0.001f) return false;
     }
@@ -1662,7 +1692,9 @@ static void DrawContextMenu() {
         bool haveRot = false;
         for (auto id : g_sel) { Shape* s = find_shape(id); if (s && s->rot != 0.f) haveRot = true; }
         if (haveRot && ImGui::MenuItem("reset rotation")) {
-            for (auto id : g_sel) { Shape* s = find_shape(id); if (s) s->rot = 0.f; }
+            std::vector<uint64_t> all = g_sel;
+            for (auto id : g_sel) { Shape* s = find_shape(id); if (s && s->type == SH_GROUP) collect_members(id, all); }
+            for (auto id : all) { Shape* s = find_shape(id); if (s) s->rot = 0.f; }
             push_undo();
         }
         if (haveText) {
@@ -2244,7 +2276,7 @@ static void CanvasFrame() {
                 if (!snap.a.bind) s->a.p = rot_about(snap.a.p, g_rotPivotW, dth);
                 if (!snap.b.bind) s->b.p = rot_about(snap.b.p, g_rotPivotW, dth);
                 break;
-            case SH_GROUP: break;
+            case SH_GROUP: s->rot = snap.rot + dth; break;   // the group's frame turns too
             }
         }
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
