@@ -731,6 +731,208 @@ static Tex* get_image_tex(const std::string& asset) {
 
 static bool file_exists(const std::string& p) { return GetFileAttributesW(to_w(p).c_str()) != INVALID_FILE_ATTRIBUTES; }
 
+// ─────────────────── video / gif decode (libav, in-process) ────────────────
+// GIFs and videos decode in-process through the flake's static libav — the
+// slopstudio-proven decoder: format+codec+swscale contexts stay RESIDENT per
+// file, decode_index() does keyframe-seek + forward-decode, sequential
+// playback reuses the held frame. GIFs autoplay-loop like images that move;
+// videos behave exactly like images until hovered (play/stop/seek/AB overlay).
+#ifdef TEI_LIBAV
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+#include <libavutil/imgutils.h>
+}
+
+struct VideoDecoder {
+    AVFormatContext* fmt = nullptr;
+    AVCodecContext*  dec = nullptr;
+    SwsContext*      sws = nullptr;
+    AVFrame*         frame = nullptr;
+    AVPacket*        pkt = nullptr;
+    int        vstream = -1;
+    AVRational tb{0, 1};
+    double     fps = 0;
+    int        frames = 0, w = 0, h = 0;
+    int        cur_idx = -1;
+    bool       ok = false;
+    unsigned long long lru = 0;
+
+    bool open(const std::string& path) {
+        if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return false;
+        if (avformat_find_stream_info(fmt, nullptr) < 0) return false;
+        vstream = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (vstream < 0) return false;
+        AVStream* st = fmt->streams[vstream];
+        const AVCodec* codec = avcodec_find_decoder(st->codecpar->codec_id);
+        if (!codec) return false;
+        dec = avcodec_alloc_context3(codec);
+        if (!dec || avcodec_parameters_to_context(dec, st->codecpar) < 0) return false;
+        dec->thread_count = 0;                       // auto multithreaded decode
+        if (avcodec_open2(dec, codec, nullptr) < 0) return false;
+        tb = st->time_base;
+        AVRational r = st->avg_frame_rate.num ? st->avg_frame_rate : st->r_frame_rate;
+        fps = r.num ? av_q2d(r) : 12.0;
+        w = dec->width; h = dec->height;
+        if (st->nb_frames > 0) frames = (int)st->nb_frames;
+        else {
+            double dur = (st->duration > 0 && st->duration != AV_NOPTS_VALUE) ? st->duration * av_q2d(tb)
+                       : (fmt->duration != AV_NOPTS_VALUE ? fmt->duration / (double)AV_TIME_BASE : 0);
+            frames = dur > 0 ? (int)(dur * fps + 0.5) : 0;
+        }
+        frame = av_frame_alloc(); pkt = av_packet_alloc();
+        ok = frame && pkt && w > 0 && h > 0;
+        return ok;
+    }
+    void close() {
+        if (sws) sws_freeContext(sws);
+        if (frame) av_frame_free(&frame);
+        if (pkt) av_packet_free(&pkt);
+        if (dec) avcodec_free_context(&dec);
+        if (fmt) avformat_close_input(&fmt);
+        sws = nullptr; frame = nullptr; pkt = nullptr; dec = nullptr; fmt = nullptr; ok = false;
+    }
+    double duration() const { return fps > 0 ? frames / fps : 0; }
+    bool to_rgba(std::vector<unsigned char>& out) {
+        if (!frame || !frame->data[0]) return false;
+        sws = sws_getCachedContext(sws, frame->width, frame->height, (AVPixelFormat)frame->format,
+                                   w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!sws) return false;
+        out.resize((size_t)w * h * 4);
+        unsigned char* dst[4] = { out.data(), nullptr, nullptr, nullptr };
+        int dstStride[4] = { w * 4, 0, 0, 0 };
+        sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dst, dstStride);
+        return true;
+    }
+    bool decode_index(int idx, std::vector<unsigned char>& out, bool retried = false) {
+        if (!ok) return false;
+        if (idx < 0) idx = 0;
+        if (frames > 0 && idx >= frames) idx = frames - 1;
+        if (idx == cur_idx) {
+            if (to_rgba(out)) return true;
+            cur_idx = -1;
+        }
+        int64_t target = (int64_t)((double)idx / fps / av_q2d(tb) + 0.5);
+        bool needSeek = (cur_idx < 0) || (idx < cur_idx) || (idx - cur_idx > 30);
+        if (needSeek) {
+            if (av_seek_frame(fmt, vstream, target, AVSEEK_FLAG_BACKWARD) < 0)
+                av_seek_frame(fmt, vstream, target, AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY);
+            avcodec_flush_buffers(dec);
+            cur_idx = -1;
+        }
+        bool reached = false, eof = false;
+        while (!reached && !eof) {
+            int rp = av_read_frame(fmt, pkt);
+            if (rp < 0) { avcodec_send_packet(dec, nullptr); eof = true; }
+            else if (pkt->stream_index != vstream) { av_packet_unref(pkt); continue; }
+            else { avcodec_send_packet(dec, pkt); av_packet_unref(pkt); }
+            for (;;) {
+                int rr = avcodec_receive_frame(dec, frame);
+                if (rr == AVERROR(EAGAIN)) break;
+                if (rr < 0) { eof = true; break; }
+                int64_t pts = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
+                cur_idx = (pts != AV_NOPTS_VALUE) ? (int)(pts * av_q2d(tb) * fps + 0.5) : (cur_idx + 1);
+                if (pts == AV_NOPTS_VALUE || cur_idx >= idx || (frames > 0 && cur_idx >= frames - 1)) { reached = true; break; }
+            }
+        }
+        // container metadata can overpromise: learn the REAL frame count at EOF
+        if (eof && !reached && cur_idx >= 0 && cur_idx + 1 < frames) frames = cur_idx + 1;
+        if (to_rgba(out)) return true;
+        cur_idx = -1;
+        if (!retried && frames > 0) return decode_index(frames - 1, out, true);
+        return false;
+    }
+};
+
+static std::map<std::string, VideoDecoder*> g_decoders;   // asset rel path → resident decoder
+static unsigned long long g_decoderClock = 0;
+static const size_t kMaxDecoders = 6;
+
+static VideoDecoder* get_decoder(const std::string& asset) {
+    auto it = g_decoders.find(asset);
+    if (it != g_decoders.end()) { it->second->lru = ++g_decoderClock; return it->second->ok ? it->second : nullptr; }
+    if (g_decoders.size() >= kMaxDecoders) {
+        auto v = g_decoders.end();
+        for (auto i = g_decoders.begin(); i != g_decoders.end(); ++i)
+            if (v == g_decoders.end() || i->second->lru < v->second->lru) v = i;
+        if (v != g_decoders.end()) { v->second->close(); delete v->second; g_decoders.erase(v); }
+    }
+    static bool quieted = false;
+    if (!quieted) { av_log_set_level(AV_LOG_ERROR); quieted = true; }
+    VideoDecoder* d = new VideoDecoder();
+    d->lru = ++g_decoderClock;
+    if (!d->open(g_projDir + "/" + asset)) d->close();
+    g_decoders[asset] = d;
+    return d->ok ? d : nullptr;
+}
+#endif // TEI_LIBAV
+
+// Per-shape playback state; the dynamic texture is updated only when the
+// wanted frame index actually changes.
+struct PlayState {
+    bool playing = false;
+    double t = 0;
+    int shownIdx = -1;
+    int w = 0, h = 0;
+    ID3D11Texture2D* tex = nullptr;
+    ID3D11ShaderResourceView* srv = nullptr;
+    void release() { if (srv) srv->Release(); if (tex) tex->Release(); srv = nullptr; tex = nullptr; shownIdx = -1; }
+};
+static std::map<uint64_t, PlayState> g_play;
+
+#ifdef TEI_LIBAV
+static bool upload_video_frame(PlayState& ps, VideoDecoder* d, int idx) {
+    std::vector<unsigned char> rgba;
+    if (!d->decode_index(idx, rgba) || rgba.empty()) return false;
+    if (!ps.tex || ps.w != d->w || ps.h != d->h) {
+        ps.release();
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = d->w; td.Height = d->h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DYNAMIC; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &ps.tex))) return false;
+        g_dev->CreateShaderResourceView(ps.tex, nullptr, &ps.srv);
+        ps.w = d->w; ps.h = d->h;
+    }
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(g_ctx->Map(ps.tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return false;
+    for (int y = 0; y < ps.h; y++)
+        memcpy((unsigned char*)m.pData + (size_t)y * m.RowPitch, &rgba[(size_t)y * ps.w * 4], (size_t)ps.w * 4);
+    g_ctx->Unmap(ps.tex, 0);
+    ps.shownIdx = idx;
+    return true;
+}
+
+// Advance playback + return the SRV for this video/gif shape (poster frame 0
+// when idle). Called from the draw pass every frame the shape is visible.
+static ID3D11ShaderResourceView* video_srv(const Shape& s, MediaKind mk) {
+    VideoDecoder* d = get_decoder(s.asset);
+    if (!d) return nullptr;
+    PlayState& ps = g_play[s.id];
+    if (mk == MK_GIF) ps.playing = true;   // gifs just loop, no controls
+    if (ps.playing) {
+        ps.t += ImGui::GetIO().DeltaTime;
+        double dur = d->duration();
+        if (mk == MK_VIDEO && s.loopA >= 0 && s.loopB > s.loopA && ps.t > s.loopB) ps.t = s.loopA;
+        else if (dur > 0 && ps.t >= dur) ps.t = 0;
+    }
+    int idx = (int)(ps.t * d->fps + 0.5);
+    if (d->frames > 0 && idx >= d->frames) idx = d->frames - 1;
+    if (idx != ps.shownIdx) upload_video_frame(ps, d, idx);
+    return ps.srv;
+}
+#endif
+
+// drop playback state (and its GPU texture) for shapes that no longer exist
+static void sweep_play_states() {
+    for (auto it = g_play.begin(); it != g_play.end();) {
+        if (!find_shape(it->first)) { it->second.release(); it = g_play.erase(it); }
+        else ++it;
+    }
+}
+
 // Copy an external file into the project's assets/ (self-contained project
 // dirs: every board carries its own media). ASCII-sanitized destination names
 // so downstream ANSI file APIs (stb) never trip on unicode.
@@ -767,9 +969,13 @@ static ImVec2 default_display_size(int w, int h) {
 }
 
 static uint64_t create_image_shape(const std::string& rel, ImVec2 centerW) {
-    Tex* t = get_image_tex(rel);
+    int w = 0, h = 0;
+    if (media_kind(rel) == MK_STILL) { Tex* t = get_image_tex(rel); w = t->w; h = t->h; }
+#ifdef TEI_LIBAV
+    else { VideoDecoder* d = get_decoder(rel); if (d) { w = d->w; h = d->h; } }
+#endif
     Shape s; s.id = new_id(); s.type = SH_IMAGE; s.asset = rel;
-    s.size = default_display_size(t->w, t->h);
+    s.size = default_display_size(w, h);
     s.pos = centerW - s.size * 0.5f;
     g_doc.shapes.push_back(s);
     return s.id;
@@ -1301,6 +1507,107 @@ static void DrawContextMenu() {
     ImGui::EndPopup();
 }
 
+// ── video hover controls ──
+// Hovering the middle of a video shows a floating play/stop/seek/AB-loop pill
+// (gifs just loop with no chrome). The overlay sticks while its widgets are in
+// use even if the pointer wanders off the trigger region.
+static uint64_t g_overlayVid = 0;
+static bool     g_overlayHot = false;   // last frame: window hovered or widget active
+
+static bool IconButton(const char* id, int icon /*0 play 1 pause 2 stop*/) {
+    ImVec2 sz(28, 28);
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    bool clicked = ImGui::InvisibleButton(id, sz);
+    ImDrawList* wdl = ImGui::GetWindowDrawList();
+    if (ImGui::IsItemHovered())
+        wdl->AddRectFilled(p, p + sz, IM_COL32(255, 255, 255, ImGui::IsItemActive() ? 36 : 20), 6.f);
+    ImVec2 c = p + sz * 0.5f;
+    ImU32 col = g_th.textMain;
+    float r = 6.f;
+    if (icon == 0)      wdl->AddTriangleFilled(c + ImVec2(-r * 0.7f, -r), c + ImVec2(-r * 0.7f, r), c + ImVec2(r, 0), col);
+    else if (icon == 1) { wdl->AddRectFilled(c + ImVec2(-r * 0.8f, -r), c + ImVec2(-r * 0.15f, r), col, 1.f);
+                          wdl->AddRectFilled(c + ImVec2(r * 0.15f, -r), c + ImVec2(r * 0.8f, r), col, 1.f); }
+    else                wdl->AddRectFilled(c + ImVec2(-r * 0.8f, -r * 0.8f), c + ImVec2(r * 0.8f, r * 0.8f), col, 1.f);
+    return clicked;
+}
+static void fmt_time(char* buf, size_t n, double t) {
+    int s = (int)(t + 0.5);
+    snprintf(buf, n, "%d:%02d", s / 60, s % 60);
+}
+
+static void DrawVideoOverlay() {
+#ifdef TEI_LIBAV
+    ImGuiIO& io = ImGui::GetIO();
+    if (g_editText || g_editLabelArrow || g_drag != DM_NONE) { g_overlayVid = 0; g_overlayHot = false; return; }
+    // topmost video whose central region contains the pointer
+    uint64_t hover = 0;
+    ImVec2 mw = S2W(io.MousePos);
+    for (int i = (int)g_doc.shapes.size() - 1; i >= 0 && !hover; i--) {
+        Shape& s = g_doc.shapes[i];
+        if (s.type != SH_IMAGE || media_kind(s.asset) != MK_VIDEO) continue;
+        WRect b = shape_bounds(s);
+        ImVec2 c = b.center(), half = b.size() * 0.35f;
+        WRect mid{ c - half, c + half };
+        if (mid.contains(mw)) hover = s.id;
+    }
+    uint64_t target = hover ? hover : (g_overlayHot ? g_overlayVid : 0);
+    g_overlayVid = target;
+    if (!target) { g_overlayHot = false; return; }
+    Shape* s = find_shape(target);
+    VideoDecoder* d = get_decoder(s->asset);
+    if (!d) { g_overlayHot = false; return; }
+    PlayState& ps = g_play[s->id];
+    double dur = d->duration();
+
+    WRect b = shape_bounds(*s);
+    ImVec2 cs = W2S(b.center());
+    float wpx = b.size().x * g_cam.zoom;
+    float sliderW = fminf(fmaxf(wpx * 0.75f, 200.f), 400.f);
+
+    ImGui::SetNextWindowPos(cs, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::Begin("##vidctl", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+
+    if (IconButton("##pp", ps.playing ? 1 : 0)) ps.playing = !ps.playing;
+    ImGui::SameLine();
+    if (IconButton("##stop", 2)) { ps.playing = false; ps.t = 0; }
+    ImGui::SameLine();
+    char t0[16], t1[16]; fmt_time(t0, 16, ps.t); fmt_time(t1, 16, dur);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_th.textDim), "%s / %s", t0, t1);
+
+    // seek bar (+ A-B markers drawn over it)
+    float tt = (float)ps.t;
+    ImGui::SetNextItemWidth(sliderW);
+    if (ImGui::SliderFloat("##seek", &tt, 0.f, (float)dur, "", ImGuiSliderFlags_AlwaysClamp))
+        ps.t = tt;
+    ImVec2 smn = ImGui::GetItemRectMin(), smx = ImGui::GetItemRectMax();
+    ImDrawList* wdl = ImGui::GetWindowDrawList();
+    auto mark = [&](float sec, ImU32 col) {
+        if (sec < 0 || dur <= 0) return;
+        float x = smn.x + (smx.x - smn.x) * (float)(sec / dur);
+        wdl->AddRectFilled(ImVec2(x - 1.5f, smn.y - 2), ImVec2(x + 1.5f, smx.y + 2), col, 1.f);
+    };
+    mark(s->loopA, IM_COL32(120, 220, 120, 230));
+    mark(s->loopB, IM_COL32(235, 120, 120, 230));
+
+    // A-B loop: set each point at the current time; × clears
+    if (ImGui::SmallButton("A")) { s->loopA = (float)ps.t; if (s->loopB >= 0 && s->loopB <= s->loopA) s->loopB = -1; push_undo(); }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("B")) { s->loopB = (float)ps.t; if (s->loopA >= 0 && s->loopA >= s->loopB) s->loopA = -1; push_undo(); }
+    if (s->loopA >= 0 || s->loopB >= 0) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x##abclr")) { s->loopA = s->loopB = -1; push_undo(); }
+        ImGui::SameLine();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_th.textDim), "loop");
+    }
+
+    g_overlayHot = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) || ImGui::IsAnyItemActive();
+    ImGui::End();
+#endif
+}
+
 // in-place text editor overlay (canvas text + arrow labels share it)
 static void DrawTextEditOverlay() {
     uint64_t id = g_editText ? g_editText : g_editLabelArrow;
@@ -1384,9 +1691,14 @@ static void CanvasFrame() {
         case SH_ARROW: draw_arrow_shape(dl, s); break;
         case SH_IMAGE: {
             ImVec2 mn = W2S(s.pos), mx = W2S(s.pos + s.size);
-            Tex* t = get_image_tex(s.asset);
-            if (t->srv) {
-                dl->AddImageRounded((ImTextureID)(intptr_t)t->srv, mn, mx,
+            ID3D11ShaderResourceView* srv = nullptr;
+            MediaKind mk = media_kind(s.asset);
+            if (mk == MK_STILL) srv = get_image_tex(s.asset)->srv;
+#ifdef TEI_LIBAV
+            else srv = video_srv(s, mk);
+#endif
+            if (srv) {
+                dl->AddImageRounded((ImTextureID)(intptr_t)srv, mn, mx,
                                     ImVec2(s.crop.x, s.crop.y), ImVec2(s.crop.z, s.crop.w),
                                     IM_COL32_WHITE, 5.f);
             } else {
@@ -1800,9 +2112,11 @@ int main(int argc, char** argv) {
 
         CanvasFrame();
         DrawContextMenu();
+        DrawVideoOverlay();
         DrawTextEditOverlay();
         DrawToolbar();
         DrawZoomPill();
+        sweep_play_states();
 
         if (!io.WantTextInput && io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_D)) {
             g_darkMode = !g_darkMode; ApplyTheme(); g_saveDueAt = ImGui::GetTime() + 0.4;
