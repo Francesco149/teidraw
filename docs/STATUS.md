@@ -37,13 +37,20 @@ render tests.
 3. Snapping guides + arrow-key nudge + shift axis-lock drag.
 
 ## Known rough edges / to keep in mind
-- While editing a rotated text, clicks on other UI route with the remapped
-  pointer — they mostly just commit the edit; harmless but noted.
-- The rotated-editor trick reaches into the InputTextMultiline child window
-  (`FindWindowByName("<win>/##t")` + vertex transform + clip-rect patch) —
-  re-verify if the imgui pin (1.92.4) ever moves.
-- Text align affects committed rendering only; the edit overlay is
-  left-aligned while typing.
+- While editing a remapped text (rotated OR center/right-aligned multiline),
+  clicks on other UI route with the remapped pointer — they mostly just
+  commit the edit; harmless but noted.
+- **Editing is fully WYSIWYG** (bold strike + per-line align offsets +
+  rotation applied to the editor's finished vertices; pointer inverse-mapped
+  per line pre-NewFrame). Surveyed 2026-07: NO off-the-shelf imgui rich-text
+  editor exists (only code editors: ImGuiColorTextEdit / ImTextEdit), so this
+  in-house transform IS the approach. If the user reports jank, the agreed
+  fallback = left-aligned editing: make edit_line_offsets fill zeros.
+- The editor transforms reach into the InputTextMultiline child window
+  (`FindWindowByName("<win>/##t")` + per-quad vertex shifts + clip-rect
+  patch) — re-verify if the imgui pin (1.92.4) ever moves.
+- List lines ("• ", "N. ") always pin left even in centered/right text — a
+  deliberate heuristic, shared by renderer + editor via is_list_line().
 - Default board dir is `./scratch` relative to cwd; fine until the picker.
 - Escape-while-crop-dragging commits instead of canceling.
 - No audio on videos yet (M4). Faux bold is double-strike, not a real weight

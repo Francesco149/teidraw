@@ -1431,6 +1431,16 @@ static void add_text_bold(ImDrawList* dl, ImFont* f, float px, ImVec2 p, ImU32 c
     dl->AddText(f, px, ImVec2(p.x + px * 0.03f, p.y), col, b, e);
 }
 
+// list lines ("• foo", "12. foo", optionally indented) pin to the left edge
+// even when the text block is centered/right-aligned
+static bool is_list_line(const char* b, const char* e) {
+    while (b < e && *b == ' ') b++;
+    if (e - b >= 3 && !memcmp(b, "\xe2\x80\xa2", 3)) return true;
+    const char* d = b;
+    while (d < e && isdigit((unsigned char)*d)) d++;
+    return d > b && d < e && *d == '.' && (d + 1 == e || d[1] == ' ');
+}
+
 static void draw_text_shape(ImDrawList* dl, const Shape& s) {
     float px = text_px(s) * g_cam.zoom;
     ImVec2 sp = W2S(s.pos);
@@ -1450,8 +1460,11 @@ static void draw_text_shape(ImDrawList* dl, const Shape& s) {
         const char* e = (const char*)memchr(b, '\n', end - b);
         if (!e) e = end;
         if (e > b) {
-            float w = ImGui::CalcTextSize(b, e).x;
-            float x = s.align == 1 ? (totalW - w) * 0.5f : s.align == 2 ? (totalW - w) : 0.f;
+            float x = 0.f;
+            if (s.align && !is_list_line(b, e)) {
+                float w = ImGui::CalcTextSize(b, e).x;
+                x = s.align == 1 ? (totalW - w) * 0.5f : (totalW - w);
+            }
             add_text_bold(dl, f, rp, ImVec2(x, y), col, b, e);
         }
         y += rp;
@@ -1477,7 +1490,7 @@ static void draw_text_shape(ImDrawList* dl, const Shape& s) {
 static void draw_arrow_shape(ImDrawList* dl, const Shape& s, bool ghostEnd = false) {
     std::vector<ImVec2> pl; arrow_polyline(s, pl);
     if (pl.size() < 2) return;
-    float thick = fmaxf(2.75f * g_cam.zoom, 1.7f);
+    float thick = fmaxf(3.25f * g_cam.zoom, 2.f);
     ImU32 col = shape_ink(s);
     std::vector<ImVec2> sp(pl.size());
     for (size_t i = 0; i < pl.size(); i++) sp[i] = W2S(pl[i]);
@@ -2104,13 +2117,15 @@ static void text_edit_apply(ImGuiInputTextCallbackData* d, bool deleted) {
         int i = ps; while (i < pe && d->Buf[i] == ' ') i++;
         std::string indent(d->Buf + ps, d->Buf + i);
         if (pe - i >= 4 && !memcmp(d->Buf + i, kBullet, 4)) {
-            if (pe - i == 4) d->DeleteChars(i, pe - i);        // empty item → end list
+            // empty item → drop marker AND the fresh newline: stay on the
+            // same (now plain) line, list mode off
+            if (pe - i == 4) d->DeleteChars(i, cur - i);
             else { std::string ins = indent + kBullet; d->InsertChars(d->CursorPos, ins.c_str()); }
             return;
         }
         int j = i; while (j < pe && j - i < 9 && isdigit((unsigned char)d->Buf[j])) j++;
         if (j > i && j < pe && d->Buf[j] == '.' && (j + 1 == pe || d->Buf[j + 1] == ' ')) {
-            if (j + 2 >= pe) d->DeleteChars(i, pe - i);        // "12." / "12. " alone → end list
+            if (j + 2 >= pe) d->DeleteChars(i, cur - i);       // "12." / "12. " alone → stay, end list
             else {
                 long n = strtol(std::string(d->Buf + i, d->Buf + j).c_str(), nullptr, 10);
                 char num[32]; snprintf(num, sizeof num, "%ld. ", n + 1);
@@ -2129,12 +2144,43 @@ static int TextEditCallback(ImGuiInputTextCallbackData* d) {
     return 0;
 }
 
+// ── WYSIWYG editing state ──
+// The live editor must look exactly like the committed shape: bold strike,
+// per-line alignment (bullets pinned left), rotation. imgui's InputText is
+// left-aligned/single-strike, so after it draws we transform its finished
+// vertices per line, and before each frame we remap the pointer inversely so
+// caret clicks land where the eye says (same pattern as rotated editing).
+static std::vector<float> g_editLineDx;        // per-line x offsets, committed layout
+static bool  g_editShiftActive = false;
+static float g_editShiftTopY = 0.f, g_editShiftPx = 1.f;
+
+static void edit_line_offsets(const std::string& text, ImFont* f, float px, int align, std::vector<float>& out) {
+    out.clear();
+    ImGui::PushFont(f, px);
+    float totalW = ImGui::CalcTextSize(text.empty() ? " " : text.c_str()).x;
+    const char* b = text.c_str();
+    const char* end = b + text.size();
+    for (;;) {
+        const char* e = (const char*)memchr(b, '\n', end - b);
+        if (!e) e = end;
+        float dx = 0.f;
+        if (align && !is_list_line(b, e)) {
+            float w = e > b ? ImGui::CalcTextSize(b, e).x : 0.f;   // empty line: caret sits where text would
+            dx = align == 1 ? (totalW - w) * 0.5f : (totalW - w);
+        }
+        out.push_back(dx);
+        if (e >= end) break;
+        b = e + 1;
+    }
+    ImGui::PopFont();
+}
+
 // in-place text editor overlay (canvas text + arrow labels share it)
 static void DrawTextEditOverlay() {
     uint64_t id = g_editText ? g_editText : g_editLabelArrow;
-    if (!id) return;
+    if (!id) { g_editShiftActive = false; return; }
     Shape* s = find_shape(id);
-    if (!s) { g_editText = g_editLabelArrow = 0; return; }
+    if (!s) { g_editText = g_editLabelArrow = 0; g_editShiftActive = false; return; }
     bool isLabel = (g_editLabelArrow != 0);
     std::string* str = isLabel ? &s->label : &s->text;
 
@@ -2175,22 +2221,58 @@ static void DrawTextEditOverlay() {
     ImGui::InputTextMultiline("##t", str, box,
                               ImGuiInputTextFlags_NoHorizontalScroll | ImGuiInputTextFlags_CallbackEdit,
                               TextEditCallback);
-    if (rotated) {
-        // The editor ran in unrotated space (pointer was inverse-rotated at
-        // frame start). Rotate its finished draw output — glyphs, caret,
-        // selection highlight — back into place and open up the clip rects,
-        // so the shape stays visually rotated while being edited.
-        ImGuiWindow* parent = ImGui::GetCurrentWindow();
-        ImGuiID cid = ImGui::GetID("##t");
-        char nm[256];
-        snprintf(nm, sizeof nm, "%s/##t", parent->Name);
-        ImGuiWindow* child = ImGui::FindWindowByName(nm);
-        if (!child) {
-            snprintf(nm, sizeof nm, "%s/##t_%08X", parent->Name, cid);
-            child = ImGui::FindWindowByName(nm);
+    // ── WYSIWYG pass: make the live editor match the committed rendering ──
+    // 1) faux-bold second strike  2) per-line alignment offsets applied to
+    // the editor's finished vertices (glyphs, caret, selection quads shift
+    // with their line)  3) everything rotated into place for rotated shapes.
+    // The pointer was remapped inversely before NewFrame (main loop).
+    ImVec2 itemMin = ImGui::GetItemRectMin();
+    ImU32 ink = shape_ink(*s);
+    if (!isLabel) edit_line_offsets(*str, font, px, s->align, g_editLineDx);
+    else g_editLineDx.clear();
+    int nLines = (int)g_editLineDx.size();
+    bool anyShift = false;
+    for (float d : g_editLineDx) if (d != 0.f) { anyShift = true; break; }
+
+    ImDrawList* pdl = ImGui::GetWindowDrawList();
+    int strikeVtx0 = pdl->VtxBuffer.Size;
+    {   // bold strike (parent drawlist; same ink so draw order is moot)
+        const char* b = str->c_str();
+        const char* end = b + str->size();
+        float bo = px * 0.03f;
+        int li = 0;
+        while (b < end) {
+            const char* e = (const char*)memchr(b, '\n', end - b);
+            if (!e) e = end;
+            if (e > b) {
+                float dx = li < nLines ? g_editLineDx[li] : 0.f;
+                pdl->AddText(font, px, ImVec2(itemMin.x + dx + bo, itemMin.y + li * px), ink, b, e);
+            }
+            li++;
+            if (e >= end) break;
+            b = e + 1;
         }
-        if (child && child->DrawList) {
-            ImDrawList* cdl = child->DrawList;
+    }
+
+    ImGuiWindow* parentWin = ImGui::GetCurrentWindow();
+    ImGuiID cid = ImGui::GetID("##t");
+    char nm[256];
+    snprintf(nm, sizeof nm, "%s/##t", parentWin->Name);
+    ImGuiWindow* child = ImGui::FindWindowByName(nm);
+    if (!child) { snprintf(nm, sizeof nm, "%s/##t_%08X", parentWin->Name, cid); child = ImGui::FindWindowByName(nm); }
+    if (child && child->DrawList) {
+        ImDrawList* cdl = child->DrawList;
+        if (anyShift) {
+            // shift per QUAD (4 consecutive verts) so no glyph shears when a
+            // descender pokes past the line box
+            for (int i = 0; i + 3 < cdl->VtxBuffer.Size; i += 4) {
+                float cy = (cdl->VtxBuffer[i].pos.y + cdl->VtxBuffer[i + 2].pos.y) * 0.5f;
+                int li = (int)floorf((cy - itemMin.y) / px);
+                li = li < 0 ? 0 : (li >= nLines ? nLines - 1 : li);
+                for (int k = 0; k < 4; k++) cdl->VtxBuffer[i + k].pos.x += g_editLineDx[li];
+            }
+        }
+        if (rotated) {
             float sn = sinf(rotA), cs = cosf(rotA);
             for (int i = 0; i < cdl->VtxBuffer.Size; i++) {
                 ImDrawVert& v = cdl->VtxBuffer[i];
@@ -2198,11 +2280,24 @@ static void DrawTextEditOverlay() {
                 v.pos.x = rotC.x + dx * cs - dy * sn;
                 v.pos.y = rotC.y + dx * sn + dy * cs;
             }
+            for (int i = strikeVtx0; i < pdl->VtxBuffer.Size; i++) {
+                ImDrawVert& v = pdl->VtxBuffer[i];
+                float dx = v.pos.x - rotC.x, dy = v.pos.y - rotC.y;
+                v.pos.x = rotC.x + dx * cs - dy * sn;
+                v.pos.y = rotC.y + dx * sn + dy * cs;
+            }
             ImVec2 ds = ImGui::GetIO().DisplaySize;
             for (int i = 0; i < cdl->CmdBuffer.Size; i++)
                 cdl->CmdBuffer[i].ClipRect = ImVec4(0, 0, ds.x, ds.y);
+            for (int i = 0; i < pdl->CmdBuffer.Size; i++)
+                pdl->CmdBuffer[i].ClipRect = ImVec4(0, 0, ds.x, ds.y);
         }
     }
+    // published for the pre-NewFrame pointer remap
+    g_editShiftActive = anyShift && !isLabel;
+    g_editShiftTopY = itemMin.y;
+    g_editShiftPx = px;
+
     bool active = ImGui::IsItemActive();
     if (active) g_editEverActive = true;
     // focus takes a frame to land: never evaluate commit conditions before the
@@ -2732,10 +2827,20 @@ int main(int argc, char** argv) {
         g_editRemap = false;
         if (g_editText) {
             Shape* es = find_shape(g_editText);
-            if (es && es->rot != 0.f) {
-                ImVec2 c = W2S(shape_local_rect(*es).center());
-                io.MousePos = rot_about(io.MousePos, c, -es->rot);
-                g_editRemap = true;
+            if (es) {
+                if (es->rot != 0.f) {
+                    ImVec2 c = W2S(shape_local_rect(*es).center());
+                    io.MousePos = rot_about(io.MousePos, c, -es->rot);
+                    g_editRemap = true;
+                }
+                // per-line alignment: un-shift the pointer by the offset of
+                // the line it hovers (last frame's layout — 1 frame of lag)
+                if (g_editShiftActive && !g_editLineDx.empty()) {
+                    int li = (int)floorf((io.MousePos.y - g_editShiftTopY) / g_editShiftPx);
+                    li = li < 0 ? 0 : (li >= (int)g_editLineDx.size() ? (int)g_editLineDx.size() - 1 : li);
+                    io.MousePos.x -= g_editLineDx[li];
+                    g_editRemap = true;
+                }
             }
         }
         ImGui::NewFrame();
