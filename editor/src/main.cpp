@@ -1470,9 +1470,29 @@ static void DrawGrid(ImDrawList* dl, ImVec2 size) {
             dl->AddRectFilled(ImVec2(x - r, y - r), ImVec2(x + r, y + r), col, r);
 }
 
-// selection outline + corner handles (OBB for a single rotated shape, AABB
-// otherwise). Returns hover: 0-3 = corner handle, 4-7 = the rotate ring just
-// OUTSIDE corner i-4, -1 = none. Corner order: tl tr br bl.
+// If every rotatable leaf (text/image) in the selection shares one nonzero
+// rotation, that's the selection's natural frame — a rotated group keeps its
+// tilt when re-selected instead of snapping to an axis-aligned box. Arrows
+// carry no rotation of their own and just tag along.
+static bool selection_common_rot(float* out) {
+    std::vector<uint64_t> all = g_sel;
+    for (auto id : g_sel) { Shape* s = find_shape(id); if (s && s->type == SH_GROUP) collect_members(id, all); }
+    bool any = false; float r = 0;
+    for (auto id : all) {
+        Shape* s = find_shape(id);
+        if (!s || (s->type != SH_TEXT && s->type != SH_IMAGE)) continue;
+        if (!any) { r = s->rot; any = true; }
+        else if (fabsf(s->rot - r) > 0.001f) return false;
+    }
+    if (!any || fabsf(r) < 0.0001f) return false;
+    *out = r;
+    return true;
+}
+
+// selection outline + corner handles (OBB for a single rotated shape or a
+// common-rotation selection, AABB otherwise). Returns hover: 0-3 = corner
+// handle, 4-7 = the rotate ring just OUTSIDE corner i-4, -1 = none.
+// Corner order: tl tr br bl.
 static ImVec2 g_selCorners[4];   // screen space
 static ImVec2 g_selCenterS;
 static int draw_selection_ui(ImDrawList* dl, bool handlesActive) {
@@ -1492,9 +1512,36 @@ static int draw_selection_ui(ImDrawList* dl, bool handlesActive) {
         return -1;
     }
     Shape* single = g_sel.size() == 1 ? find_shape(g_sel[0]) : nullptr;
+    float commonRot = 0;
     if (single && (single->type == SH_TEXT || single->type == SH_IMAGE)) {
         ImVec2 c[4]; shape_obb(*single, c, 4.f / g_cam.zoom);
         for (int i = 0; i < 4; i++) g_selCorners[i] = W2S(c[i]);
+    } else if (selection_common_rot(&commonRot)) {
+        // OBB at the shared rotation: gather everyone's corner points, fit an
+        // axis-aligned box in the rotated frame, rotate the box back
+        std::vector<uint64_t> all = g_sel;
+        for (auto id : g_sel) { Shape* s = find_shape(id); if (s && s->type == SH_GROUP) collect_members(id, all); }
+        std::vector<ImVec2> pts;
+        for (auto id : all) {
+            Shape* s = find_shape(id); if (!s) continue;
+            if (s->type == SH_TEXT || s->type == SH_IMAGE) {
+                ImVec2 c[4]; shape_obb(*s, c);
+                for (int i = 0; i < 4; i++) pts.push_back(c[i]);
+            } else if (s->type == SH_ARROW) {
+                pts.push_back(arrow_end_pos(s->a));
+                pts.push_back(arrow_end_pos(s->b));
+            }
+        }
+        ImVec2 pivot = pts[0];
+        WRect lr; bool first = true;
+        for (ImVec2 p : pts) {
+            ImVec2 q = rot_about(p, pivot, -commonRot);
+            if (first) { lr.mn = lr.mx = q; first = false; } else lr.include(q);
+        }
+        float pad = 4.f / g_cam.zoom;
+        lr.mn = lr.mn - ImVec2(pad, pad); lr.mx = lr.mx + ImVec2(pad, pad);
+        ImVec2 k[4] = { lr.mn, ImVec2(lr.mx.x, lr.mn.y), lr.mx, ImVec2(lr.mn.x, lr.mx.y) };
+        for (int i = 0; i < 4; i++) g_selCorners[i] = W2S(rot_about(k[i], pivot, commonRot));
     } else {
         WRect b = selection_bounds();
         ImVec2 mn = W2S(b.mn) - ImVec2(4, 4), mx = W2S(b.mx) + ImVec2(4, 4);

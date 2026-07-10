@@ -29,6 +29,11 @@ overlay; the selection box turns rigidly during multi-selection rotation
 (corners captured at gesture start) instead of re-fitting a bulging AABB;
 **zoom commands** Shift+1 fit / Shift+2 selection / Shift+0 100%, all flying
 the camera with a 180 ms ease-out (log-zoom lerp; any wheel/pan cancels).
+Session 3c: selection-box heuristic — if every rotatable leaf in a selection
+(or group) shares one nonzero rotation, the box renders as an OBB in that
+shared frame (fit in the rotated frame, rotated back; arrows tag along), so
+rotated groups keep their tilt when re-selected instead of snapping to an
+axis-aligned AABB. Groups don't store rotation; it's derived from members.
 
 ## Build & verify
 ```
