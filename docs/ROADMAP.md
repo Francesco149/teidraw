@@ -34,7 +34,7 @@ play/stop/seek/A-B pill, dynamic-texture upload. Shape clipboard.
 - Viewport culling + text-extent caching (only matters at 1000s of shapes).
 - Decode thread for video (keep UI thread pure); NVDEC/d3d11va option.
 - Video audio (WASAPI + swresample; the flake libav already has swresample).
-- Rotation gizmo; more shapes (rect/ellipse/frame) IF daily use demands.
+- More shapes (rect/ellipse/frame) IF daily use demands (rotation: done, session 2).
 - freetype glyph rasterizer for even better small-text rendering.
 
 ## M5 — linux port

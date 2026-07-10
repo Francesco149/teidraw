@@ -24,7 +24,9 @@ This file auto-loads every session. The repo is the source of truth.
 
 ## Interaction heuristics implemented (the "guess what I want" list)
 Click group-child → selects group; click again → drills to child (Esc pops).
-Click text → edits; drag text → moves. Arrow end dropped over a shape → binds
+Click text → selects; click the selected text again → edits; drag → moves.
+Corner handles resize; the ring just OUTSIDE a corner rotates (shift = 15°
+steps). Arrow end dropped over a shape → binds
 with the exact anchor remembered, line auto-trimmed at the target's bounds.
 Drag arrow middle → bend (snaps straight near chord). Double-click arrow →
 label that blanks the line under it. Corner drag → aspect-locked scale;

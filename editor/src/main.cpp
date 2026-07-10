@@ -60,6 +60,11 @@ struct WRect { ImVec2 mn{0,0}, mx{0,0};
     ImVec2 size() const { return mx - mn; }
     ImVec2 center() const { return (mn + mx) * 0.5f; }
 };
+static ImVec2 rot_about(ImVec2 p, ImVec2 c, float a) {
+    float s = sinf(a), co = cosf(a);
+    ImVec2 d = p - c;
+    return ImVec2(c.x + d.x * co - d.y * s, c.y + d.x * s + d.y * co);
+}
 static float dist_point_seg(ImVec2 p, ImVec2 a, ImVec2 b) {
     ImVec2 ab = b - a; float d2 = ab.x * ab.x + ab.y * ab.y;
     float t = d2 > 0 ? ((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / d2 : 0;
@@ -273,7 +278,8 @@ struct Shape {
     int   family = FF_HAND;
     int   tsize = kDefaultTextSize;
     float scale = 1.f;      // continuous scale from corner-resize (multiplies font px)
-    ImVec2 pos{0, 0};       // text/image top-left (world)
+    ImVec2 pos{0, 0};       // text/image local-rect top-left (world, pre-rotation)
+    float rot = 0.f;        // radians, about the local rect's center
     // image / video
     std::string asset;
     ImVec2 size{0, 0};
@@ -319,12 +325,33 @@ static ImVec2 text_extent(const Shape& s) {
     return sz;
 }
 
+// Text/image shapes live in a LOCAL axis-aligned rect (pos..pos+size/extent)
+// rotated by `rot` about the rect's center. Everything geometric goes through
+// these three helpers so rotation stays consistent in one place.
+static WRect shape_local_rect(const Shape& s) {
+    WRect r; r.mn = s.pos;
+    r.mx = s.pos + (s.type == SH_TEXT ? text_extent(s) : s.size);
+    return r;
+}
+static bool has_rot(const Shape& s) { return (s.type == SH_TEXT || s.type == SH_IMAGE) && s.rot != 0.f; }
+// rotated corners, order: tl tr br bl (pad in local units expands the rect)
+static void shape_obb(const Shape& s, ImVec2 out[4], float pad = 0.f) {
+    WRect r = shape_local_rect(s);
+    r.mn = r.mn - ImVec2(pad, pad); r.mx = r.mx + ImVec2(pad, pad);
+    ImVec2 c = r.center();
+    ImVec2 k[4] = { r.mn, ImVec2(r.mx.x, r.mn.y), r.mx, ImVec2(r.mn.x, r.mx.y) };
+    for (int i = 0; i < 4; i++) out[i] = s.rot != 0.f ? rot_about(k[i], c, s.rot) : k[i];
+}
+
 static WRect shape_bounds(const Shape& s);   // fwd
 static ImVec2 arrow_end_pos(const ArrowEnd& e) {
     if (e.bind) {
         Shape* t = find_shape(e.bind);
-        if (t) { WRect b = shape_bounds(*t);
-                 return ImVec2(b.mn.x + b.size().x * e.anchor.x, b.mn.y + b.size().y * e.anchor.y); }
+        if (t) {
+            WRect b = shape_local_rect(*t);
+            ImVec2 p(b.mn.x + b.size().x * e.anchor.x, b.mn.y + b.size().y * e.anchor.y);
+            return t->rot != 0.f ? rot_about(p, b.center(), t->rot) : p;
+        }
     }
     return e.p;
 }
@@ -332,8 +359,12 @@ static ImVec2 arrow_end_pos(const ArrowEnd& e) {
 static WRect shape_bounds(const Shape& s) {
     WRect r;
     switch (s.type) {
-    case SH_TEXT: { ImVec2 e = text_extent(s); r.mn = s.pos; r.mx = s.pos + e; } break;
-    case SH_IMAGE: r.mn = s.pos; r.mx = s.pos + s.size; break;
+    case SH_TEXT: case SH_IMAGE: {
+        if (!has_rot(s)) return shape_local_rect(s);
+        ImVec2 c[4]; shape_obb(s, c);
+        r.mn = r.mx = c[0];
+        for (int i = 1; i < 4; i++) r.include(c[i]);
+    } break;
     case SH_ARROW: {
         ImVec2 pa = arrow_end_pos(s.a), pb = arrow_end_pos(s.b);
         r.mn = r.mx = pa; r.include(pb);
@@ -389,6 +420,7 @@ static std::vector<uint64_t> g_sel;
 static uint64_t g_drill = 0;        // group id whose CHILDREN are directly selectable
 static uint64_t g_editText = 0;     // text shape being edited
 static bool     g_editTextTakeFocus = false;
+static bool     g_editEverActive = false;   // editor item has held focus at least once
 static std::string g_editPrev;      // last-frame text (escape-revert workaround)
 static uint64_t g_editLabelArrow = 0;   // arrow whose label is being edited
 
@@ -416,10 +448,12 @@ static json shape_to_json(const Shape& s) {
         j["text"] = s.text; j["family"] = s.family; j["tsize"] = s.tsize;
         if (s.scale != 1.f) j["scale"] = s.scale;
         j["x"] = s.pos.x; j["y"] = s.pos.y;
+        if (s.rot != 0.f) j["rot"] = s.rot;
         break;
     case SH_IMAGE:
         j["asset"] = s.asset; j["x"] = s.pos.x; j["y"] = s.pos.y;
         j["w"] = s.size.x; j["h"] = s.size.y;
+        if (s.rot != 0.f) j["rot"] = s.rot;
         if (s.crop.x != 0 || s.crop.y != 0 || s.crop.z != 1 || s.crop.w != 1)
             j["crop"] = { s.crop.x, s.crop.y, s.crop.z, s.crop.w };
         if (s.loopA >= 0) j["loopA"] = s.loopA;
@@ -449,11 +483,13 @@ static Shape shape_from_json(const json& j) {
         s.family = j.value("family", (int)FF_HAND); s.tsize = j.value("tsize", kDefaultTextSize);
         s.scale = j.value("scale", 1.f);
         s.pos = ImVec2(j.value("x", 0.f), j.value("y", 0.f));
+        s.rot = j.value("rot", 0.f);
         break;
     case SH_IMAGE:
         s.asset = j.value("asset", std::string());
         s.pos = ImVec2(j.value("x", 0.f), j.value("y", 0.f));
         s.size = ImVec2(j.value("w", 0.f), j.value("h", 0.f));
+        s.rot = j.value("rot", 0.f);
         if (j.contains("crop") && j["crop"].is_array() && j["crop"].size() == 4)
             s.crop = ImVec4(j["crop"][0], j["crop"][1], j["crop"][2], j["crop"][3]);
         s.loopA = j.value("loopA", -1.f);
@@ -1199,8 +1235,9 @@ static uint64_t hit_test(ImVec2 w) {
                 if (dist_point_seg(w, pl[k], pl[k + 1]) < th) return s.id;
             continue;
         }
-        WRect b = shape_bounds(s);
-        if (b.contains(w)) return s.id;
+        WRect b = shape_local_rect(s);
+        ImVec2 p = s.rot != 0.f ? rot_about(w, b.center(), -s.rot) : w;
+        if (b.contains(p)) return s.id;
     }
     return 0;
 }
@@ -1232,16 +1269,26 @@ static void draw_text_shape(ImDrawList* dl, const Shape& s) {
     float px = text_px(s) * g_cam.zoom;
     ImVec2 sp = W2S(s.pos);
     ImU32 col = g_th.textMain;
+    int vtx0 = dl->VtxBuffer.Size;
     if (px <= kMaxGlyphPx) {
         dl->AddText(g_fonts[s.family], px, sp, col, s.text.c_str());
     } else {
         // zoomed way in: draw at capped raster size, scale geometry up
         float k = px / kMaxGlyphPx;
-        int vtx0 = dl->VtxBuffer.Size;
         dl->AddText(g_fonts[s.family], kMaxGlyphPx, ImVec2(0, 0), col, s.text.c_str());
         for (int i = vtx0; i < dl->VtxBuffer.Size; i++) {
             ImDrawVert& v = dl->VtxBuffer[i];
             v.pos.x = v.pos.x * k + sp.x; v.pos.y = v.pos.y * k + sp.y;
+        }
+    }
+    if (s.rot != 0.f) {
+        ImVec2 c = W2S(shape_local_rect(s).center());
+        float sn = sinf(s.rot), cs = cosf(s.rot);
+        for (int i = vtx0; i < dl->VtxBuffer.Size; i++) {
+            ImDrawVert& v = dl->VtxBuffer[i];
+            float dx = v.pos.x - c.x, dy = v.pos.y - c.y;
+            v.pos.x = c.x + dx * cs - dy * sn;
+            v.pos.y = c.y + dx * sn + dy * cs;
         }
     }
 }
@@ -1284,7 +1331,7 @@ static void draw_arrow_shape(ImDrawList* dl, const Shape& s, bool ghostEnd = fal
 }
 
 // ─────────────────────────── canvas interaction ────────────────────────────
-enum DragMode { DM_NONE = 0, DM_PENDING, DM_MOVE, DM_MARQUEE, DM_HANDLE, DM_CROP,
+enum DragMode { DM_NONE = 0, DM_PENDING, DM_MOVE, DM_MARQUEE, DM_HANDLE, DM_CROP, DM_ROTATE,
                 DM_ARROW_A, DM_ARROW_B, DM_BEND, DM_NEW_ARROW, DM_PAN_R };
 static DragMode g_drag = DM_NONE;
 static ImVec2   g_dragStartW, g_dragStartS;    // world/screen at mousedown
@@ -1292,7 +1339,10 @@ static ImVec2   g_lastDragW;
 static uint64_t g_downLeaf = 0, g_downTarget = 0;
 static bool     g_downWasSelected = false;
 static int      g_handleIdx = -1;              // 0 tl, 1 tr, 2 br, 3 bl
-static WRect    g_handleStartBounds;
+static ImVec2   g_handleFixedW;                // resize: fixed (opposite) corner, world
+static float    g_handleStartDist = 1.f;       // resize: mousedown distance to fixed corner
+static ImVec2   g_rotPivotW;                   // rotate: pivot (selection center), world
+static float    g_rotStartAngle = 0.f;
 static std::vector<std::pair<uint64_t, Shape>> g_handleStartShapes;  // id → snapshot
 static uint64_t g_newArrowId = 0;
 static bool     g_rDrag = false;               // right button turned into a pan
@@ -1302,7 +1352,7 @@ static Tool g_tool = TOOL_SELECT;
 static bool g_spacePan = false;
 
 static void begin_text_edit(uint64_t id) {
-    g_editText = id; g_editTextTakeFocus = true;
+    g_editText = id; g_editTextTakeFocus = true; g_editEverActive = false;
     Shape* s = find_shape(id);
     g_editPrev = s ? s->text : std::string();
     g_editLabelArrow = 0;
@@ -1335,12 +1385,13 @@ static void try_bind(ArrowEnd& e, ImVec2 w, uint64_t selfId) {
     for (int i = (int)g_doc.shapes.size() - 1; i >= 0; i--) {
         Shape& s = g_doc.shapes[i];
         if (s.id == selfId || s.type == SH_ARROW || s.type == SH_GROUP) continue;
-        WRect b = shape_bounds(s);
-        if (b.contains(w)) {
+        WRect b = shape_local_rect(s);
+        ImVec2 p = s.rot != 0.f ? rot_about(w, b.center(), -s.rot) : w;   // anchor in local frame
+        if (b.contains(p)) {
             ImVec2 sz = b.size();
             e.bind = s.id;
-            e.anchor = ImVec2(sz.x > 0 ? (w.x - b.mn.x) / sz.x : 0.5f,
-                              sz.y > 0 ? (w.y - b.mn.y) / sz.y : 0.5f);
+            e.anchor = ImVec2(sz.x > 0 ? (p.x - b.mn.x) / sz.x : 0.5f,
+                              sz.y > 0 ? (p.y - b.mn.y) / sz.y : 0.5f);
             return;
         }
     }
@@ -1368,23 +1419,42 @@ static void DrawGrid(ImDrawList* dl, ImVec2 size) {
             dl->AddRectFilled(ImVec2(x - r, y - r), ImVec2(x + r, y + r), col, r);
 }
 
-// selection outline + corner handles; returns hovered handle (-1 none)
+// selection outline + corner handles (OBB for a single rotated shape, AABB
+// otherwise). Returns hover: 0-3 = corner handle, 4-7 = the rotate ring just
+// OUTSIDE corner i-4, -1 = none. Corner order: tl tr br bl.
+static ImVec2 g_selCorners[4];   // screen space
+static ImVec2 g_selCenterS;
 static int draw_selection_ui(ImDrawList* dl, bool handlesActive) {
     if (g_sel.empty()) return -1;
-    WRect b = selection_bounds();
-    ImVec2 mn = W2S(b.mn) - ImVec2(4, 4), mx = W2S(b.mx) + ImVec2(4, 4);
-    dl->AddRect(mn, mx, g_th.selStroke, 4.f, 0, 1.5f);
-    int hover = -1;
-    if (!handlesActive) return -1;
-    ImVec2 corners[4] = { mn, ImVec2(mx.x, mn.y), mx, ImVec2(mn.x, mx.y) };
-    ImVec2 m = ImGui::GetIO().MousePos;
-    for (int i = 0; i < 4; i++) {
-        float r = 5.f;
-        bool h = fabsf(m.x - corners[i].x) < r + 3 && fabsf(m.y - corners[i].y) < r + 3;
-        if (h) hover = i;
-        dl->AddCircleFilled(corners[i], r, g_th.handleFill);
-        dl->AddCircle(corners[i], r, g_th.selStroke, 0, 1.5f);
+    Shape* single = g_sel.size() == 1 ? find_shape(g_sel[0]) : nullptr;
+    if (single && (single->type == SH_TEXT || single->type == SH_IMAGE)) {
+        ImVec2 c[4]; shape_obb(*single, c, 4.f / g_cam.zoom);
+        for (int i = 0; i < 4; i++) g_selCorners[i] = W2S(c[i]);
+    } else {
+        WRect b = selection_bounds();
+        ImVec2 mn = W2S(b.mn) - ImVec2(4, 4), mx = W2S(b.mx) + ImVec2(4, 4);
+        g_selCorners[0] = mn; g_selCorners[1] = ImVec2(mx.x, mn.y);
+        g_selCorners[2] = mx; g_selCorners[3] = ImVec2(mn.x, mx.y);
     }
+    g_selCenterS = (g_selCorners[0] + g_selCorners[2]) * 0.5f;
+    ImVec2 poly[4] = { g_selCorners[0], g_selCorners[1], g_selCorners[2], g_selCorners[3] };
+    dl->AddPolyline(poly, 4, g_th.selStroke, ImDrawFlags_Closed, 1.5f);
+    if (!handlesActive) return -1;
+    int hover = -1;
+    ImVec2 m = ImGui::GetIO().MousePos;
+    const float r = 5.f;
+    for (int i = 0; i < 4; i++)
+        if (vlen(m - g_selCorners[i]) < r + 3) hover = i;
+    if (hover < 0)   // rotate ring: a band just outside each corner handle
+        for (int i = 0; i < 4; i++) {
+            float d = vlen(m - g_selCorners[i]);
+            if (d >= r + 3 && d < r + 17) hover = 4 + i;
+        }
+    for (int i = 0; i < 4; i++) {
+        dl->AddCircleFilled(g_selCorners[i], r, g_th.handleFill);
+        dl->AddCircle(g_selCorners[i], r, g_th.selStroke, 0, 1.5f);
+    }
+    if (hover >= 4) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     return hover;
 }
 
@@ -1471,8 +1541,17 @@ static void DrawContextMenu() {
             for (auto id : g_sel) { Shape* s = find_shape(id);
                 if (!s || s->type != SH_IMAGE) continue;
                 WRect F = image_full_rect(*s);
-                s->pos = F.mn; s->size = F.size(); s->crop = ImVec4(0, 0, 1, 1);
+                ImVec2 c0 = s->pos + s->size * 0.5f;
+                ImVec2 cw = s->rot != 0.f ? rot_about(F.center(), c0, s->rot) : F.center();
+                s->size = F.size(); s->pos = cw - s->size * 0.5f;
+                s->crop = ImVec4(0, 0, 1, 1);
             }
+            push_undo();
+        }
+        bool haveRot = false;
+        for (auto id : g_sel) { Shape* s = find_shape(id); if (s && s->rot != 0.f) haveRot = true; }
+        if (haveRot && ImGui::MenuItem("reset rotation")) {
+            for (auto id : g_sel) { Shape* s = find_shape(id); if (s) s->rot = 0.f; }
             push_undo();
         }
         if (haveText) {
@@ -1646,7 +1725,11 @@ static void DrawTextEditOverlay() {
     std::string before = *str;
     ImGui::InputTextMultiline("##t", str, box, ImGuiInputTextFlags_NoHorizontalScroll);
     bool active = ImGui::IsItemActive();
-    bool deactivated = ImGui::IsItemDeactivated();
+    if (active) g_editEverActive = true;
+    // focus takes a frame to land: never evaluate commit conditions before the
+    // item has actually been active, or the creating click kills the editor
+    bool deactivated = g_editEverActive && ImGui::IsItemDeactivated();
+    if (!g_editEverActive) { g_editPrev = *str; ImGui::End(); ImGui::PopStyleVar(2); ImGui::PopStyleColor(3); ImGui::PopFont(); return; }
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         // imgui's escape reverts the buffer to its value at activation; we want
         // escape = commit-what-you-see, so restore last frame's text
@@ -1697,10 +1780,16 @@ static void CanvasFrame() {
 #ifdef TEI_LIBAV
             else srv = video_srv(s, mk);
 #endif
-            if (srv) {
+            if (srv && s.rot == 0.f) {
                 dl->AddImageRounded((ImTextureID)(intptr_t)srv, mn, mx,
                                     ImVec2(s.crop.x, s.crop.y), ImVec2(s.crop.z, s.crop.w),
                                     IM_COL32_WHITE, 5.f);
+            } else if (srv) {
+                ImVec2 c[4]; shape_obb(s, c);
+                ImVec2 sc[4]; for (int i = 0; i < 4; i++) sc[i] = W2S(c[i]);
+                dl->AddImageQuad((ImTextureID)(intptr_t)srv, sc[0], sc[1], sc[2], sc[3],
+                                 ImVec2(s.crop.x, s.crop.y), ImVec2(s.crop.z, s.crop.y),
+                                 ImVec2(s.crop.z, s.crop.w), ImVec2(s.crop.x, s.crop.w));
             } else {
                 dl->AddRectFilled(mn, mx, IM_COL32(120, 120, 128, 50), 5.f);
                 dl->AddRect(mn, mx, IM_COL32(120, 120, 128, 120), 5.f);
@@ -1812,7 +1901,7 @@ static void CanvasFrame() {
                 if (vlen(io.MousePos - agz.pb) < r) { g_drag = DM_ARROW_B; goto down_done; }
                 if (vlen(io.MousePos - agz.mid) < r) { g_drag = DM_BEND; goto down_done; }
             }
-            if (hoverHandle >= 0 && io.KeyCtrl && g_sel.size() == 1) {
+            if (hoverHandle >= 0 && hoverHandle < 4 && io.KeyCtrl && g_sel.size() == 1) {
                 // ctrl+corner on a single image = crop
                 Shape* s = find_shape(g_sel[0]);
                 if (s && s->type == SH_IMAGE) {
@@ -1823,12 +1912,19 @@ static void CanvasFrame() {
                 }
             }
             if (hoverHandle >= 0) {
-                g_drag = DM_HANDLE; g_handleIdx = hoverHandle;
-                g_handleStartBounds = selection_bounds();
                 g_handleStartShapes.clear();
                 std::vector<uint64_t> all = g_sel;
                 for (auto id : g_sel) { Shape* s = find_shape(id); if (s && s->type == SH_GROUP) collect_members(id, all); }
                 for (auto id : all) { Shape* s = find_shape(id); if (s) g_handleStartShapes.push_back({ id, *s }); }
+                if (hoverHandle < 4) {
+                    g_drag = DM_HANDLE; g_handleIdx = hoverHandle;
+                    g_handleFixedW = S2W(g_selCorners[(hoverHandle + 2) & 3]);
+                    g_handleStartDist = fmaxf(vlen(mw - g_handleFixedW), 0.001f);
+                } else {
+                    g_drag = DM_ROTATE;
+                    g_rotPivotW = S2W(g_selCenterS);
+                    g_rotStartAngle = atan2f(mw.y - g_rotPivotW.y, mw.x - g_rotPivotW.x);
+                }
                 goto down_done;
             }
             g_downLeaf = hit_test(mw);
@@ -1881,19 +1977,10 @@ static void CanvasFrame() {
     }
 
     if (g_drag == DM_HANDLE) {
-        // corner resize: scale about the opposite corner; text scales its font
-        WRect& b0 = g_handleStartBounds;
-        ImVec2 fixed = g_handleIdx == 0 ? b0.mx : g_handleIdx == 1 ? ImVec2(b0.mn.x, b0.mx.y)
-                     : g_handleIdx == 2 ? b0.mn : ImVec2(b0.mx.x, b0.mn.y);
-        ImVec2 sz0 = b0.size();
-        float k = 1.f;
-        if (sz0.x > 1 || sz0.y > 1) {
-            ImVec2 d0 = (g_handleIdx == 0 ? b0.mn : g_handleIdx == 1 ? ImVec2(b0.mx.x, b0.mn.y)
-                        : g_handleIdx == 2 ? b0.mx : ImVec2(b0.mn.x, b0.mx.y)) - fixed;
-            ImVec2 d1 = mw - fixed;
-            float k0 = fabsf(d0.x) > fabsf(d0.y) ? d1.x / d0.x : d1.y / d0.y;
-            k = fmaxf(0.05f, k0);
-        }
+        // corner resize: uniform scale about the opposite corner (distance
+        // ratio — rotation-agnostic); text scales its continuous font multiplier
+        ImVec2 fixed = g_handleFixedW;
+        float k = fmaxf(0.05f, vlen(mw - fixed) / g_handleStartDist);
         for (auto& [id, snap] : g_handleStartShapes) {
             Shape* s = find_shape(id); if (!s) continue;
             auto sc = [&](ImVec2 p) { return fixed + (p - fixed) * k; };
@@ -1911,26 +1998,63 @@ static void CanvasFrame() {
         ImGui::SetMouseCursor(g_handleIdx % 2 == 0 ? ImGuiMouseCursor_ResizeNWSE : ImGuiMouseCursor_ResizeNESW);
     }
 
+    if (g_drag == DM_ROTATE) {
+        float ang = atan2f(mw.y - g_rotPivotW.y, mw.x - g_rotPivotW.x);
+        float dth = ang - g_rotStartAngle;
+        if (io.KeyShift) dth = roundf(dth / (IM_PI / 12.f)) * (IM_PI / 12.f);   // 15° steps
+        for (auto& [id, snap] : g_handleStartShapes) {
+            Shape* s = find_shape(id); if (!s) continue;
+            switch (s->type) {
+            case SH_TEXT: case SH_IMAGE: {
+                ImVec2 c0 = shape_local_rect(snap).center();
+                ImVec2 c1 = rot_about(c0, g_rotPivotW, dth);
+                s->rot = snap.rot + dth;
+                s->pos = snap.pos + (c1 - c0);
+            } break;
+            case SH_ARROW:
+                if (!snap.a.bind) s->a.p = rot_about(snap.a.p, g_rotPivotW, dth);
+                if (!snap.b.bind) s->b.p = rot_about(snap.b.p, g_rotPivotW, dth);
+                break;
+            case SH_GROUP: break;
+            }
+        }
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    }
+
     if (g_drag == DM_CROP && !g_handleStartShapes.empty()) {
         Shape* s = find_shape(g_handleStartShapes[0].first);
         const Shape& snap = g_handleStartShapes[0].second;
         if (s) {
-            WRect F = image_full_rect(snap);   // full-image projection stays fixed
-            // ghost: the whole source at low alpha, crop region drawn normally after
+            // all crop math happens in the shape's LOCAL (unrotated) frame;
+            // c0 = the snapshot's rotation pivot, fixed for the whole drag
+            ImVec2 c0 = snap.pos + snap.size * 0.5f;
+            float rt = snap.rot;
+            ImVec2 ml = rt != 0.f ? rot_about(mw, c0, -rt) : mw;
+            WRect F = image_full_rect(snap);   // full-image projection (local), stays fixed
+            // ghost: the whole source at low alpha (+outline), rotated into place
+            ImVec2 fc[4] = { F.mn, ImVec2(F.mx.x, F.mn.y), F.mx, ImVec2(F.mn.x, F.mx.y) };
+            ImVec2 gp[4];
+            for (int i = 0; i < 4; i++) gp[i] = W2S(rt != 0.f ? rot_about(fc[i], c0, rt) : fc[i]);
             Tex* t = get_image_tex(s->asset);
             if (t->srv)
-                dl->AddImage((ImTextureID)(intptr_t)t->srv, W2S(F.mn), W2S(F.mx),
-                             ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, 80));
-            dl->AddRect(W2S(F.mn), W2S(F.mx), g_th.selStroke, 0, 0, 1.f);
+                dl->AddImageQuad((ImTextureID)(intptr_t)t->srv, gp[0], gp[1], gp[2], gp[3],
+                                 ImVec2(0, 0), ImVec2(1, 0), ImVec2(1, 1), ImVec2(0, 1),
+                                 IM_COL32(255, 255, 255, 80));
+            dl->AddPolyline(gp, 4, g_th.selStroke, ImDrawFlags_Closed, 1.f);
             // drag the grabbed corner of the display rect, clamped inside F
             ImVec2 mn = snap.pos, mx = snap.pos + snap.size;
-            ImVec2 p(fminf(fmaxf(mw.x, F.mn.x), F.mx.x), fminf(fmaxf(mw.y, F.mn.y), F.mx.y));
+            ImVec2 p(fminf(fmaxf(ml.x, F.mn.x), F.mx.x), fminf(fmaxf(ml.y, F.mn.y), F.mx.y));
             float minSz = 8.f;
             if (g_handleIdx == 0)      { mn.x = fminf(p.x, mx.x - minSz); mn.y = fminf(p.y, mx.y - minSz); }
             else if (g_handleIdx == 1) { mx.x = fmaxf(p.x, mn.x + minSz); mn.y = fminf(p.y, mx.y - minSz); }
             else if (g_handleIdx == 2) { mx.x = fmaxf(p.x, mn.x + minSz); mx.y = fmaxf(p.y, mn.y + minSz); }
             else                       { mn.x = fminf(p.x, mx.x - minSz); mx.y = fmaxf(p.y, mn.y + minSz); }
-            s->pos = mn; s->size = mx - mn;
+            s->size = mx - mn;
+            // reposition so the full-image projection is visually unmoved even
+            // though the rotation pivot migrates to the new rect's center
+            ImVec2 cl = (mn + mx) * 0.5f;
+            ImVec2 cw = rt != 0.f ? rot_about(cl, c0, rt) : cl;
+            s->pos = cw - s->size * 0.5f;
             ImVec2 fsz = F.size();
             s->crop = ImVec4((mn.x - F.mn.x) / fsz.x, (mn.y - F.mn.y) / fsz.y,
                              (mx.x - F.mn.x) / fsz.x, (mx.y - F.mn.y) / fsz.y);
@@ -1977,7 +2101,7 @@ static void CanvasFrame() {
             } else if (leafS && leafS->type == SH_ARROW && dbl) {
                 // double-click arrow → edit its label
                 g_sel.clear(); g_sel.push_back(g_downLeaf);
-                g_editLabelArrow = g_downLeaf; g_editTextTakeFocus = true;
+                g_editLabelArrow = g_downLeaf; g_editTextTakeFocus = true; g_editEverActive = false;
                 g_editPrev = leafS->label;
             } else if (g_downWasSelected && g_downTarget != g_downLeaf) {
                 // click again on a selected group → drill one level toward the leaf
@@ -1991,9 +2115,8 @@ static void CanvasFrame() {
                         break;
                     }
             } else if (leafS && leafS->type == SH_TEXT && g_downTarget == g_downLeaf &&
-                       (g_downWasSelected || !leafS->parent || g_drill)) {
-                // click text → edit it (grouped text needs its drill click first)
-                g_sel.clear(); g_sel.push_back(g_downLeaf);
+                       g_downWasSelected && g_sel.size() == 1) {
+                // click on already-selected text → edit (first click only selects)
                 begin_text_edit(g_downLeaf);
             } else {
                 g_sel.clear(); g_sel.push_back(g_downTarget);
@@ -2002,7 +2125,7 @@ static void CanvasFrame() {
         }
 
         if (g_drag == DM_MOVE || g_drag == DM_HANDLE || g_drag == DM_CROP ||
-            g_drag == DM_ARROW_A || g_drag == DM_ARROW_B || g_drag == DM_BEND)
+            g_drag == DM_ROTATE || g_drag == DM_ARROW_A || g_drag == DM_ARROW_B || g_drag == DM_BEND)
             push_undo();
 
         if (g_drag == DM_NEW_ARROW) {
