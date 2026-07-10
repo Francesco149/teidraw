@@ -28,7 +28,8 @@ nix develop --command make -C editor    # → build/teidraw.exe (Win64 PE)
 `V` select · `H` hand · `T` text · `A` arrow · `Del` delete ·
 `Ctrl+Z/Y` undo/redo · `Ctrl+C/X/V` clipboard · `Ctrl+D` duplicate ·
 `Ctrl+G` group · `Ctrl+Shift+G` ungroup · `[` `]` z-order ·
-`Ctrl+A` select all · `Ctrl+Shift+D` theme · `Esc` pop/deselect
+`Ctrl+A` select all · `Ctrl+Shift+D` theme · `Esc` pop/deselect ·
+`Shift+1` zoom to fit · `Shift+2` zoom to selection · `Shift+0` 100%
 
 ## License
 

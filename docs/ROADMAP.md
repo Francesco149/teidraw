@@ -28,7 +28,7 @@ play/stop/seek/A-B pill, dynamic-texture upload. Shape clipboard.
   (tldraw's alignment polish); arrow-key nudge; shift-drag axis lock.
 - Text wrap width (drag side handles to set a wrap box).
 - Multi-monitor DPI changes (WM_DPICHANGED restyle).
-- Zoom-to-fit (Shift+1), zoom-to-selection (Shift+2), animated zoom easing.
+
 
 ## M4 — polish & performance
 - Viewport culling + text-extent caching (only matters at 1000s of shapes).

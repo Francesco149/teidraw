@@ -21,6 +21,14 @@ Enter on an empty item ends the list — bullet glyph verified in all 4 fonts);
 editor's local space each frame (canvas input suspended meanwhile) and the
 editor's draw output (glyphs/caret/selection) is rotated back + clip rects
 opened, so the shape never snaps straight while editing.
+Session 3b: backspace on an empty list item deletes the marker AND joins the
+previous line (deletion detected via buffer-length tracking in the edit
+callback); fixed the one-line-short editor box after Enter (CalcTextSize
+drops a trailing empty line → transient scrollbar) + scrollbar hidden in the
+overlay; the selection box turns rigidly during multi-selection rotation
+(corners captured at gesture start) instead of re-fitting a bulging AABB;
+**zoom commands** Shift+1 fit / Shift+2 selection / Shift+0 100%, all flying
+the camera with a 180 ms ease-out (log-zoom lerp; any wheel/pan cancels).
 
 ## Build & verify
 ```

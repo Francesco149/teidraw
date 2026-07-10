@@ -251,13 +251,49 @@ static Camera g_cam;
 static ImVec2 W2S(ImVec2 w) { return ImVec2(w.x * g_cam.zoom + g_cam.pan.x, w.y * g_cam.zoom + g_cam.pan.y); }
 static ImVec2 S2W(ImVec2 s) { return ImVec2((s.x - g_cam.pan.x) / g_cam.zoom, (s.y - g_cam.pan.y) / g_cam.zoom); }
 
+// short eased camera flights for the zoom commands (wheel/pan stay immediate
+// and cancel any flight in progress — direct input always wins)
+struct CamAnim { bool active = false; double t0 = 0; ImVec2 pan0, pan1; float z0 = 1, z1 = 1; };
+static CamAnim g_camAnim;
+
 static void ZoomAt(ImVec2 pivot, float factor) {
+    g_camAnim.active = false;
     float z = g_cam.zoom * factor;
     z = z < 0.02f ? 0.02f : (z > 64.f ? 64.f : z);
     factor = z / g_cam.zoom;
     g_cam.pan.x = pivot.x - (pivot.x - g_cam.pan.x) * factor;
     g_cam.pan.y = pivot.y - (pivot.y - g_cam.pan.y) * factor;
     g_cam.zoom = z;
+}
+
+static void start_cam_anim(ImVec2 pan1, float z1) {
+    g_camAnim = { true, ImGui::GetTime(), g_cam.pan, pan1, g_cam.zoom, z1 };
+}
+static void tick_cam_anim() {
+    if (!g_camAnim.active) return;
+    const float dur = 0.18f;
+    float u = (float)((ImGui::GetTime() - g_camAnim.t0) / dur);
+    if (u >= 1.f) { u = 1.f; g_camAnim.active = false; }
+    float e = 1.f - powf(1.f - u, 3.f);   // ease-out cubic
+    g_cam.zoom = expf(logf(g_camAnim.z0) + (logf(g_camAnim.z1) - logf(g_camAnim.z0)) * e);
+    g_cam.pan = g_camAnim.pan0 + (g_camAnim.pan1 - g_camAnim.pan0) * e;
+}
+
+// fly the camera so `r` (world) fits the viewport with a margin, capped at
+// 100% — wheel in from there if you want closer
+static void zoom_to_rect(const WRect& r, ImVec2 vpSize) {
+    ImVec2 sz = r.size();
+    if (sz.x < 1 && sz.y < 1) return;
+    const float pad = 72.f;
+    float z = fminf((vpSize.x - pad * 2) / fmaxf(sz.x, 1.f),
+                    (vpSize.y - pad * 2) / fmaxf(sz.y, 1.f));
+    z = fminf(fmaxf(z, 0.02f), 1.f);
+    ImVec2 c = r.center();
+    start_cam_anim(ImVec2(vpSize.x * 0.5f - c.x * z, vpSize.y * 0.5f - c.y * z), z);
+}
+static void zoom_to_100(ImVec2 vpSize) {
+    ImVec2 c = S2W(vpSize * 0.5f);   // keep the view center put
+    start_cam_anim(ImVec2(vpSize.x * 0.5f - c.x, vpSize.y * 0.5f - c.y), 1.f);
 }
 
 // ─────────────────────────── document model ────────────────────────────────
@@ -1348,6 +1384,14 @@ static ImVec2   g_handleFixedW;                // resize: fixed (opposite) corne
 static float    g_handleStartDist = 1.f;       // resize: mousedown distance to fixed corner
 static ImVec2   g_rotPivotW;                   // rotate: pivot (selection center), world
 static float    g_rotStartAngle = 0.f;
+static ImVec2   g_rotCornersW[4];              // selection box at rotate start (world) — the box rotates rigidly
+
+static float current_rot_delta(ImVec2 mw, bool shiftSnap) {
+    float ang = atan2f(mw.y - g_rotPivotW.y, mw.x - g_rotPivotW.x);
+    float dth = ang - g_rotStartAngle;
+    if (shiftSnap) dth = roundf(dth / (IM_PI / 12.f)) * (IM_PI / 12.f);   // 15° steps
+    return dth;
+}
 static std::vector<std::pair<uint64_t, Shape>> g_handleStartShapes;  // id → snapshot
 static uint64_t g_newArrowId = 0;
 static bool     g_rDrag = false;               // right button turned into a pan
@@ -1356,8 +1400,10 @@ enum Tool { TOOL_SELECT = 0, TOOL_HAND, TOOL_TEXT, TOOL_ARROW, TOOL_COUNT };
 static Tool g_tool = TOOL_SELECT;
 static bool g_spacePan = false;
 
+static int g_editLastLen = -1;   // auto-list callback: deletion detection across calls
 static void begin_text_edit(uint64_t id) {
     g_editText = id; g_editTextTakeFocus = true; g_editEverActive = false;
+    g_editLastLen = -1;
     Shape* s = find_shape(id);
     g_editPrev = s ? s->text : std::string();
     g_editLabelArrow = 0;
@@ -1431,6 +1477,20 @@ static ImVec2 g_selCorners[4];   // screen space
 static ImVec2 g_selCenterS;
 static int draw_selection_ui(ImDrawList* dl, bool handlesActive) {
     if (g_sel.empty()) return -1;
+    if (g_drag == DM_ROTATE) {
+        // while rotating, the box captured at gesture start turns rigidly with
+        // the selection instead of re-fitting to a (bulging) AABB every frame
+        ImGuiIO& io = ImGui::GetIO();
+        float dth = current_rot_delta(S2W(io.MousePos), io.KeyShift);
+        for (int i = 0; i < 4; i++) g_selCorners[i] = W2S(rot_about(g_rotCornersW[i], g_rotPivotW, dth));
+        g_selCenterS = (g_selCorners[0] + g_selCorners[2]) * 0.5f;
+        dl->AddPolyline(g_selCorners, 4, g_th.selStroke, ImDrawFlags_Closed, 1.5f);
+        for (int i = 0; i < 4; i++) {
+            dl->AddCircleFilled(g_selCorners[i], 5.f, g_th.handleFill);
+            dl->AddCircle(g_selCorners[i], 5.f, g_th.selStroke, 0, 1.5f);
+        }
+        return -1;
+    }
     Shape* single = g_sel.size() == 1 ? find_shape(g_sel[0]) : nullptr;
     if (single && (single->type == SH_TEXT || single->type == SH_IMAGE)) {
         ImVec2 c[4]; shape_obb(*single, c, 4.f / g_cam.zoom);
@@ -1515,10 +1575,9 @@ static void DrawZoomPill() {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
     char z[32]; snprintf(z, sizeof z, "%d%%", (int)roundf(g_cam.zoom * 100.f));
-    if (ImGui::Button(z)) {
-        ImVec2 c = ImVec2(ImGui::GetMainViewport()->Size.x * 0.5f, ImGui::GetMainViewport()->Size.y * 0.5f);
-        ZoomAt(c, 1.f / g_cam.zoom);
-    }
+    if (ImGui::Button(z)) zoom_to_100(ImGui::GetMainViewport()->Size);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("100%% (Shift+0) · fit (Shift+1) · selection (Shift+2)");
     ImGui::End();
 }
 
@@ -1698,11 +1757,26 @@ static void DrawVideoOverlay() {
 // strips the marker and ends the list. Markdown-editor muscle memory.
 static const char* kBullet = "\xe2\x80\xa2 ";   // "• " (4 bytes)
 
-static int TextEditCallback(ImGuiInputTextCallbackData* d) {
-    if (d->EventFlag != ImGuiInputTextFlags_CallbackEdit || d->BufTextLen <= 0) return 0;
+static void text_edit_apply(ImGuiInputTextCallbackData* d, bool deleted) {
+    if (d->BufTextLen <= 0) return;
     int cur = d->CursorPos;
-    if (cur < 1 || cur > d->BufTextLen) return 0;
+    if (cur < 1 || cur > d->BufTextLen) return;
     auto line_start = [&](int from) { int i = from; while (i > 0 && d->Buf[i - 1] != '\n') i--; return i; };
+
+    if (deleted) {
+        // backspaced down to a bare marker ("• " lost its space): remove the
+        // marker AND the newline before it — back to the previous line
+        int ls = line_start(cur);
+        int i = ls; while (i < cur && d->Buf[i] == ' ') i++;
+        bool bareBullet = (cur - i == 3 && !memcmp(d->Buf + i, "\xe2\x80\xa2", 3));
+        int j = i; while (j < cur - 1 && isdigit((unsigned char)d->Buf[j])) j++;
+        bool bareNumber = (j > i && j == cur - 1 && d->Buf[j] == '.');
+        if (bareBullet || bareNumber) {
+            int from = ls > 0 ? ls - 1 : ls;    // include the preceding '\n' if any
+            d->DeleteChars(from, cur - from);
+        }
+        return;
+    }
 
     if (d->Buf[cur - 1] == ' ' && cur >= 2) {
         // just typed the space of a "- " / "* " marker at line start?
@@ -1712,7 +1786,7 @@ static int TextEditCallback(ImGuiInputTextCallbackData* d) {
             d->DeleteChars(i, 2);
             d->InsertChars(i, kBullet);
         }
-        return 0;
+        return;
     }
     if (d->Buf[cur - 1] == '\n') {
         // Enter: continue (or end) the previous line's list
@@ -1723,7 +1797,7 @@ static int TextEditCallback(ImGuiInputTextCallbackData* d) {
         if (pe - i >= 4 && !memcmp(d->Buf + i, kBullet, 4)) {
             if (pe - i == 4) d->DeleteChars(i, pe - i);        // empty item → end list
             else { std::string ins = indent + kBullet; d->InsertChars(d->CursorPos, ins.c_str()); }
-            return 0;
+            return;
         }
         int j = i; while (j < pe && j - i < 9 && isdigit((unsigned char)d->Buf[j])) j++;
         if (j > i && j < pe && d->Buf[j] == '.' && (j + 1 == pe || d->Buf[j + 1] == ' ')) {
@@ -1736,6 +1810,13 @@ static int TextEditCallback(ImGuiInputTextCallbackData* d) {
             }
         }
     }
+}
+
+static int TextEditCallback(ImGuiInputTextCallbackData* d) {
+    if (d->EventFlag != ImGuiInputTextFlags_CallbackEdit) return 0;
+    bool deleted = g_editLastLen >= 0 && d->BufTextLen < g_editLastLen;
+    text_edit_apply(d, deleted);
+    g_editLastLen = d->BufTextLen;   // after our own edits, so they don't read as user deletions
     return 0;
 }
 
@@ -1764,6 +1845,7 @@ static void DrawTextEditOverlay() {
 
     ImGui::PushFont(font, px);
     ImVec2 ext = ImGui::CalcTextSize(str->empty() ? " " : str->c_str());
+    if (!str->empty() && str->back() == '\n') ext.y += px;   // CalcTextSize drops the trailing empty line
     float minW = ImGui::CalcTextSize("MM").x;
     ImVec2 box(fmaxf(ext.x, minW) + px * 0.75f, ext.y + px * 0.5f);
     ImVec2 winPos = isLabel ? anchor - box * 0.5f : anchor;
@@ -1774,6 +1856,7 @@ static void DrawTextEditOverlay() {
     ImGui::PushStyleColor(ImGuiCol_FrameBg, isLabel ? ImGui::ColorConvertU32ToFloat4(g_th.canvasBg) : ImVec4(0, 0, 0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 8));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 1.f);   // no scrollbar flash on growth frames
     ImGui::Begin("##textedit", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNav);
@@ -1815,7 +1898,7 @@ static void DrawTextEditOverlay() {
     // focus takes a frame to land: never evaluate commit conditions before the
     // item has actually been active, or the creating click kills the editor
     bool deactivated = g_editEverActive && ImGui::IsItemDeactivated();
-    if (!g_editEverActive) { g_editPrev = *str; ImGui::End(); ImGui::PopStyleVar(2); ImGui::PopStyleColor(3); ImGui::PopFont(); return; }
+    if (!g_editEverActive) { g_editPrev = *str; ImGui::End(); ImGui::PopStyleVar(3); ImGui::PopStyleColor(3); ImGui::PopFont(); return; }
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         // imgui's escape reverts the buffer to its value at activation; we want
         // escape = commit-what-you-see, so restore last frame's text
@@ -1830,7 +1913,7 @@ static void DrawTextEditOverlay() {
         (void)before;
     }
     ImGui::End();
-    ImGui::PopStyleVar(2);
+    ImGui::PopStyleVar(3);
     ImGui::PopStyleColor(3);
     ImGui::PopFont();
 }
@@ -1843,6 +1926,7 @@ static void CanvasFrame() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
 
+    tick_cam_anim();
     dl->AddRectFilled(vp->Pos, vp->Pos + vp->Size, g_th.canvasBg);
     DrawGrid(dl, vp->Size);
 
@@ -1929,6 +2013,18 @@ static void CanvasFrame() {
         }
         if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) { reorder_selected(true); push_undo(); }
         if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket))  { reorder_selected(false); push_undo(); }
+        if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_1)) {           // zoom to fit everything
+            WRect r; bool first = true;
+            for (auto& s : g_doc.shapes) {
+                if (s.type == SH_GROUP) continue;
+                WRect b = shape_bounds(s);
+                if (first) { r = b; first = false; } else r.include(b);
+            }
+            if (!first) zoom_to_rect(r, vp->Size);
+        }
+        if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_2) && !g_sel.empty())   // zoom to selection
+            zoom_to_rect(selection_bounds(), vp->Size);
+        if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_0)) zoom_to_100(vp->Size);
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
             if (g_drill) g_drill = 0;
             else clear_selection();
@@ -1948,6 +2044,7 @@ static void CanvasFrame() {
     bool handActive = (g_tool == TOOL_HAND) || g_spacePan;
     if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.f) ||
         (handActive && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.f))) {
+        g_camAnim.active = false;
         g_cam.pan = g_cam.pan + io.MouseDelta;
         return;
     }
@@ -1955,7 +2052,7 @@ static void CanvasFrame() {
 
     // ── right button: drag = pan, click = context menu ──
     if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !uiHot) g_rDrag = false;
-    if (ImGui::IsMouseDragging(ImGuiMouseButton_Right, 4.f)) { g_cam.pan = g_cam.pan + io.MouseDelta; g_rDrag = true; }
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Right, 4.f)) { g_camAnim.active = false; g_cam.pan = g_cam.pan + io.MouseDelta; g_rDrag = true; }
     if (ImGui::IsMouseReleased(ImGuiMouseButton_Right) && !g_rDrag && !uiHot) {
         uint64_t leaf = hit_test(mw);
         uint64_t target = resolve_target(leaf);
@@ -2011,6 +2108,7 @@ static void CanvasFrame() {
                     g_drag = DM_ROTATE;
                     g_rotPivotW = S2W(g_selCenterS);
                     g_rotStartAngle = atan2f(mw.y - g_rotPivotW.y, mw.x - g_rotPivotW.x);
+                    for (int i = 0; i < 4; i++) g_rotCornersW[i] = S2W(g_selCorners[i]);
                 }
                 goto down_done;
             }
@@ -2085,9 +2183,7 @@ static void CanvasFrame() {
     }
 
     if (g_drag == DM_ROTATE) {
-        float ang = atan2f(mw.y - g_rotPivotW.y, mw.x - g_rotPivotW.x);
-        float dth = ang - g_rotStartAngle;
-        if (io.KeyShift) dth = roundf(dth / (IM_PI / 12.f)) * (IM_PI / 12.f);   // 15° steps
+        float dth = current_rot_delta(mw, io.KeyShift);
         for (auto& [id, snap] : g_handleStartShapes) {
             Shape* s = find_shape(id); if (!s) continue;
             switch (s->type) {
