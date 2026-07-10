@@ -398,16 +398,20 @@ static void arrow_polyline(const Shape& s, std::vector<ImVec2>& out) {
     auto trim = [&](const ArrowEnd& e, bool fromStart) {
         if (!e.bind) return;
         Shape* t = find_shape(e.bind); if (!t) return;
-        WRect b = shape_bounds(*t);
+        // test against the target's OBB in its local frame — the AABB of a
+        // rotated shape bulges and would eat the arrow (shrink during rotation)
+        WRect b = shape_local_rect(*t);
+        ImVec2 c = b.center(); float rt = t->rot;
         b.mn = b.mn - ImVec2(gap, gap); b.mx = b.mx + ImVec2(gap, gap);
-        // walk inward from this end, drop samples inside the (padded) bbox
+        auto inside = [&](ImVec2 p) { return b.contains(rt != 0.f ? rot_about(p, c, -rt) : p); };
+        // walk inward from this end, drop samples inside the (padded) box
         if (fromStart) {
             size_t i = 0;
-            while (i + 1 < out.size() && b.contains(out[i])) i++;
+            while (i + 1 < out.size() && inside(out[i])) i++;
             if (i > 0) out.erase(out.begin(), out.begin() + i);
         } else {
             size_t i = out.size();
-            while (i > 1 && b.contains(out[i - 1])) i--;
+            while (i > 1 && inside(out[i - 1])) i--;
             if (i < out.size()) out.erase(out.begin() + i, out.end());
         }
     };
@@ -421,6 +425,7 @@ static uint64_t g_drill = 0;        // group id whose CHILDREN are directly sele
 static uint64_t g_editText = 0;     // text shape being edited
 static bool     g_editTextTakeFocus = false;
 static bool     g_editEverActive = false;   // editor item has held focus at least once
+static bool     g_editRemap = false;        // pointer is remapped into a rotated editor's local space
 static std::string g_editPrev;      // last-frame text (escape-revert workaround)
 static uint64_t g_editLabelArrow = 0;   // arrow whose label is being edited
 
@@ -1687,6 +1692,53 @@ static void DrawVideoOverlay() {
 #endif
 }
 
+// ── auto lists ──
+// "- " / "* " at line start becomes a bullet; Enter continues the list
+// ("• " again, or the next number for "12. " items); Enter on an EMPTY item
+// strips the marker and ends the list. Markdown-editor muscle memory.
+static const char* kBullet = "\xe2\x80\xa2 ";   // "• " (4 bytes)
+
+static int TextEditCallback(ImGuiInputTextCallbackData* d) {
+    if (d->EventFlag != ImGuiInputTextFlags_CallbackEdit || d->BufTextLen <= 0) return 0;
+    int cur = d->CursorPos;
+    if (cur < 1 || cur > d->BufTextLen) return 0;
+    auto line_start = [&](int from) { int i = from; while (i > 0 && d->Buf[i - 1] != '\n') i--; return i; };
+
+    if (d->Buf[cur - 1] == ' ' && cur >= 2) {
+        // just typed the space of a "- " / "* " marker at line start?
+        int ls = line_start(cur - 1);
+        int i = ls; while (i < cur - 2 && d->Buf[i] == ' ') i++;
+        if (i == cur - 2 && (d->Buf[i] == '-' || d->Buf[i] == '*')) {
+            d->DeleteChars(i, 2);
+            d->InsertChars(i, kBullet);
+        }
+        return 0;
+    }
+    if (d->Buf[cur - 1] == '\n') {
+        // Enter: continue (or end) the previous line's list
+        int pe = cur - 1;
+        int ps = line_start(pe);
+        int i = ps; while (i < pe && d->Buf[i] == ' ') i++;
+        std::string indent(d->Buf + ps, d->Buf + i);
+        if (pe - i >= 4 && !memcmp(d->Buf + i, kBullet, 4)) {
+            if (pe - i == 4) d->DeleteChars(i, pe - i);        // empty item → end list
+            else { std::string ins = indent + kBullet; d->InsertChars(d->CursorPos, ins.c_str()); }
+            return 0;
+        }
+        int j = i; while (j < pe && j - i < 9 && isdigit((unsigned char)d->Buf[j])) j++;
+        if (j > i && j < pe && d->Buf[j] == '.' && (j + 1 == pe || d->Buf[j + 1] == ' ')) {
+            if (j + 2 >= pe) d->DeleteChars(i, pe - i);        // "12." / "12. " alone → end list
+            else {
+                long n = strtol(std::string(d->Buf + i, d->Buf + j).c_str(), nullptr, 10);
+                char num[32]; snprintf(num, sizeof num, "%ld. ", n + 1);
+                std::string ins = indent + num;
+                d->InsertChars(d->CursorPos, ins.c_str());
+            }
+        }
+    }
+    return 0;
+}
+
 // in-place text editor overlay (canvas text + arrow labels share it)
 static void DrawTextEditOverlay() {
     uint64_t id = g_editText ? g_editText : g_editLabelArrow;
@@ -1706,6 +1758,10 @@ static void DrawTextEditOverlay() {
         anchor = W2S(pl.empty() ? arrow_end_pos(s->a) : pl[pl.size() / 2]);
     } else anchor = W2S(s->pos);
 
+    bool rotated = !isLabel && s->rot != 0.f;
+    ImVec2 rotC = W2S(shape_local_rect(*s).center());   // rotation pivot (screen)
+    float  rotA = s->rot;
+
     ImGui::PushFont(font, px);
     ImVec2 ext = ImGui::CalcTextSize(str->empty() ? " " : str->c_str());
     float minW = ImGui::CalcTextSize("MM").x;
@@ -1723,7 +1779,37 @@ static void DrawTextEditOverlay() {
                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNav);
     if (g_editTextTakeFocus) { ImGui::SetKeyboardFocusHere(); g_editTextTakeFocus = false; }
     std::string before = *str;
-    ImGui::InputTextMultiline("##t", str, box, ImGuiInputTextFlags_NoHorizontalScroll);
+    ImGui::InputTextMultiline("##t", str, box,
+                              ImGuiInputTextFlags_NoHorizontalScroll | ImGuiInputTextFlags_CallbackEdit,
+                              TextEditCallback);
+    if (rotated) {
+        // The editor ran in unrotated space (pointer was inverse-rotated at
+        // frame start). Rotate its finished draw output — glyphs, caret,
+        // selection highlight — back into place and open up the clip rects,
+        // so the shape stays visually rotated while being edited.
+        ImGuiWindow* parent = ImGui::GetCurrentWindow();
+        ImGuiID cid = ImGui::GetID("##t");
+        char nm[256];
+        snprintf(nm, sizeof nm, "%s/##t", parent->Name);
+        ImGuiWindow* child = ImGui::FindWindowByName(nm);
+        if (!child) {
+            snprintf(nm, sizeof nm, "%s/##t_%08X", parent->Name, cid);
+            child = ImGui::FindWindowByName(nm);
+        }
+        if (child && child->DrawList) {
+            ImDrawList* cdl = child->DrawList;
+            float sn = sinf(rotA), cs = cosf(rotA);
+            for (int i = 0; i < cdl->VtxBuffer.Size; i++) {
+                ImDrawVert& v = cdl->VtxBuffer[i];
+                float dx = v.pos.x - rotC.x, dy = v.pos.y - rotC.y;
+                v.pos.x = rotC.x + dx * cs - dy * sn;
+                v.pos.y = rotC.y + dx * sn + dy * cs;
+            }
+            ImVec2 ds = ImGui::GetIO().DisplaySize;
+            for (int i = 0; i < cdl->CmdBuffer.Size; i++)
+                cdl->CmdBuffer[i].ClipRect = ImVec4(0, 0, ds.x, ds.y);
+        }
+    }
     bool active = ImGui::IsItemActive();
     if (active) g_editEverActive = true;
     // focus takes a frame to land: never evaluate commit conditions before the
@@ -1849,6 +1935,7 @@ static void CanvasFrame() {
         }
     } else g_spacePan = false;
 
+    if (g_editRemap) return;   // pointer lives in a rotated editor's space; canvas input suspended
     if (uiHot && g_drag == DM_NONE) return;
 
     ImVec2 mw = S2W(io.MousePos);
@@ -1961,18 +2048,17 @@ static void CanvasFrame() {
         dl->AddRect(W2S(mn), W2S(mx), g_th.selStroke, 2.f, 0, 1.f);
         if (!io.KeyShift) g_sel.clear();
         WRect mr{ mn, mx };
+        // partial overlap selects (hands-on feedback) — plain AABB intersection
+        auto touches = [&](const WRect& b) {
+            return b.mx.x >= mr.mn.x && b.mn.x <= mr.mx.x && b.mx.y >= mr.mn.y && b.mn.y <= mr.mx.y;
+        };
         for (auto& s : g_doc.shapes) {
             if (s.parent || s.type == SH_GROUP) continue;
-            WRect b = shape_bounds(s);
-            if (b.mn.x >= mr.mn.x && b.mx.x <= mr.mx.x && b.mn.y >= mr.mn.y && b.mx.y <= mr.mx.y)
-                if (!is_selected(s.id)) g_sel.push_back(s.id);
+            if (touches(shape_bounds(s)) && !is_selected(s.id)) g_sel.push_back(s.id);
         }
-        // top-level groups fully inside get selected as groups
         for (auto& s : g_doc.shapes) {
             if (s.type != SH_GROUP || s.parent) continue;
-            WRect b = shape_bounds(s);
-            if (b.mn.x >= mr.mn.x && b.mx.x <= mr.mx.x && b.mn.y >= mr.mn.y && b.mx.y <= mr.mx.y)
-                if (!is_selected(s.id)) g_sel.push_back(s.id);
+            if (touches(shape_bounds(s)) && !is_selected(s.id)) g_sel.push_back(s.id);
         }
     }
 
@@ -2231,6 +2317,19 @@ int main(int argc, char** argv) {
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
+        // Editing a ROTATED text: imgui runs the editor in the shape's
+        // unrotated space. Inverse-rotate the pointer here (after the backend
+        // wrote it, before NewFrame snapshots it); the overlay rotates the
+        // editor's draw output back into place.
+        g_editRemap = false;
+        if (g_editText) {
+            Shape* es = find_shape(g_editText);
+            if (es && es->rot != 0.f) {
+                ImVec2 c = W2S(shape_local_rect(*es).center());
+                io.MousePos = rot_about(io.MousePos, c, -es->rot);
+                g_editRemap = true;
+            }
+        }
         ImGui::NewFrame();
 
         CanvasFrame();

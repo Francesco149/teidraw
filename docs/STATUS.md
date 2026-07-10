@@ -12,6 +12,15 @@ instantly committing the empty editor (focus-frame race); click semantics are
 now select-first / edit-on-second-click; added **rotation** (drag the ring
 just outside a corner handle, shift = 15° steps) across render/bounds/hit/
 gizmos/crop/arrow-anchors, groups rotate about the selection center.
+Session 3: arrows stay **rigid under rotation** (trim now tests the target's
+OBB in its local frame — the rotated AABB used to bulge and eat the line);
+marquee selects on **partial overlap**; **auto lists** in the text editor
+("- "/"* " → "• ", Enter continues bullets and increments "12. " numbering,
+Enter on an empty item ends the list — bullet glyph verified in all 4 fonts);
+**rotated text edits in place**: the pointer is inverse-rotated into the
+editor's local space each frame (canvas input suspended meanwhile) and the
+editor's draw output (glyphs/caret/selection) is rotated back + clip rects
+opened, so the shape never snaps straight while editing.
 
 ## Build & verify
 ```
@@ -32,9 +41,11 @@ Suggested order:
 3. Snapping guides + nudge keys + shift axis-lock.
 
 ## Known rough edges / to keep in mind
-- Editing a ROTATED text draws the edit overlay axis-aligned (the shape snaps
-  visually straight while editing, back to rotated on commit).
-- Arrow trim on rotated targets uses the AABB, slightly loose on fat angles.
+- While editing a rotated text, clicks on OTHER ui (toolbar etc.) route with
+  the remapped pointer — mostly they just commit the edit; harmless but noted.
+- The rotated-editor draw-output rotation reaches into the InputTextMultiline
+  child window (`FindWindowByName("<win>/##t")` + vertex transform + clip-rect
+  patch) — re-verify if the imgui pin ever moves.
 - Default board dir is `./scratch` relative to cwd — double-clicking the exe
   on Windows creates it next to the exe; fine until the board picker lands.
 - Video overlay steals canvas input while visible (by design via imgui
