@@ -3683,6 +3683,82 @@ static void ed_insert(EdTarget& t, const std::string& ins, int kind) {
     g_ted.caret = g_ted.anchor = a + (int)ins.size();
 }
 
+// ── numbered-list renumbering ──
+static int ed_line_home(const std::string& s, int i) {
+    if (i > (int)s.size()) i = (int)s.size();
+    while (i > 0 && s[i - 1] != '\n') i--;
+    return i;
+}
+// digits of a "N. " marker at line start ls (also accepts "N." at EOL)
+static long ed_parse_num(const std::string& s, int ls, int* db, int* de) {
+    int i = ls, n = (int)s.size();
+    while (i < n && s[i] == ' ') i++;
+    int d0 = i;
+    while (i < n && isdigit((unsigned char)s[i]) && i - d0 < 9) i++;
+    if (i == d0 || i >= n || s[i] != '.') return -1;
+    if (i + 1 < n && s[i + 1] != ' ' && s[i + 1] != '\n') return -1;
+    *db = d0; *de = i;
+    return strtol(s.substr(d0, (size_t)(i - d0)).c_str(), nullptr, 10);
+}
+// the FIRST item's number of the contiguous run containing pos's line
+// (-1 when that line isn't a numbered item)
+static long ed_run_anchor(const std::string& s, int pos) {
+    int db, de;
+    int ls = ed_line_home(s, pos);
+    long n = ed_parse_num(s, ls, &db, &de);
+    if (n < 0) return -1;
+    while (ls > 0) {
+        int ps = ed_line_home(s, ls - 1);
+        long m = ed_parse_num(s, ps, &db, &de);
+        if (m < 0) break;
+        ls = ps; n = m;
+    }
+    return n;
+}
+// Renumber the contiguous run of "N. " lines containing `from` (byte offset):
+// walk back to the run's first item, then rewrite the numbers sequentially.
+// anchor < 0 keeps the first item's number (insert/delete inside a list);
+// anchor >= 0 forces it (a split list's lower half restarts at the ORIGINAL
+// list's first number). Caret shifts with the digit edits; runs inside the
+// same undo record as the edit that caused it.
+static void ed_renumber(EdTarget& t, int from, long anchor) {
+    ed_mutate(t, -1, [&](std::string& s) {
+        int db, de;
+        int ls = ed_line_home(s, from);
+        if (ed_parse_num(s, ls, &db, &de) < 0) return;
+        while (ls > 0) {   // back to the run's first item
+            int ps = ed_line_home(s, ls - 1);
+            if (ed_parse_num(s, ps, &db, &de) < 0) break;
+            ls = ps;
+        }
+        long n = anchor >= 0 ? anchor : ed_parse_num(s, ls, &db, &de);
+        int cur = ls;
+        for (;;) {
+            long have = ed_parse_num(s, cur, &db, &de);
+            if (have < 0) break;
+            if (have != n) {
+                char buf[16]; int len = snprintf(buf, sizeof buf, "%ld", n);
+                int delta = len - (de - db);
+                s.replace(db, (size_t)(de - db), buf, (size_t)len);
+                if (g_ted.caret  > db) g_ted.caret  += delta;
+                if (g_ted.anchor > db) g_ted.anchor += delta;
+                de += delta;
+            }
+            n++;
+            size_t nl = s.find('\n', de);
+            if (nl == std::string::npos) break;
+            cur = (int)nl + 1;
+        }
+    });
+}
+// a gap opened at `at`: the numbered run just below restarts at `anchor`
+// (the split list's own first number; < 0 = nothing was split, leave it)
+static void ed_renumber_below(EdTarget& t, int at, long anchor) {
+    if (anchor < 0) return;
+    size_t nl = t.str->find('\n', at);
+    if (nl != std::string::npos) ed_renumber(t, (int)nl + 1, anchor);
+}
+
 // auto-list fixups, run AFTER the primary edit (same undo record: kind -1)
 static void ed_autolist_space(EdTarget& t) {   // "- "/"* " at line start → "• "
     std::string& s = *t.str; int cur = g_ted.caret;
@@ -3704,8 +3780,10 @@ static void ed_autolist_newline(EdTarget& t) {   // Enter continues (or ends) th
     if (pe - i >= 4 && !memcmp(s.c_str() + i, kBullet, 4)) {
         // empty item → drop marker AND the fresh newline: stay on the same
         // (now plain) line, list mode off
-        if (pe - i == 4) { ed_mutate(t, -1, [&](std::string& str) { str.erase(i, cur - i); }); g_ted.caret = g_ted.anchor = i; }
-        else {
+        if (pe - i == 4) {
+            ed_mutate(t, -1, [&](std::string& str) { str.erase(i, cur - i); });
+            g_ted.caret = g_ted.anchor = i;
+        } else {
             std::string ins = indent + kBullet;
             ed_mutate(t, -1, [&](std::string& str) { str.insert(cur, ins); });
             g_ted.caret = g_ted.anchor = cur + (int)ins.size();
@@ -3714,15 +3792,31 @@ static void ed_autolist_newline(EdTarget& t) {   // Enter continues (or ends) th
     }
     int j = i; while (j < pe && j - i < 9 && isdigit((unsigned char)s[j])) j++;
     if (j > i && j < pe && s[j] == '.' && (j + 1 == pe || s[j + 1] == ' ')) {
-        if (j + 2 >= pe) {   // "12." / "12. " alone → stay, end list
+        if (j + 2 >= pe) {   // "12." / "12. " alone → stay, end list; the
+            // split-off lower half restarts at the list's own first number
+            long anchor = ed_run_anchor(s, ps);
             ed_mutate(t, -1, [&](std::string& str) { str.erase(i, cur - i); });
             g_ted.caret = g_ted.anchor = i;
+            ed_renumber_below(t, i, anchor);
         } else {
             long n = strtol(s.substr(i, j - i).c_str(), nullptr, 10);
             char num[32]; snprintf(num, sizeof num, "%ld. ", n + 1);
             std::string ins = indent + num;
             ed_mutate(t, -1, [&](std::string& str) { str.insert(cur, ins); });
             g_ted.caret = g_ted.anchor = cur + (int)ins.size();
+            ed_renumber(t, g_ted.caret, -1);   // items below the insert shift up
+        }
+        return;
+    }
+    // Enter on a plain EMPTY line = deliberately opening a gap (the "split by
+    // deleting the line" flow ends up here too): if a numbered run sits right
+    // above the gap, the run below restarts at that list's own first number
+    if (pe == ps && ps > 0) {
+        long anchor = ed_run_anchor(s, ps - 1);
+        if (anchor >= 0) {
+            int q = cur;
+            while (q < (int)s.size() && s[q] == '\n') q++;   // skip the rest of the gap
+            ed_renumber(t, q, anchor);
         }
     }
 }
@@ -3738,6 +3832,7 @@ static void ed_autolist_deleted(EdTarget& t) {   // bare marker left → unwrap 
         int from = ls > 0 ? ls - 1 : ls;   // include the preceding '\n' if any
         ed_mutate(t, -1, [&](std::string& str) { str.erase(from, cur - from); });
         g_ted.caret = g_ted.anchor = from;
+        if (bareNumber) ed_renumber(t, g_ted.caret, -1);   // close the gap in the numbering
     }
 }
 
@@ -4569,6 +4664,8 @@ int main(int argc, char** argv) {
     uint64_t editId = 0;   // dev: open the text editor on this shape (headless editor shots)
     uint64_t selId = 0;    // dev: select this shape (headless selection-UI shots)
     int bsFrame = -1;      // dev: press Backspace in the editor on this frame
+    int enterFrame = -1;   // dev: press Enter on this frame
+    int caretIdx = -1;     // dev: --edit caret byte offset (default: text end)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
         else if (!strcmp(argv[i], "--export") && i + 1 < argc) exportPng = argv[++i];
@@ -4578,6 +4675,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--edit") && i + 1 < argc) editId = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--sel") && i + 1 < argc) selId = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--bs") && i + 1 < argc) bsFrame = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--enter") && i + 1 < argc) enterFrame = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--caret") && i + 1 < argc) caretIdx = atoi(argv[++i]);
         else if (argv[i][0] != '-') boardArg = argv[i];
     }
     bool headless = shotPath || exportPng || exportTxt;
@@ -4612,7 +4711,10 @@ int main(int argc, char** argv) {
     if (!boardArg.empty()) switch_board(boardArg);   // empty = picker opens over a blank canvas
     if (editId) {
         Shape* es = find_shape(editId);
-        if (es && es->type == SH_TEXT) { g_sel.assign(1, editId); begin_text_edit(editId, (int)es->text.size()); }
+        if (es && es->type == SH_TEXT) {
+            g_sel.assign(1, editId);
+            begin_text_edit(editId, caretIdx >= 0 ? caretIdx : (int)es->text.size());
+        }
     }
     if (selId && find_shape(selId)) g_sel.assign(1, selId);
     ApplyTheme();
@@ -4641,9 +4743,13 @@ int main(int argc, char** argv) {
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
-        if (bsFrame >= 0) {   // dev: scripted keystroke for headless editor shots
+        if (bsFrame >= 0) {   // dev: scripted keystrokes for headless editor shots
             if (framesDone == bsFrame) io.AddKeyEvent(ImGuiKey_Backspace, true);
             if (framesDone == bsFrame + 1) io.AddKeyEvent(ImGuiKey_Backspace, false);
+        }
+        if (enterFrame >= 0) {
+            if (framesDone == enterFrame) io.AddKeyEvent(ImGuiKey_Enter, true);
+            if (framesDone == enterFrame + 1) io.AddKeyEvent(ImGuiKey_Enter, false);
         }
         ImGui::NewFrame();
 

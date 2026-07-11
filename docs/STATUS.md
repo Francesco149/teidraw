@@ -115,9 +115,15 @@ caret/selection/undo live in `g_ted`, mouse maps into the shape's local frame
 (rotation inverse, layout lines, nearest-boundary x), text mutations go
 through `ed_mutate` (arrow anchors pinned to world points, rotated texts keep
 their world top-left so glyphs don't swing per keystroke), auto-lists ported
-verbatim, in-session ctrl+Z/Y with burst coalescing, click/word/line
-double/triple-click drag selection, clipboard, IME caret positioning via
-PlatformImeData. Editing rotated/aligned/wrapped text is now exactly
+verbatim + **numbered-list renumbering** (ed_renumber: inserting/removing an
+item rewrites the contiguous run anchored at its first number; splitting a
+list — Enter on an empty item or on a gap line — restarts the lower half at
+the ORIGINAL list's first number, so 0-started lists split into 0-started
+halves; all inside the same undo record), in-session ctrl+Z/Y with burst
+coalescing, click/word/line double/triple-click drag selection, clipboard,
+IME caret positioning via PlatformImeData. Headless editor testing: --edit
+--caret --enter --bs drive scripted edits, board saves on exit for text
+assertions. Editing rotated/aligned/wrapped text is now exactly
 WYSIWYG — the kWysiwyg flags, pre-frame pointer remap and phantom-selection
 saga are deleted. Also: **video play state persists** (`play` in board.json;
 a video left playing resumes when the board reopens, transport clicks
