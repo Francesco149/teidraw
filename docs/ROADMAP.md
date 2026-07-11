@@ -21,9 +21,9 @@ play/stop/seek/A-B pill, dynamic-texture upload. Shape clipboard.
 ## M3 — daily-driver gaps (next)
 - **LLM export** ✅: copy board/selection as PNG to clipboard (+ `--export
   out.png` CLI); reading-order text outline (context menu / `--export-txt`).
-- Global settings file (%APPDATA%/teidraw/settings.json): theme, undo limit,
-  last board; board picker overlay (recent boards, new-board) instead of
-  CLI-arg-only.
+- **Global settings + board picker** ✅: %APPDATA%/teidraw/settings.json
+  (theme, zoom anim, undo limit, boards dir, recent boards); picker overlay
+  (Ctrl+O / auto on bare launch: recents, new-board, native folder dialog).
 - Drag **snapping** to other shapes' edges/centers + distance guides
   (tldraw's alignment polish); arrow-key nudge; shift-drag axis lock.
 - Text wrap width (drag side handles to set a wrap box).

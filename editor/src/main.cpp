@@ -18,6 +18,8 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <shlobj.h>      // SHGetKnownFolderPath (Documents → default boards dir)
+#include <shobjidl.h>    // IFileOpenDialog (board folder picker)
 #include <d3d11.h>
 #include <dxgi1_3.h>
 #include <cmath>
@@ -640,10 +642,10 @@ static Shape shape_from_json(const json& j) {
 }
 static bool g_zoomAnim = true;   // eased camera flights for the zoom commands
 static bool g_zoomAnim_fwd() { return g_zoomAnim; }
+static bool g_settingsFromFile = false;   // %APPDATA% settings.json existed at boot
 static std::string doc_to_json_string() {
     json j;
-    j["v"] = 2; j["nextId"] = g_doc.nextId; j["dark"] = g_darkMode;
-    j["zoomAnim"] = g_zoomAnim;
+    j["v"] = 2; j["nextId"] = g_doc.nextId;
     j["cam"] = { {"x", g_cam.pan.x}, {"y", g_cam.pan.y}, {"z", g_cam.zoom} };
     json arr = json::array();
     for (auto& s : g_doc.shapes) arr.push_back(shape_to_json(s));
@@ -693,8 +695,12 @@ static bool doc_from_json_string(const std::string& str, bool restoreCam) {
         g_cam.pan = ImVec2(j["cam"].value("x", 0.f), j["cam"].value("y", 0.f));
         g_cam.zoom = j["cam"].value("z", 1.f);
     }
-    if (j.contains("dark") && restoreCam) { g_darkMode = j["dark"]; }
-    if (restoreCam) g_zoomAnim = j.value("zoomAnim", true);
+    // theme prefs are global now (%APPDATA% settings.json); boards written
+    // before that still carry them — adopt once when no settings file exists
+    if (restoreCam && !g_settingsFromFile) {
+        if (j.contains("dark")) g_darkMode = j["dark"];
+        g_zoomAnim = j.value("zoomAnim", true);
+    }
     // drop selection entries that no longer exist
     std::vector<uint64_t> keep;
     for (auto id : g_sel) if (find_shape(id)) keep.push_back(id);
@@ -711,6 +717,7 @@ static void write_file_atomic(const std::string& path, const std::string& data) 
     MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 static void save_board_now() {
+    if (g_projDir.empty()) return;   // picker open at boot, no board yet
     write_file_atomic(g_projDir + "/board.json", doc_to_json_string());
     g_saveDueAt = 0;
 }
@@ -722,11 +729,13 @@ static int g_undoPos = -1;
 static int g_undoLimit = 4096;
 
 static void undo_journal_rewrite() {
+    if (g_projDir.empty()) return;
     std::string path = g_projDir + "/undo.jsonl";
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     for (auto& s : g_undo) f << s << "\n";
 }
 static void push_undo() {
+    if (g_projDir.empty()) return;
     std::string snap = doc_to_json_string();
     if (g_undoPos >= 0 && g_undo[g_undoPos] == snap) return;   // no-op gesture
     bool branched = (g_undoPos + 1 < (int)g_undo.size());
@@ -1385,6 +1394,148 @@ static void paste_clipboard(ImVec2 atW) {
         }
     }
     CloseClipboard();
+}
+
+// ──────────────── global settings (%APPDATA%) · board switching ────────────
+// Per-USER prefs — theme, zoom animation, undo limit, boards home and the
+// recent-board list — live in %APPDATA%/teidraw/settings.json (boards stay
+// self-contained: board.json only holds the document + camera). recent[0] is
+// the last board: a bare `teidraw` launch reopens it (first run: the picker).
+static std::string g_settingsDir;               // %APPDATA%/teidraw ("" = unavailable)
+static std::string g_boardsDir;                 // where "new board" mints dirs
+static std::vector<std::string> g_recentBoards; // absolute dirs, most recent first
+static bool g_headless = false;                 // --shot/--export: don't touch recents
+
+static bool path_eq(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++) {
+        char x = (char)tolower((unsigned char)a[i]), y = (char)tolower((unsigned char)b[i]);
+        if (x == '\\') x = '/';
+        if (y == '\\') y = '/';
+        if (x != y) return false;
+    }
+    return true;
+}
+static std::string abs_path(const std::string& p) {
+    wchar_t buf[2048];
+    DWORD n = GetFullPathNameW(to_w(p).c_str(), 2048, buf, nullptr);
+    return (n > 0 && n < 2048) ? from_w(buf) : p;
+}
+static std::string board_name(const std::string& dir) {
+    std::string d = dir;
+    while (!d.empty() && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+    size_t sl = d.find_last_of("/\\");
+    return sl == std::string::npos ? d : d.substr(sl + 1);
+}
+static bool board_exists(const std::string& dir) { return file_exists(dir + "/board.json"); }
+
+static void save_settings() {
+    if (g_settingsDir.empty()) return;
+    json j;
+    j["dark"] = g_darkMode;
+    j["zoomAnim"] = g_zoomAnim;
+    j["undoLimit"] = g_undoLimit;
+    j["boardsDir"] = g_boardsDir;
+    j["recent"] = g_recentBoards;
+    write_file_atomic(g_settingsDir + "/settings.json", j.dump(2));
+}
+static void load_settings() {
+    const char* app = getenv("APPDATA");
+    if (app && *app) {
+        g_settingsDir = std::string(app) + "/teidraw";
+        CreateDirectoryA(g_settingsDir.c_str(), nullptr);
+    }
+    PWSTR docs = nullptr;   // default new-board home: Documents/teidraw
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
+        g_boardsDir = from_w(docs) + "\\teidraw";
+        CoTaskMemFree(docs);
+    } else if (!g_settingsDir.empty()) g_boardsDir = g_settingsDir + "/boards";
+    if (g_settingsDir.empty()) return;
+    std::ifstream f(g_settingsDir + "/settings.json", std::ios::binary);
+    if (!f) return;
+    std::stringstream ss; ss << f.rdbuf();
+    json j = json::parse(ss.str(), nullptr, false);
+    if (j.is_discarded()) return;
+    g_settingsFromFile = true;
+    g_darkMode  = j.value("dark", true);
+    g_zoomAnim  = j.value("zoomAnim", true);
+    g_undoLimit = j.value("undoLimit", 4096);
+    g_undoLimit = g_undoLimit < 8 ? 8 : (g_undoLimit > 262144 ? 262144 : g_undoLimit);
+    g_boardsDir = j.value("boardsDir", g_boardsDir);
+    for (auto& r : j.value("recent", json::array()))
+        if (r.is_string() && board_exists(r)) g_recentBoards.push_back(r);   // dead dirs pruned here
+}
+static void note_board_opened(const std::string& absDir) {
+    for (int i = (int)g_recentBoards.size() - 1; i >= 0; i--)
+        if (path_eq(g_recentBoards[i], absDir)) g_recentBoards.erase(g_recentBoards.begin() + i);
+    g_recentBoards.insert(g_recentBoards.begin(), absDir);
+    if (g_recentBoards.size() > 10) g_recentBoards.resize(10);
+    save_settings();
+}
+
+static void set_undo_limit(int n) {
+    g_undoLimit = n;
+    if ((int)g_undo.size() > n) {
+        int drop = (int)g_undo.size() - n;
+        g_undo.erase(g_undo.begin(), g_undo.begin() + drop);
+        g_undoPos = g_undoPos < drop ? 0 : g_undoPos - drop;
+        undo_journal_rewrite();
+    }
+    save_settings();
+}
+
+// Save the current board, tear down every per-board cache, load `dir`.
+// A brand-new dir gets its board.json written immediately so it's a valid
+// board (and recents entry) from second zero.
+static void switch_board(const std::string& dirIn) {
+    std::string dir = abs_path(dirIn);
+    if (!g_projDir.empty()) {
+        if (path_eq(abs_path(g_projDir), dir)) return;
+        save_board_now();
+    }
+    g_doc = Doc{};
+    g_undo.clear(); g_undoPos = -1;
+    clear_selection(); g_editText = 0; g_editLabelArrow = 0;
+    g_cam = Camera{}; g_camAnim.active = false;
+    g_saveDueAt = 0;
+    for (auto& [rel, t] : g_texCache) if (t.srv) t.srv->Release();
+    g_texCache.clear();
+    for (auto& [id, ps] : g_play) ps.release();
+    g_play.clear();
+#ifdef TEI_LIBAV
+    for (auto& [rel, d] : g_decoders) { d->close(); delete d; }
+    g_decoders.clear();
+#endif
+    g_projDir = dir;
+    load_board();
+    if (!board_exists(dir)) save_board_now();
+    if (!g_headless) note_board_opened(dir);
+    if (g_hwnd) SetWindowTextW(g_hwnd, to_w(board_name(dir) + " — teidraw").c_str());
+}
+
+// Native folder dialog: open a board anywhere (an empty folder becomes a new
+// board there). Show() pumps its own message loop; our frame just stalls.
+static std::string pick_folder_dialog() {
+    std::string out;
+    HRESULT ci = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    IFileOpenDialog* dlg = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) {
+        DWORD opts = 0;
+        dlg->GetOptions(&opts);
+        dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        dlg->SetTitle(L"open board folder (empty folder = new board)");
+        if (SUCCEEDED(dlg->Show(g_hwnd))) {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(dlg->GetResult(&item))) {
+                PWSTR w = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &w))) { out = from_w(w); CoTaskMemFree(w); }
+                item->Release();
+            }
+        }
+        dlg->Release();
+    }
+    if (ci == S_OK || ci == S_FALSE) CoUninitialize();
+    return out;
 }
 
 // ─────────────────────────────── hit testing ───────────────────────────────
@@ -2127,6 +2278,97 @@ static void DrawZoomPill() {
     ImGui::End();
 }
 
+// ── board picker (Ctrl+O; auto-opens when the app starts with no board) ──
+static bool g_pickerWant = false;
+static std::string g_newBoardName;
+
+static std::string sanitize_board_name(const std::string& in) {
+    std::string out;
+    for (char c : in) {
+        if (isalnum((unsigned char)c) || c == '-' || c == '_') out += c;
+        else if (c == ' ') out += '-';
+    }
+    return out;
+}
+
+// long paths elide from the LEFT — the tail (the board dir) is the news
+static std::string elide_left(const std::string& s, ImFont* f, float px, float maxw) {
+    if (f->CalcTextSizeA(px, FLT_MAX, 0.f, s.c_str()).x <= maxw) return s;
+    std::string tail = s;
+    while (tail.size() > 8 &&
+           f->CalcTextSizeA(px, FLT_MAX, 0.f, ("…" + tail).c_str()).x > maxw) {
+        size_t cut = 1;
+        while (cut < tail.size() && (tail[cut] & 0xC0) == 0x80) cut++;   // stay on utf-8 boundaries
+        tail.erase(0, cut);
+    }
+    return "…" + tail;
+}
+
+static void DrawBoardPicker() {
+    bool noBoard = g_projDir.empty();
+    if ((g_pickerWant || noBoard) && !ImGui::IsPopupOpen("boards")) {
+        g_newBoardName.clear();
+        ImGui::OpenPopup("boards");   // no board open = the picker IS the app
+    }
+    g_pickerWant = false;
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->Size * 0.5f, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(540, 0), ImVec2(540, vp->Size.y * 0.85f));
+    if (!ImGui::BeginPopupModal("boards", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                                ImGuiWindowFlags_NoTitleBar))
+        return;
+
+    ImDrawList* wdl = ImGui::GetWindowDrawList();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_th.textDim), noBoard ? "boards" : "boards · esc to close");
+    ImGui::Spacing();
+    std::string cur = noBoard ? std::string() : abs_path(g_projDir);
+    bool anyRecent = false;
+    for (int i = 0; i < (int)g_recentBoards.size(); i++) {
+        const std::string& r = g_recentBoards[i];
+        if (!board_exists(r)) continue;
+        anyRecent = true;
+        bool isCur = !cur.empty() && path_eq(r, cur);
+        char rid[24]; snprintf(rid, sizeof rid, "##board%d", i);
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float w = ImGui::GetContentRegionAvail().x;
+        bool clicked = ImGui::Selectable(rid, isCur, 0, ImVec2(w, 42.f));
+        ImFont* f = ImGui::GetFont();
+        wdl->AddText(f, 17.f, p + ImVec2(10, 3), g_th.textMain, board_name(r).c_str());
+        wdl->AddText(f, 13.f, p + ImVec2(10, 24), g_th.textDim, elide_left(r, f, 13.f, w - 32.f).c_str());
+        if (isCur) wdl->AddCircleFilled(p + ImVec2(w - 14.f, 21.f), 3.5f, g_th.accent);
+        if (clicked) {
+            if (!isCur) switch_board(r);
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    if (anyRecent) ImGui::Separator();
+
+    if (ImGui::IsWindowAppearing() && !anyRecent) ImGui::SetKeyboardFocusHere();
+    ImGui::SetNextItemWidth(-84.f);
+    bool create = ImGui::InputTextWithHint("##newboard", "new board name", &g_newBoardName,
+                                           ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    create |= ImGui::Button("create", ImVec2(76, 0));
+    std::string clean = sanitize_board_name(g_newBoardName);
+    if (!g_boardsDir.empty()) {
+        std::string where = "in " + (clean.empty() ? g_boardsDir : g_boardsDir + "\\" + clean);
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_th.textDim), "%s",
+                           elide_left(where, ImGui::GetFont(), ImGui::GetFontSize(),
+                                      ImGui::GetContentRegionAvail().x).c_str());
+    }
+    if (create && !clean.empty() && !g_boardsDir.empty()) {
+        CreateDirectoryA(g_boardsDir.c_str(), nullptr);
+        switch_board(g_boardsDir + "/" + clean);
+        ImGui::CloseCurrentPopup();
+    }
+    if (ImGui::Button("open folder…")) {
+        std::string dir = pick_folder_dialog();
+        if (!dir.empty()) { switch_board(dir); ImGui::CloseCurrentPopup(); }
+    }
+    ImGui::EndPopup();
+}
+
 // ── style panel (top right): palette · text size · align · opacity ──
 // With a selection it restyles it; always updates the current style that new
 // shapes are born with.
@@ -2294,11 +2536,21 @@ static void DrawContextMenu() {
         if (ImGui::MenuItem("copy board as text")) copy_text_to_clipboard(board_outline(false));
         ImGui::Separator();
         if (ImGui::MenuItem(g_darkMode ? "light mode" : "dark mode", "Ctrl+Shift+D")) {
-            g_darkMode = !g_darkMode; ApplyTheme(); g_saveDueAt = ImGui::GetTime() + 0.4;
+            g_darkMode = !g_darkMode; ApplyTheme(); save_settings();
         }
         if (ImGui::MenuItem("zoom animation", nullptr, g_zoomAnim)) {
-            g_zoomAnim = !g_zoomAnim; g_saveDueAt = ImGui::GetTime() + 0.4;
+            g_zoomAnim = !g_zoomAnim; save_settings();
         }
+        if (ImGui::BeginMenu("undo limit")) {
+            static const int kLims[] = { 256, 1024, 4096, 16384 };
+            for (int v : kLims) {
+                char lbl[16]; snprintf(lbl, sizeof lbl, "%d", v);
+                if (ImGui::MenuItem(lbl, nullptr, g_undoLimit == v)) set_undo_limit(v);
+            }
+            ImGui::EndMenu();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("boards…", "Ctrl+O")) g_pickerWant = true;
     }
     ImGui::EndPopup();
 }
@@ -2350,6 +2602,7 @@ static void DrawVideoOverlay() {
     g_overlayVid = target;
     if (!target) { g_overlayHot = false; return; }
     Shape* s = find_shape(target);
+    if (!s) { g_overlayVid = 0; g_overlayHot = false; return; }   // deleted / board switched away
     VideoDecoder* d = get_decoder(s->asset);
     if (!d) { g_overlayHot = false; return; }
     PlayState& ps = g_play[s->id];
@@ -2756,8 +3009,9 @@ static void CanvasFrame() {
         else hoverHandle = draw_selection_ui(dl, true);
     }
 
-    // ── keyboard ──
-    if (!io.WantTextInput) {
+    // ── keyboard ── (all off while the board picker modal is up)
+    if (!io.WantTextInput && !ImGui::IsPopupOpen("boards")) {
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) g_pickerWant = true;
         if (ImGui::IsKeyPressed(ImGuiKey_V)) g_tool = TOOL_SELECT;
         if (ImGui::IsKeyPressed(ImGuiKey_H)) g_tool = TOOL_HAND;
         if (ImGui::IsKeyPressed(ImGuiKey_T)) g_tool = TOOL_TEXT;
@@ -3133,17 +3387,24 @@ static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 int main(int argc, char** argv) {
     // teidraw [projectDir] [--shot out.png | --export out.png | --export-txt out.txt] [--frames N]
+    // No projectDir: reopen the last board (recent[0]); first run = the picker.
     const char* shotPath = nullptr; int shotFrames = 8;
     const char* exportPng = nullptr; const char* exportTxt = nullptr;
+    std::string boardArg; bool forcePicker = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
         else if (!strcmp(argv[i], "--export") && i + 1 < argc) exportPng = argv[++i];
         else if (!strcmp(argv[i], "--export-txt") && i + 1 < argc) exportTxt = argv[++i];
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) shotFrames = atoi(argv[++i]);
-        else if (argv[i][0] != '-') g_projDir = argv[i];
+        else if (!strcmp(argv[i], "--picker")) forcePicker = true;   // dev: shot the picker UI
+        else if (argv[i][0] != '-') boardArg = argv[i];
     }
     bool headless = shotPath || exportPng || exportTxt;
-    if (g_projDir.empty()) g_projDir = "scratch";
+    g_headless = headless;
+    load_settings();
+    if (boardArg.empty() && headless && !forcePicker) boardArg = "scratch";
+    if (boardArg.empty() && !forcePicker && !g_recentBoards.empty()) boardArg = g_recentBoards[0];
+    g_pickerWant = forcePicker;
 
     ImGui_ImplWin32_EnableDpiAwareness();
     WNDCLASSEXW wc = { sizeof(wc), CS_OWNDC, WndProc, 0, 0, GetModuleHandleW(nullptr),
@@ -3167,7 +3428,7 @@ int main(int argc, char** argv) {
     ImGui_ImplDX11_Init(g_dev, g_ctx);
     LoadFonts();
     ImGui::GetStyle().FontSizeBase = 15.f * g_dpi;
-    load_board();
+    if (!boardArg.empty()) switch_board(boardArg);   // empty = picker opens over a blank canvas
     ApplyTheme();
     ImGui::GetStyle().ScaleAllSizes(g_dpi);
 
@@ -3226,10 +3487,11 @@ int main(int argc, char** argv) {
         DrawToolbar();
         DrawStylePanel();
         DrawZoomPill();
+        DrawBoardPicker();
         sweep_play_states();
 
         if (!io.WantTextInput && io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_D)) {
-            g_darkMode = !g_darkMode; ApplyTheme(); g_saveDueAt = ImGui::GetTime() + 0.4;
+            g_darkMode = !g_darkMode; ApplyTheme(); save_settings();
         }
 
         // autosave debounce
@@ -3273,6 +3535,7 @@ int main(int argc, char** argv) {
     }
 
     save_board_now();
+    save_settings();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

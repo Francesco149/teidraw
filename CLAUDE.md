@@ -44,7 +44,9 @@ Paste = shapes > PNG > DIB > files > plain text (becomes a text shape).
   Inter/JetBrains Mono/Lora come from nixpkgs via the flake.
 - A **board** is a self-contained project dir: `board.json` + `assets/` (every
   imported file is COPIED in) + `undo.jsonl` (snapshot journal; undo history
-  survives sessions, cap `g_undoLimit`).
+  survives sessions, cap `g_undoLimit`). Per-user prefs (theme, undo limit,
+  recent boards) live in `%APPDATA%/teidraw/settings.json`; a bare launch
+  reopens the last board, Ctrl+O = board picker.
 
 ## Build / run / verify
 ```

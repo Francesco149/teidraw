@@ -18,7 +18,14 @@ Shift+2 selection / Shift+0 100%) flying an ease-in-out-quart 0.28s camera
 export** (copy board/selection as PNG at 2× — offscreen render, clipboard PNG
 + CF_DIB — Ctrl+Shift+C or context menu; "copy as text" = reading-order
 outline with texts verbatim, media placeholders, group nesting, arrows as a
-connection list). Board format **v2** (v1 tsize indices migrate at load);
+connection list), **global settings** (%APPDATA%/teidraw/settings.json:
+theme, zoom anim, undo limit + context-menu presets, boards dir, recent
+boards — theme prefs moved OUT of board.json, adopted once from boards that
+still carry them), **board picker** (modal via Ctrl+O / context menu; auto
+on bare launch with no last board: recents with left-elided paths, new-board
+under Documents/teidraw, native folder dialog; switch_board tears down all
+per-board caches). Bare `teidraw` reopens the last board; window title shows
+the board name. Board format **v2** (v1 tsize indices migrate at load);
 loads sanitize duplicate ids / stale nextId / empty texts. Single TU, builds
 warning-free.
 
@@ -36,8 +43,8 @@ minted duplicate ids once). Use a throwaway dir under the scratchpad for
 render tests.
 
 ## NEXT TASK → M3 (docs/ROADMAP.md)
-1. Board picker + global settings file (%APPDATA%), undo-limit option.
-2. Snapping guides + arrow-key nudge + shift axis-lock drag.
+1. Snapping guides + arrow-key nudge + shift axis-lock drag.
+2. Text wrap width; then the custom WYSIWYG canvas editor (see below).
 
 ## Known rough edges / to keep in mind
 - **WYSIWYG-transform editing is fully OFF** (`kWysiwygAlignEdit` and
@@ -63,7 +70,11 @@ render tests.
   patch) — re-verify if the imgui pin (1.92.4) ever moves.
 - List lines ("• ", "N. ") always pin left even in centered/right text — a
   deliberate heuristic, shared by renderer + editor via is_list_line().
-- Default board dir is `./scratch` relative to cwd; fine until the picker.
+- Bare launch reopens recent[0] from settings.json; headless (`--shot`/
+  `--export*`) never touches recents and still defaults to `./scratch`.
+  `--picker` (dev flag) forces the picker open — used for headless UI shots.
+  Settings tests can point the app at a fake `%APPDATA%` via
+  `WSLENV=APPDATA/p APPDATA=<dir> ./build/teidraw.exe …`.
 - Escape-while-crop-dragging commits instead of canceling.
 - No audio on videos yet (M4). Faux bold is double-strike, not a real weight
   (real SemiBold statics would be the upgrade if it ever looks mushy).
