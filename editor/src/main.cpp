@@ -2151,11 +2151,17 @@ static float g_dpi = 1.f;
 
 static ImU32 shape_ink(const Shape& s) { return with_opacity(palette_color(s.col), s.opacity); }
 
-// double-strike faux bold: second pass offset a fraction of the glyph size
+// double-strike faux bold: second pass offset a fraction of the glyph size.
+// AddText TRUNCATES positions to whole px — snap the origin ourselves and
+// keep the strike offset integral, or a fractional x (wrap widths make
+// per-line align offsets fractional) puts the two strikes in different
+// truncation buckets: 2px apart instead of 1 = visibly doubled glyphs,
+// appearing/disappearing with zoom (the session-8 "renders twice" bug).
 static void add_text_bold(ImDrawList* dl, ImFont* f, float px, ImVec2 p, ImU32 col,
                           const char* b, const char* e = nullptr) {
+    p.x = IM_TRUNC(p.x); p.y = IM_TRUNC(p.y);
     dl->AddText(f, px, p, col, b, e);
-    dl->AddText(f, px, ImVec2(p.x + px * 0.03f, p.y), col, b, e);
+    dl->AddText(f, px, ImVec2(p.x + IM_TRUNC(px * 0.03f), p.y), col, b, e);
 }
 
 static void draw_text_shape(ImDrawList* dl, const Shape& s) {

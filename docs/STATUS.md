@@ -148,12 +148,15 @@ testing (typing feel, selection, IME, auto-lists, wrapped/rotated editing).
 - List lines ("• ", "N. ") always pin left even in centered/right text — a
   deliberate heuristic; wrapped continuations of a list item inherit the pin
   (decided per hard line in layout_text).
-- OPEN (user report, session 8): while typing, a line can look "rendered
-  twice with a slight offset / bolder" on the live canvas. NOT reproduced
-  headless: committed renders are byte-stable, per-frame layout logs are
-  stable post-edit, single-frame --edit/--bs shots look clean. Waiting on a
-  live screenshot + zoom level; suspect list: something temporal (frame
-  alternation) or dynamic-font-atlas UV churn under real session pressure.
+- RESOLVED (session 8, was the "renders twice / bolder" report): AddText
+  truncates positions to whole px, so a FRACTIONAL per-line x (wrap widths
+  are user-dragged floats → right/center align offsets go fractional) could
+  put the faux-bold's two strikes in different truncation buckets — 2px
+  apart instead of 1 = visibly doubled glyphs, zoom- and line-dependent.
+  add_text_bold now snaps the origin and keeps the strike offset integral.
+  Repro recipe that finally caught it: real board copy + `--shot` at the
+  user's exact zoom (1.0), 600% magnified crops, A/B against a pre-refactor
+  worktree build.
 - Bare launch reopens recent[0] from settings.json; headless (`--shot`/
   `--export*`) never touches recents and still defaults to `./scratch`.
   `--picker` (dev flag) forces the picker open — used for headless UI shots.
