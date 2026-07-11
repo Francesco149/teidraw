@@ -388,6 +388,7 @@ struct Shape {
     ImVec4 crop{0, 0, 1, 1};    // visible sub-rect of the source (u0,v0,u1,v1)
     float loopA = -1, loopB = -1;   // video A-B loop points (seconds; -1 = unset)
     bool  sound = false;            // video audio on (off by default; pill toggle)
+    bool  play = false;             // video was playing — resumes on next open
     // arrow
     ArrowEnd a, b;
     float bend = 0.f;       // signed offset of the on-curve midpoint ⊥ to the chord
@@ -612,6 +613,7 @@ static json shape_to_json(const Shape& s) {
         if (s.loopA >= 0) j["loopA"] = s.loopA;
         if (s.loopB >= 0) j["loopB"] = s.loopB;
         if (s.sound) j["sound"] = true;
+        if (s.play) j["play"] = true;
         break;
     case SH_ARROW: {
         auto end = [](const ArrowEnd& e) {
@@ -654,6 +656,7 @@ static Shape shape_from_json(const json& j) {
         s.loopA = j.value("loopA", -1.f);
         s.loopB = j.value("loopB", -1.f);
         s.sound = j.value("sound", false);
+        s.play = j.value("play", false);
         break;
     case SH_ARROW: {
         auto end = [](const json& k) {
@@ -1445,10 +1448,15 @@ static std::map<uint64_t, PlayState> g_play;
 
 // A video with an A-B loop opens AT A: the poster and the first play start
 // from the loop, not file start. (Every g_play access goes through here so a
-// selected-but-culled video can't sneak in a t=0 entry.)
+// selected-but-culled video can't sneak in a t=0 entry.) A video saved while
+// playing resumes on its own — but never headless, so --shot/--export render
+// the poster, not a wall-clock-dependent frame.
 static PlayState& play_state(const Shape& s) {
     auto ins = g_play.try_emplace(s.id);
-    if (ins.second && s.loopA >= 0) ins.first->second.t = s.loopA;
+    if (ins.second) {
+        if (s.loopA >= 0) ins.first->second.t = s.loopA;
+        if (s.play && !g_headless) ins.first->second.playing = true;
+    }
     return ins.first->second;
 }
 
@@ -1626,6 +1634,7 @@ static void replace_image_contents(Shape& s, const std::string& rel) {
     }
     s.loopA = s.loopB = -1;
     s.sound = false;
+    s.play = false;
 }
 
 // The (world) rect the FULL source image projects to, given the current
@@ -3215,8 +3224,11 @@ static void DrawVideoOverlay() {
     if (g_overlayDownCtl != -2 && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
         int ctl = g_overlayDownCtl; g_overlayDownCtl = -2;
         if (vlen(io.MousePos - g_dragStartS) < 4.f) switch (ctl) {
-        case OV_PLAY: ps.playing = !ps.playing; break;
-        case OV_STOP: ps.playing = false; ps.t = v->loopA >= 0 ? v->loopA : 0; ps.audioSeek = true; break;
+        // play/stop persist (no undo entry — transport, not an edit): a video
+        // left playing resumes when the board is next opened
+        case OV_PLAY: ps.playing = !ps.playing; v->play = ps.playing; g_saveDueAt = ImGui::GetTime() + 0.4; break;
+        case OV_STOP: ps.playing = false; ps.t = v->loopA >= 0 ? v->loopA : 0; ps.audioSeek = true;
+                      v->play = false; g_saveDueAt = ImGui::GetTime() + 0.4; break;
         case OV_SEEK: if (dur > 0) {
             float u = (overlay_unrot(io.MousePos).x - g_ovTL.x - g_ovCtl[OV_SEEK].mn.x) / fmaxf(g_ovCtl[OV_SEEK].size().x, 1.f);
             ps.t = fminf(fmaxf(u, 0.f), 1.f) * dur;
