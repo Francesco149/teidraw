@@ -360,7 +360,7 @@ static void zoom_to_100(ImVec2 vpSize) {
 }
 
 // ─────────────────────────── document model ────────────────────────────────
-enum ShapeType { SH_TEXT = 0, SH_ARROW, SH_IMAGE, SH_GROUP };
+enum ShapeType { SH_TEXT = 0, SH_ARROW, SH_IMAGE, SH_GROUP, SH_DRAW };
 
 struct ArrowEnd {
     ImVec2  p{0, 0};        // world point (used when unbound)
@@ -394,6 +394,11 @@ struct Shape {
     ArrowEnd a, b;
     float bend = 0.f;       // signed offset of the on-curve midpoint ⊥ to the chord
     std::string label;
+    // freehand stroke — baked ink: move/scale/rotate/delete only, never reshaped.
+    // Point centers in LOCAL units relative to pos (the rect pos..pos+size hugs
+    // the ink); press[i] ∈ 0..1 drives the per-point radius (thin when fast).
+    std::vector<ImVec2> pts;
+    std::vector<float>  press;
 };
 
 struct Doc {
@@ -437,7 +442,7 @@ static bool members_common_rot(uint64_t gid, float* out) {
     bool any = false; float r = 0;
     for (auto id : m) {
         Shape* c = find_shape(id);
-        if (!c || (c->type != SH_TEXT && c->type != SH_IMAGE)) continue;
+        if (!c || (c->type != SH_TEXT && c->type != SH_IMAGE && c->type != SH_DRAW)) continue;
         if (!any) { r = c->rot; any = true; }
         else if (fabsf(c->rot - r) > 0.001f) return false;
     }
@@ -448,6 +453,12 @@ static bool members_common_rot(uint64_t gid, float* out) {
 
 // ── shape geometry ──
 static float text_px(const Shape& s) { return kTextSizes[s.tsize] * s.scale; }
+
+// strokes share the S/M/L/XL ladder (widths in world px, tldraw's draw sizes);
+// pressure thins toward 35% of the nominal width and can fatten a touch past it
+static const float kDrawSizes[4] = { 2.f, 3.5f, 5.f, 10.f };
+static float draw_width(const Shape& s) { return kDrawSizes[s.tsize] * s.scale; }
+static float draw_radius(const Shape& s, float p) { return draw_width(s) * 0.5f * (0.35f + 0.75f * p); }
 
 // list lines ("• foo", "12. foo", optionally indented) pin to the left edge
 // even when the text block is centered/right-aligned
@@ -651,7 +662,7 @@ static WRect shape_local_rect(const Shape& s) {
     r.mx = s.pos + (s.type == SH_TEXT ? text_extent(s) : s.size);
     return r;
 }
-static bool has_rot(const Shape& s) { return (s.type == SH_TEXT || s.type == SH_IMAGE) && s.rot != 0.f; }
+static bool has_rot(const Shape& s) { return (s.type == SH_TEXT || s.type == SH_IMAGE || s.type == SH_DRAW) && s.rot != 0.f; }
 // rotated corners, order: tl tr br bl (pad in local units expands the rect)
 static void shape_obb(const Shape& s, ImVec2 out[4], float pad = 0.f) {
     WRect r = shape_local_rect(s);
@@ -659,6 +670,27 @@ static void shape_obb(const Shape& s, ImVec2 out[4], float pad = 0.f) {
     ImVec2 c = r.center();
     ImVec2 k[4] = { r.mn, ImVec2(r.mx.x, r.mn.y), r.mx, ImVec2(r.mn.x, r.mx.y) };
     for (int i = 0; i < 4; i++) out[i] = s.rot != 0.f ? rot_about(k[i], c, s.rot) : k[i];
+}
+
+// Re-fit a stroke's local rect to its ink (point centers ± radii) after points
+// are appended or the width changes. Rotation pivots on the rect's own center,
+// which moves with the rect — so place the new rect's center where the OLD
+// frame maps it (the crop/wrap trick), keeping the drawn ink world-stationary.
+static void draw_recalc_bounds(Shape& s) {
+    if (s.pts.empty()) return;
+    WRect b; bool first = true;
+    for (size_t i = 0; i < s.pts.size(); i++) {
+        float r = draw_radius(s, s.press[i]);
+        ImVec2 rr(r, r);
+        if (first) { b.mn = s.pts[i] - rr; b.mx = s.pts[i] + rr; first = false; }
+        else { b.include(s.pts[i] - rr); b.include(s.pts[i] + rr); }
+    }
+    ImVec2 c0 = s.pos + s.size * 0.5f;   // old rotation pivot
+    ImVec2 cl = s.pos + b.center();      // new rect center, old local frame
+    ImVec2 cw = s.rot != 0.f ? rot_about(cl, c0, s.rot) : cl;
+    for (auto& p : s.pts) p = p - b.mn;
+    s.size = b.size();
+    s.pos = cw - s.size * 0.5f;
 }
 
 static WRect shape_bounds(const Shape& s);   // fwd
@@ -677,7 +709,7 @@ static ImVec2 arrow_end_pos(const ArrowEnd& e) {
 static WRect shape_bounds(const Shape& s) {
     WRect r;
     switch (s.type) {
-    case SH_TEXT: case SH_IMAGE: {
+    case SH_TEXT: case SH_IMAGE: case SH_DRAW: {
         WRect lr = shape_local_rect(s);
         ImVec2 piv = lr.center();   // rotation pivot = the BOX center, always
         if (s.type == SH_TEXT) lr.mn.x += text_left_overhang(s);   // poking "10." markers are ink too
@@ -743,6 +775,8 @@ static void arrow_polyline(const Shape& s, std::vector<ImVec2>& out) {
 // ── selection / interaction state ──
 static std::vector<uint64_t> g_sel;
 static uint64_t g_drill = 0;        // group id whose CHILDREN are directly selectable
+static uint64_t g_drawId = 0;       // stroke being captured (DM_DRAW)
+static uint64_t g_lastDrawId = 0;   // shift+press with the draw tool extends this stroke
 static uint64_t g_editText = 0;         // text shape being edited (custom canvas editor)
 static uint64_t g_editLabelArrow = 0;   // arrow whose label is being edited
 
@@ -800,6 +834,20 @@ static json shape_to_json(const Shape& s) {
     case SH_GROUP:
         if (s.rot != 0.f) j["rot"] = s.rot;   // the group's persistent frame
         break;
+    case SH_DRAW: {
+        j["x"] = s.pos.x; j["y"] = s.pos.y;
+        j["w"] = s.size.x; j["h"] = s.size.y;
+        j["tsize"] = s.tsize;
+        if (s.scale != 1.f) j["scale"] = s.scale;
+        if (s.rot != 0.f) j["rot"] = s.rot;
+        // flat [x,y,p, x,y,p, …], quantized — a long stroke is hundreds of points
+        auto q = [](float v) { return roundf(v * 100.f) * 0.01f; };
+        json pa = json::array();
+        for (size_t i = 0; i < s.pts.size(); i++) {
+            pa.push_back(q(s.pts[i].x)); pa.push_back(q(s.pts[i].y)); pa.push_back(q(s.press[i]));
+        }
+        j["pts"] = std::move(pa);
+    } break;
     }
     return j;
 }
@@ -846,6 +894,20 @@ static Shape shape_from_json(const json& j) {
     case SH_GROUP:
         s.rot = j.value("rot", 0.f);
         break;
+    case SH_DRAW:
+        s.pos = ImVec2(j.value("x", 0.f), j.value("y", 0.f));
+        s.size = ImVec2(j.value("w", 0.f), j.value("h", 0.f));
+        s.tsize = j.value("tsize", kDefaultTextSize);
+        s.scale = j.value("scale", 1.f);
+        s.rot = j.value("rot", 0.f);
+        if (j.contains("pts") && j["pts"].is_array()) {
+            const json& pa = j["pts"];
+            for (size_t i = 0; i + 2 < pa.size(); i += 3) {
+                s.pts.push_back(ImVec2(pa[i], pa[i + 1]));
+                s.press.push_back(pa[i + 2]);
+            }
+        }
+        break;
     }
     return s;
 }
@@ -891,6 +953,10 @@ static bool doc_from_json_string(const std::string& str, bool restoreCam) {
             bool empty = true;
             for (char c : s.text) if (!isspace((unsigned char)c)) { empty = false; break; }
             if (empty) dead.push_back(s.id);
+        }
+        for (auto& s : g_doc.shapes) if (s.type == SH_DRAW) {
+            if (s.pts.empty()) { dead.push_back(s.id); continue; }
+            while (s.press.size() < s.pts.size()) s.press.push_back(0.6f);   // hand-edited boards
         }
         if (!dead.empty()) delete_shapes(dead);
     }
@@ -1003,7 +1069,7 @@ static void delete_shapes(const std::vector<uint64_t>& ids) {
 
 static void move_shape(Shape& s, ImVec2 d) {
     switch (s.type) {
-    case SH_TEXT: case SH_IMAGE: s.pos = s.pos + d; break;
+    case SH_TEXT: case SH_IMAGE: case SH_DRAW: s.pos = s.pos + d; break;
     case SH_ARROW:
         if (!s.a.bind) s.a.p = s.a.p + d;
         if (!s.b.bind) s.b.p = s.b.p + d;
@@ -1880,7 +1946,7 @@ static void paste_shapes_json(const std::string& payload, ImVec2 atW) {
         // bounds of foreign shapes: geometric fields only (no doc lookups for binds)
         WRect r;
         if (s.type == SH_ARROW) { r.mn = r.mx = s.a.p; r.include(s.b.p); }
-        else { r.mn = s.pos; r.mx = s.pos + (s.type == SH_IMAGE ? s.size : text_extent(s)); }
+        else { r.mn = s.pos; r.mx = s.pos + (s.type == SH_TEXT ? text_extent(s) : s.size); }
         if (first) { b = r; first = false; } else b.include(r);
     }
     ImVec2 off = first ? ImVec2(0, 0) : atW - b.center();
@@ -2109,6 +2175,7 @@ static void switch_board(const std::string& dirIn) {
     }
 #endif
     g_projDir = dir;
+    g_drawId = g_lastDrawId = 0;
     load_board();
     if (!board_exists(dir)) save_board_now();
     if (!g_headless) note_board_opened(dir);
@@ -2154,6 +2221,23 @@ static uint64_t hit_test(ImVec2 w) {
             float th = screen_px(8.f);
             for (size_t k = 0; k + 1 < pl.size(); k++)
                 if (dist_point_seg(w, pl[k], pl[k + 1]) < th) return s.id;
+            continue;
+        }
+        if (s.type == SH_DRAW) {
+            // hit the ink, not the box: sparse diagonal strokes have huge boxes
+            WRect lb = shape_local_rect(s);
+            ImVec2 p = s.rot != 0.f ? rot_about(w, lb.center(), -s.rot) : w;
+            ImVec2 q = p - s.pos;
+            float th = screen_px(6.f);
+            if (q.x < -th || q.y < -th || q.x > s.size.x + th || q.y > s.size.y + th) continue;
+            if (s.pts.size() == 1) {
+                if (vlen(q - s.pts[0]) < fmaxf(draw_radius(s, s.press[0]), th)) return s.id;
+                continue;
+            }
+            for (size_t k = 0; k + 1 < s.pts.size(); k++) {
+                float r = fmaxf(fmaxf(draw_radius(s, s.press[k]), draw_radius(s, s.press[k + 1])), th);
+                if (dist_point_seg(q, s.pts[k], s.pts[k + 1]) < r) return s.id;
+            }
             continue;
         }
         WRect b = shape_local_rect(s);
@@ -2285,6 +2369,96 @@ static void draw_arrow_shape(ImDrawList* dl, const Shape& s, bool ghostEnd = fal
     }
 }
 
+// Variable-width freehand stroke. Rails L/R offset each point along the
+// averaged segment normal by its pressure-driven radius. Two fills:
+//   opaque — overlapping segment quads + a disc at every point (round joins/
+//   caps for free, O(n), immune to self-intersection; invisible overdraw
+//   because the color is solid).
+//   translucent — one concave outline polygon (rails + cap arcs), because
+//   overdraw would double-blend into blotches at every joint.
+static void draw_stroke_shape(ImDrawList* dl, const Shape& s) {
+    int n = (int)s.pts.size();
+    if (!n) return;
+    ImU32 col = shape_ink(s);
+    ImVec2 c = shape_local_rect(s).center();
+    static std::vector<ImVec2> sp; static std::vector<float> rr;   // reused (single-threaded)
+    sp.resize(n); rr.resize(n);
+    for (int i = 0; i < n; i++) {
+        ImVec2 w = s.pos + s.pts[i];
+        if (s.rot != 0.f) w = rot_about(w, c, s.rot);
+        sp[i] = W2S(w);
+        rr[i] = fmaxf(draw_radius(s, s.press[i]) * g_cam.zoom, 0.55f);   // stay visible zoomed out
+    }
+    if (n == 1) { dl->AddCircleFilled(sp[0], rr[0], col); return; }
+    static std::vector<ImVec2> L, R;
+    L.resize(n); R.resize(n);
+    ImVec2 dir(1, 0);
+    for (int i = 0; i < n; i++) {
+        ImVec2 d = sp[i == n - 1 ? i : i + 1] - sp[i == 0 ? i : i - 1];
+        float len = vlen(d);
+        if (len > 0.0001f) dir = d * (1.f / len);   // zero-length: keep the last heading
+        ImVec2 nn(-dir.y, dir.x);
+        L[i] = sp[i] + nn * rr[i];
+        R[i] = sp[i] - nn * rr[i];
+    }
+    if (s.opacity >= 0.999f) {
+        for (int i = 0; i + 1 < n; i++) {
+            ImVec2 q[4] = { L[i], L[i + 1], R[i + 1], R[i] };
+            dl->AddConvexPolyFilled(q, 4, col);
+        }
+        for (int i = 0; i < n; i++) dl->AddCircleFilled(sp[i], rr[i], col);
+        return;
+    }
+    // Translucent: the ribbon must be filled exactly ONCE or every overlap
+    // double-blends. Concave-poly fill is out — it ear-clips, and a stroke
+    // outline self-intersects wherever the path curls tighter than the pen
+    // radius, which ear-clipping turns into giant filled blobs. So build the
+    // mesh by hand: strip triangles between the rails, semicircle fans for the
+    // caps, and a 1px outward fringe fading to transparent for anti-aliasing
+    // (a fold at an extreme cusp can still double-blend, but only inside the
+    // fold's own few pixels).
+    struct RV { ImVec2 p, o; };            // outline ring vertex + outward unit
+    static std::vector<RV> ring;
+    ring.clear(); ring.reserve(2 * n + 14);
+    auto radial = [](ImVec2 v, ImVec2 c) {
+        ImVec2 d = v - c; float l = vlen(d);
+        return l > 1e-4f ? d * (1.f / l) : ImVec2(1, 0);
+    };
+    auto arc = [&](ImVec2 p, float r, ImVec2 from) {   // 7 pts sweeping half a turn
+        float a0 = atan2f(from.y, from.x);
+        for (int k = 1; k < 8; k++) {
+            float a = a0 - IM_PI * (float)k / 8.f;
+            ImVec2 u(cosf(a), sinf(a));
+            ring.push_back({ p + u * r, u });
+        }
+    };
+    for (int i = 0; i < n; i++) ring.push_back({ L[i], radial(L[i], sp[i]) });
+    arc(sp[n - 1], rr[n - 1], L[n - 1] - sp[n - 1]);   // end cap: L → R through the heading
+    for (int i = n - 1; i >= 0; i--) ring.push_back({ R[i], radial(R[i], sp[i]) });
+    arc(sp[0], rr[0], R[0] - sp[0]);                   // start cap: R → L through −heading
+    int m = (int)ring.size();                          // = 2n + 14
+    auto rI = [&](int i) { return n + 7 + (n - 1 - i); };   // ring slot of R[i]
+    dl->PrimReserve((2 * (n - 1) + 16 + 2 * m) * 3, 2 * m + 2);
+    ImVec2 uv = dl->_Data->TexUvWhitePixel;
+    ImU32 col0 = col & 0x00FFFFFF;
+    unsigned base = dl->_VtxCurrentIdx;
+    for (int i = 0; i < m; i++) dl->PrimWriteVtx(ring[i].p, uv, col);                 // inner ring
+    for (int i = 0; i < m; i++) dl->PrimWriteVtx(ring[i].p + ring[i].o, uv, col0);    // fringe ring
+    dl->PrimWriteVtx(sp[0], uv, col);                                                 // cap fan centers
+    dl->PrimWriteVtx(sp[n - 1], uv, col);
+    auto tri = [&](int a, int b, int c) {
+        dl->PrimWriteIdx((ImDrawIdx)(base + a)); dl->PrimWriteIdx((ImDrawIdx)(base + b));
+        dl->PrimWriteIdx((ImDrawIdx)(base + c));
+    };
+    for (int i = 0; i + 1 < n; i++) { tri(i, i + 1, rI(i + 1)); tri(i, rI(i + 1), rI(i)); }
+    for (int j = n - 1; j < n + 7; j++) tri(2 * m + 1, j, j + 1);            // end cap fan (L[n-1]…arc…R[n-1])
+    for (int j = 2 * n + 6; j < 2 * n + 14; j++) tri(2 * m, j, (j + 1) % m); // start cap fan (R[0]…arc…L[0])
+    for (int j = 0; j < m; j++) {                                            // AA fringe around the ring
+        int k = (j + 1) % m;
+        tri(j, k, m + k); tri(j, m + k, m + j);
+    }
+}
+
 // doc order = z order. `only` (when non-null) limits drawing to those ids —
 // the selection-export path renders just the selected shapes.
 static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
@@ -2315,6 +2489,7 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
         if (b.mx.x < view.mn.x || b.mn.x > view.mx.x || b.mx.y < view.mn.y || b.mn.y > view.mx.y) continue;
         switch (s.type) {
         case SH_TEXT:  draw_text_shape(dl, s); break;
+        case SH_DRAW:  draw_stroke_shape(dl, s); break;
         case SH_ARROW: draw_arrow_shape(dl, s); break;
         case SH_IMAGE: {
             ImVec2 mn = W2S(s.pos), mx = W2S(s.pos + s.size);
@@ -2509,6 +2684,7 @@ static std::string outline_ref(const ArrowEnd& e) {
     if (Shape* t = find_shape(e.bind)) {
         if (t->type == SH_TEXT)  return "\"" + first_line_trunc(t->text) + "\"";
         if (t->type == SH_IMAGE) return "[" + std::string(media_word(*t)) + " " + t->asset + "]";
+        if (t->type == SH_DRAW)  return "[drawing]";
         return "[group]";
     }
     char buf[48];
@@ -2546,6 +2722,10 @@ static void outline_emit(const Shape& s, int depth, std::string& out) {
         char dim[48];
         snprintf(dim, sizeof dim, "%dx%d", (int)lroundf(s.size.x), (int)lroundf(s.size.y));
         out += ind + "- " + media_word(s) + " " + pos + " " + dim + ": " + s.asset + "\n";
+    } else if (s.type == SH_DRAW) {
+        char dim[48];
+        snprintf(dim, sizeof dim, "%dx%d", (int)lroundf(s.size.x), (int)lroundf(s.size.y));
+        out += ind + "- drawing " + pos + " " + dim + "\n";
     } else if (s.type == SH_GROUP) {
         out += ind + "- group " + pos + ":\n";
         std::vector<const Shape*> kids;   // members of an included group are all in
@@ -2611,7 +2791,7 @@ static void copy_text_to_clipboard(const std::string& utf8) {
 
 // ─────────────────────────── canvas interaction ────────────────────────────
 enum DragMode { DM_NONE = 0, DM_PENDING, DM_MOVE, DM_MARQUEE, DM_HANDLE, DM_CROP, DM_ROTATE,
-                DM_WRAP, DM_ARROW_A, DM_ARROW_B, DM_BEND, DM_NEW_ARROW, DM_PAN_R };
+                DM_WRAP, DM_ARROW_A, DM_ARROW_B, DM_BEND, DM_NEW_ARROW, DM_PAN_R, DM_DRAW };
 static DragMode g_drag = DM_NONE;
 static ImVec2   g_dragStartW, g_dragStartS;    // world/screen at mousedown
 static WRect    g_moveStartBounds;             // selection bounds when the move began
@@ -2639,7 +2819,7 @@ static int      g_wrapClickIdx = -1;
 static uint64_t g_newArrowId = 0;
 static bool     g_rDrag = false;               // right button turned into a pan
 
-enum Tool { TOOL_SELECT = 0, TOOL_HAND, TOOL_TEXT, TOOL_ARROW, TOOL_COUNT };
+enum Tool { TOOL_SELECT = 0, TOOL_HAND, TOOL_DRAW, TOOL_TEXT, TOOL_ARROW, TOOL_COUNT };
 static Tool g_tool = TOOL_SELECT;
 static bool g_spacePan = false;
 
@@ -2729,6 +2909,125 @@ static uint64_t create_text_at(ImVec2 w) {
     s.pos.y -= kTextSizes[s.tsize] * 0.5f;
     g_doc.shapes.push_back(s);
     return s.id;
+}
+
+// ── freehand stroke capture ──
+// Pressure: a real pen (WM_POINTER, e.g. a Wacom with Windows Ink on) drives
+// it directly; a mouse simulates it from speed — stroke fast, get a thin line
+// (the tldraw look). Points are streamlined (exponential smoothing toward the
+// cursor) so mouse jitter doesn't ripple the ink. SHIFT chains: shift+press
+// with the draw tool appends a straight rubber-band segment from the LAST
+// stroke's endpoint (same shape, not a new one), and toggling shift mid-drag
+// flips between straight and freehand within the one gesture.
+static bool   g_drawStraight = false;   // current sub-mode of the live gesture
+static int    g_drawSegBase = 0;        // pts count where the live segment starts
+static ImVec2 g_drawSmooth;             // streamline accumulator (world)
+static ImVec2 g_drawPrevMouse;          // last frame's cursor (world) — speed source
+static float  g_drawPressure = 0.6f;    // smoothed pressure state
+static float  g_penPressure = -1.f;     // live pen pressure from WM_POINTER (-1 = no pen)
+
+// world point → the shape's local point frame (undo rotation, then pos)
+static ImVec2 draw_to_local(const Shape& s, ImVec2 w) {
+    if (s.rot != 0.f) w = rot_about(w, s.pos + s.size * 0.5f, -s.rot);
+    return w - s.pos;
+}
+static ImVec2 draw_from_local(const Shape& s, ImVec2 l) {
+    ImVec2 w = s.pos + l;
+    return s.rot != 0.f ? rot_about(w, s.pos + s.size * 0.5f, s.rot) : w;
+}
+
+static void draw_begin(ImVec2 mw, bool shift) {
+    Shape* ext = nullptr;
+    if (shift && g_lastDrawId) {
+        ext = find_shape(g_lastDrawId);
+        if (ext && (ext->type != SH_DRAW || ext->pts.empty())) ext = nullptr;
+    }
+    if (ext) {   // chain a straight segment onto the last stroke
+        g_drawId = ext->id;
+        g_drawStraight = true;
+        g_drawSegBase = (int)ext->pts.size();
+        g_drawPressure = ext->press.back();
+    } else {
+        Shape s; s.id = new_id(); s.type = SH_DRAW;
+        s.col = g_curCol; s.opacity = g_curOpacity; s.tsize = g_curSize;
+        s.pos = mw;
+        g_drawPressure = g_penPressure >= 0.f ? g_penPressure : 0.6f;
+        s.pts.push_back(ImVec2(0, 0));
+        s.press.push_back(g_drawPressure);
+        g_doc.shapes.push_back(s);
+        draw_recalc_bounds(g_doc.shapes.back());
+        g_drawId = s.id;
+        g_drawStraight = shift;   // shift with nothing to chain to = straight from here
+        g_drawSegBase = 1;
+    }
+    g_drawSmooth = g_drawPrevMouse = mw;
+    g_drag = DM_DRAW;
+}
+
+static void draw_end(ImVec2 mw);   // fwd
+
+static void draw_update(ImVec2 mw) {
+    Shape* s = find_shape(g_drawId);
+    if (!s || s->type != SH_DRAW) { g_drag = DM_NONE; g_drawId = 0; return; }   // undo mid-drag etc.
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        // the release slipped past us (space-pan etc. return before the
+        // release handler) — commit instead of inking a ghost cursor trail
+        draw_end(mw); g_drag = DM_NONE; return;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    float dt = io.DeltaTime > 0.f ? io.DeltaTime : 1.f / 120.f;
+
+    if (io.KeyShift != g_drawStraight) {   // flip sub-mode mid-gesture
+        g_drawStraight = io.KeyShift;
+        g_drawSegBase = (int)s->pts.size();   // straight endpoint / freehand tail committed
+        g_drawSmooth = g_drawPrevMouse = mw;  // no smoothing lag or speed spike across the seam
+    }
+
+    if (g_drawStraight) {
+        // rubber-band: the segment endpoint chases the cursor at frozen width;
+        // pts[segBase-1] (the previous end) anchors the line
+        s->pts.resize(g_drawSegBase); s->press.resize(g_drawSegBase);
+        s->pts.push_back(draw_to_local(*s, mw));
+        s->press.push_back(g_drawPressure);
+    } else {
+        float t = 1.f - expf(-dt * 40.f);   // streamline (~25ms time constant)
+        g_drawSmooth = g_drawSmooth + (mw - g_drawSmooth) * t;
+        float target;
+        if (g_penPressure >= 0.f) target = g_penPressure;
+        else {
+            // simulated: normalize cursor speed by the stroke width so every
+            // size ladder step thins over the same *relative* speed range
+            float speed = vlen(mw - g_drawPrevMouse) / dt;   // world px/s
+            target = 1.f - speed / (draw_width(*s) * 350.f);
+            target = target < 0.f ? 0.f : target;
+        }
+        g_drawPressure += (target - g_drawPressure) * fminf(dt * (g_penPressure >= 0.f ? 40.f : 15.f), 1.f);
+        ImVec2 lastW = draw_from_local(*s, s->pts.back());
+        if (vlen(g_drawSmooth - lastW) * g_cam.zoom > 2.f) {   // min 2 screen px per point
+            s->pts.push_back(draw_to_local(*s, g_drawSmooth));
+            s->press.push_back(g_drawPressure);
+        }
+    }
+    g_drawPrevMouse = mw;
+    draw_recalc_bounds(*s);   // keep bounds live so culling can't eat the wet stroke
+}
+
+static void draw_end(ImVec2 mw) {
+    Shape* s = find_shape(g_drawId);
+    if (s && s->type == SH_DRAW) {
+        if (!g_drawStraight && !s->pts.empty()) {
+            // land the ink exactly where the cursor let go (streamline trails it)
+            ImVec2 lastW = draw_from_local(*s, s->pts.back());
+            if (vlen(mw - lastW) * g_cam.zoom > 0.5f) {
+                s->pts.push_back(draw_to_local(*s, mw));
+                s->press.push_back(g_drawPressure);
+            }
+        }
+        draw_recalc_bounds(*s);
+        g_lastDrawId = g_drawId;   // the next shift+press chains onto this stroke
+        push_undo();
+    }
+    g_drawId = 0;
 }
 
 // Re-box a text: new left edge + wrap width in the SNAPSHOT's local frame
@@ -2873,7 +3172,7 @@ static int draw_selection_ui(ImDrawList* dl, bool handlesActive) {
     }
     Shape* single = g_sel.size() == 1 ? find_shape(g_sel[0]) : nullptr;
     float commonRot = 0;
-    if (single && (single->type == SH_TEXT || single->type == SH_IMAGE)) {
+    if (single && (single->type == SH_TEXT || single->type == SH_IMAGE || single->type == SH_DRAW)) {
         ImVec2 c[4]; shape_obb(*single, c, 4.f / g_cam.zoom);
         for (int i = 0; i < 4; i++) g_selCorners[i] = W2S(c[i]);
     } else if (selection_common_rot(&commonRot)) {
@@ -2884,7 +3183,7 @@ static int draw_selection_ui(ImDrawList* dl, bool handlesActive) {
         std::vector<ImVec2> pts;
         for (auto id : all) {
             Shape* s = find_shape(id); if (!s) continue;
-            if (s->type == SH_TEXT || s->type == SH_IMAGE) {
+            if (s->type == SH_TEXT || s->type == SH_IMAGE || s->type == SH_DRAW) {
                 ImVec2 c[4]; shape_obb(*s, c);
                 for (int i = 0; i < 4; i++) pts.push_back(c[i]);
             } else if (s->type == SH_ARROW) {
@@ -2984,8 +3283,8 @@ static ArrowGizmo arrow_gizmo(ImDrawList* dl) {
 }
 
 // ─────────────────────────────── UI chrome ─────────────────────────────────
-static const char* kToolLabel[TOOL_COUNT] = { "sel", "hand", "text", "arrow" };
-static const char* kToolKey[TOOL_COUNT]   = { "V", "H", "T", "A" };
+static const char* kToolLabel[TOOL_COUNT] = { "sel", "hand", "draw", "text", "arrow" };
+static const char* kToolKey[TOOL_COUNT]   = { "V", "H", "D", "T", "A" };
 
 static void DrawToolbar() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -3132,6 +3431,7 @@ static void DrawStylePanel() {
     int curCol = g_curCol, curSize = g_curSize, curAlign = g_curAlign;
     float curOp = g_curOpacity;
     bool haveText = g_sel.empty();   // no selection → size/align rows always shown
+    bool haveDraw = false;           // strokes share the size ladder, not align
     for (auto id : g_sel) {
         std::vector<uint64_t> all{ id };
         Shape* g = find_shape(id);
@@ -3141,11 +3441,14 @@ static void DrawStylePanel() {
             if (!s || s->type == SH_GROUP) continue;
             curCol = s->col; curOp = s->opacity;
             if (s->type == SH_TEXT) { curSize = s->tsize; curAlign = s->align; haveText = true; }
+            else if (s->type == SH_DRAW) { curSize = s->tsize; haveDraw = true; }
             goto found;
         }
     }
 found:;
-    for (auto id : g_sel) { Shape* s = find_shape(id); if (s && s->type == SH_TEXT) haveText = true; }
+    for (auto id : g_sel) { Shape* s = find_shape(id); if (!s) continue;
+        if (s->type == SH_TEXT) haveText = true;
+        if (s->type == SH_DRAW) haveDraw = true; }
 
     ImDrawList* wdl = ImGui::GetWindowDrawList();
     const float cell = 24.f;
@@ -3164,7 +3467,7 @@ found:;
         }
     }
 
-    if (haveText) {
+    if (haveText || haveDraw) {
         for (int z = 0; z < 4; z++) {
             if (z) ImGui::SameLine(0.f, 4.f);
             bool active = (curSize == z);
@@ -3175,10 +3478,15 @@ found:;
             char lbl[16]; snprintf(lbl, sizeof lbl, "%s##ts%d", kTextSizeName[z], z);
             if (ImGui::Button(lbl, ImVec2(38, 24))) {
                 g_curSize = z;
-                if (apply_to_selection([&](Shape& s) { if (s.type == SH_TEXT) { s.tsize = z; s.scale = 1.f; } })) push_undo();
+                if (apply_to_selection([&](Shape& s) {
+                        if (s.type == SH_TEXT) { s.tsize = z; s.scale = 1.f; }
+                        else if (s.type == SH_DRAW) { s.tsize = z; s.scale = 1.f; draw_recalc_bounds(s); }
+                    })) push_undo();
             }
             if (active) ImGui::PopStyleColor(2);
         }
+    }
+    if (haveText) {
         // align: three little line-stacks (left / center / right)
         for (int a = 0; a < 3; a++) {
             if (a) ImGui::SameLine(0.f, 4.f);
@@ -4191,6 +4499,7 @@ static void CanvasFrame() {
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) g_pickerWant = true;
         if (ImGui::IsKeyPressed(ImGuiKey_V)) g_tool = TOOL_SELECT;
         if (ImGui::IsKeyPressed(ImGuiKey_H)) g_tool = TOOL_HAND;
+        if (ImGui::IsKeyPressed(ImGuiKey_D) && !io.KeyCtrl) g_tool = TOOL_DRAW;
         if (ImGui::IsKeyPressed(ImGuiKey_T)) g_tool = TOOL_TEXT;
         if (ImGui::IsKeyPressed(ImGuiKey_A) && !io.KeyCtrl) g_tool = TOOL_ARROW;
         g_spacePan = ImGui::IsKeyDown(ImGuiKey_Space);
@@ -4292,6 +4601,8 @@ static void CanvasFrame() {
             begin_text_edit(id, 0);
             g_tool = TOOL_SELECT;
             g_drag = DM_NONE;
+        } else if (g_tool == TOOL_DRAW) {
+            draw_begin(mw, io.KeyShift);
         } else if (g_tool == TOOL_ARROW) {
             Shape s; s.id = new_id(); s.type = SH_ARROW;
             s.col = g_curCol; s.opacity = g_curOpacity;
@@ -4454,6 +4765,11 @@ static void CanvasFrame() {
             case SH_TEXT:  s->pos = sc(snap.pos); s->scale = snap.scale * k;
                            s->wrapW = snap.wrapW * k; break;   // wrap box scales with the glyphs
             case SH_IMAGE: s->pos = sc(snap.pos); s->size = snap.size * k; break;
+            case SH_DRAW:  // points and width (via scale) grow in lockstep, so
+                           // the ink box scales exactly like an image's rect
+                s->pos = sc(snap.pos); s->size = snap.size * k; s->scale = snap.scale * k;
+                for (size_t i = 0; i < snap.pts.size(); i++) s->pts[i] = snap.pts[i] * k;
+                break;
             case SH_ARROW:
                 if (!snap.a.bind) s->a.p = sc(snap.a.p);
                 if (!snap.b.bind) s->b.p = sc(snap.b.p);
@@ -4471,7 +4787,7 @@ static void CanvasFrame() {
         for (auto& [id, snap] : g_handleStartShapes) {
             Shape* s = find_shape(id); if (!s) continue;
             switch (s->type) {
-            case SH_TEXT: case SH_IMAGE: {
+            case SH_TEXT: case SH_IMAGE: case SH_DRAW: {
                 ImVec2 c0 = shape_local_rect(snap).center();
                 ImVec2 c1 = rot_about(c0, g_rotPivotW, dth);
                 s->rot = snap.rot + dth;
@@ -4544,6 +4860,8 @@ static void CanvasFrame() {
         }
     }
 
+    if (g_drag == DM_DRAW) draw_update(mw);
+
     if (g_drag == DM_ARROW_A || g_drag == DM_ARROW_B || g_drag == DM_NEW_ARROW || g_drag == DM_BEND) {
         Shape* s = find_shape(g_drag == DM_NEW_ARROW ? g_newArrowId : (g_sel.empty() ? 0 : g_sel[0]));
         if (s && s->type == SH_ARROW) {
@@ -4611,6 +4929,8 @@ static void CanvasFrame() {
             g_drag == DM_ARROW_A || g_drag == DM_ARROW_B || g_drag == DM_BEND)
             push_undo();
 
+        if (g_drag == DM_DRAW) draw_end(mw);   // commits + remembers for shift-chaining
+
         if (g_drag == DM_NEW_ARROW) {
             Shape* s = find_shape(g_newArrowId);
             if (s) {
@@ -4650,6 +4970,22 @@ static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         DragFinish(hd);
     } return 0;
+    // Pen pressure (Wacom etc. with Windows Ink on). We don't call
+    // EnableMouseInPointer, so the pen ALSO arrives as normal mouse input —
+    // imgui's mouse path is untouched; we just siphon the pressure off and the
+    // draw tool reads it instead of simulating from speed. Hover reports
+    // pressure 0 → treated as "no pen" until the tip touches.
+    case WM_POINTERDOWN: case WM_POINTERUPDATE: {
+        POINTER_INPUT_TYPE pt;
+        UINT32 pid = GET_POINTERID_WPARAM(w);
+        if (GetPointerType(pid, &pt) && pt == PT_PEN) {
+            POINTER_PEN_INFO pi;
+            g_penPressure = (GetPointerPenInfo(pid, &pi) && pi.pressure)
+                            ? (float)pi.pressure / 1024.f : -1.f;
+        }
+        break;
+    }
+    case WM_POINTERUP: case WM_POINTERLEAVE: g_penPressure = -1.f; break;
     case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(h, m, w, l);

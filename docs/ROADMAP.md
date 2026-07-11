@@ -44,6 +44,9 @@ play/stop/seek/A-B pill, dynamic-texture upload. Shape clipboard.
   toggle on the pill; audio clock drives the video while sounding).
 - More shapes (rect/ellipse/frame) IF daily use demands (rotation: done, session 2).
 - freetype glyph rasterizer for even better small-text rendering.
+- **Freehand draw tool** ✅ (session 9, promoted out of the parking lot on
+  user request: pressure/speed-thinned strokes, shift straight-line chaining,
+  WM_POINTER pen pressure).
 
 ## M5 — linux port
 SDL3 (or Win32→X11/Wayland via GLFW) + Vulkan or GL backend behind the same
@@ -51,5 +54,4 @@ canvas code; mailbox present mode ≈ flip model. The canvas/doc layers are
 platform-clean already; platform bits are isolated at the top of main.cpp.
 
 ## parking lot
-Collaborative/multiplayer: out of scope. Freehand ink: not a primary
-primitive, only if wanted later. Rich text: no.
+Collaborative/multiplayer: out of scope. Rich text: no.

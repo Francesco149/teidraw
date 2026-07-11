@@ -5,8 +5,8 @@ one purpose, complexity hidden, heuristics that guess intent, and an obsessively
 smooth/responsive canvas. Native **C++ · Dear ImGui 1.92 · D3D11 · Win32**,
 cross-compiled to a Win64 PE with **mingw-w64 from the nix flake** (the proven
 slopstudio pattern), run on the Win11 host via WSLInterop. Windows first; Linux
-port later. Primary primitives: **text, arrows, images/gifs/videos, groups** —
-deliberately NOT every tldraw feature.
+port later. Primary primitives: **text, arrows, images/gifs/videos, groups,
+freehand strokes** — deliberately NOT every tldraw feature.
 
 This file auto-loads every session. The repo is the source of truth.
 **Read next: `docs/STATUS.md`** — current state + what to build next.
@@ -33,6 +33,10 @@ label that blanks the line under it. Corner drag → aspect-locked scale;
 ctrl+corner on image → crop with full-image ghost. Drop image onto image →
 replace contents (cropped frames keep the frame, cover-crop the new source).
 Paste = shapes > PNG > DIB > files > plain text (becomes a text shape).
+Draw tool (D): stroke fast → thinner ink (real pen pressure wins when a
+tablet reports it); shift+press chains a straight segment onto the LAST
+stroke, and toggling shift mid-drag flips straight/freehand — one shape.
+Strokes are baked ink: move/scale/rotate/delete, never reshape.
 
 ## Layout
 - `editor/src/main.cpp` — the whole app, single TU (slopstudio pattern; split

@@ -1,6 +1,6 @@
 # STATUS — live front
 
-*Updated: 2026-07-11 (session 8). History lives in `git log` — this file only
+*Updated: 2026-07-11 (session 9). History lives in `git log` — this file only
 describes NOW.*
 
 ## Where things stand
@@ -129,6 +129,34 @@ saga are deleted. Also: **video play state persists** (`play` in board.json;
 a video left playing resumes when the board reopens, transport clicks
 autosave without undo entries; headless still renders posters).
 
+Session-9 = **freehand draw tool** (D / toolbar "draw"; promoted out of the
+roadmap parking lot on user request). `SH_DRAW` shapes are baked ink: point
+centers + per-point pressure local to a pos/size/rot rect (same frame math as
+images), stored as a flat quantized `pts` triple array in board.json —
+selectable/movable/scalable/rotatable/deletable, never reshaped. Capture
+streamlines the cursor (~25ms exp. smoothing) and simulates pressure from
+speed (normalized by stroke width → fast = thin, the tldraw look); a real pen
+overrides it via WM_POINTER (`g_penPressure`; no EnableMouseInPointer, so
+imgui's mouse path is untouched — needs Windows Ink on in the tablet driver).
+**Shift chains strokes**: shift+press with the draw tool appends a straight
+rubber-band segment onto the LAST stroke (same shape, from its endpoint), and
+toggling shift mid-drag flips straight/freehand within one gesture
+(`g_drawSegBase` marks the live segment; straight mode rewrites its tail each
+frame). One undo per gesture. Strokes use the S/M/L/XL ladder as width
+(`kDrawSizes` 2/3.5/5/10 world px, style panel size row applies, align is
+text-only), palette color + opacity work. Rendering (`draw_stroke_shape`):
+pressure-radius rails around each point; opaque = overlapping quads + a disc
+per point (O(n), self-intersection-proof); translucent = hand-built mesh
+(strip triangles + cap fans + 1px outward AA fringe via PrimReserve) because
+one polygon fill must NOT ear-clip — stroke outlines self-intersect at curls
+tighter than the pen radius and AddConcavePolyFilled turns those into giant
+blobs (session-9 lesson, caught by `--export` render test). Hit-testing walks
+the ink polyline (max(radius, 6px) threshold, box prefilter), not the rect.
+`draw_recalc_bounds` re-hugs the rect to the ink after every append / width
+change, keeping ink world-stationary under rotation via the crop/wrap
+center-remap trick. Corner resize scales pts+scale in lockstep so the box
+scales like an image. Text outline export says `- drawing (x, y) WxH`.
+
 ## Build & verify
 ```
 nix develop --command make -C editor            # build/teidraw.exe
@@ -145,8 +173,10 @@ render tests.
 ## NEXT TASK (docs/ROADMAP.md)
 M3 is DONE (wrap + WYSIWYG editor landed session 8) except multi-monitor DPI
 (WM_DPICHANGED restyle). M4 is essentially done too. What's left before M5
-(linux port) is polish on user feedback — the new editor needs hands-on
-testing (typing feel, selection, IME, auto-lists, wrapped/rotated editing).
+(linux port) is polish on user feedback — the session-8 editor and the
+session-9 draw tool both need hands-on testing (draw: stroke feel/thinning
+constants in the `── freehand stroke capture ──` block, shift chaining, pen
+pressure on the user's Wacom CTL-480 with Windows Ink on).
 
 ## Known rough edges / to keep in mind
 - **The text editor is in-house** (`DrawTextEditor` + `g_ted`): no imgui
