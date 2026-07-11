@@ -29,6 +29,7 @@
 #include <set>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -138,27 +139,35 @@ static void DestroyDeviceD3D() {
     if (g_dev) { g_dev->Release(); g_dev = nullptr; }
 }
 
+// Read any GPU texture back as opaque RGBA8 via a staging copy.
+static bool read_texture_rgba(ID3D11Texture2D* tex, std::vector<unsigned char>& px, int& w, int& h) {
+    D3D11_TEXTURE2D_DESC d; tex->GetDesc(&d);
+    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+    ID3D11Texture2D* staging = nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &staging))) return false;
+    g_ctx->CopyResource(staging, tex);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(g_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) { staging->Release(); return false; }
+    w = (int)d.Width; h = (int)d.Height;
+    px.resize((size_t)w * h * 4);
+    for (int y = 0; y < h; y++)
+        memcpy(&px[(size_t)y * w * 4], (unsigned char*)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4);
+    g_ctx->Unmap(staging, 0);
+    staging->Release();
+    for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;   // force opaque alpha
+    return true;
+}
+
 // Save the current backbuffer as a PNG (the --shot verification path).
 static bool SaveBackbufferPNG(const char* path) {
     ID3D11Texture2D* bb = nullptr;
     g_sc->GetBuffer(0, IID_PPV_ARGS(&bb));
     if (!bb) return false;
-    D3D11_TEXTURE2D_DESC d; bb->GetDesc(&d);
-    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0;
-    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
-    ID3D11Texture2D* staging = nullptr;
-    if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &staging))) { bb->Release(); return false; }
-    g_ctx->CopyResource(staging, bb);
+    std::vector<unsigned char> px; int w = 0, h = 0;
+    bool ok = read_texture_rgba(bb, px, w, h);
     bb->Release();
-    D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(g_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) { staging->Release(); return false; }
-    std::vector<unsigned char> px((size_t)d.Width * d.Height * 4);
-    for (UINT y = 0; y < d.Height; y++)
-        memcpy(&px[(size_t)y * d.Width * 4], (unsigned char*)m.pData + (size_t)y * m.RowPitch, (size_t)d.Width * 4);
-    g_ctx->Unmap(staging, 0);
-    staging->Release();
-    for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;   // force opaque alpha
-    return stbi_write_png(path, (int)d.Width, (int)d.Height, 4, px.data(), (int)d.Width * 4) != 0;
+    return ok && stbi_write_png(path, w, h, 4, px.data(), w * 4) != 0;
 }
 
 // ───────────────────────────────── theme ───────────────────────────────────
@@ -1525,6 +1534,313 @@ static void draw_arrow_shape(ImDrawList* dl, const Shape& s, bool ghostEnd = fal
     }
 }
 
+// doc order = z order. `only` (when non-null) limits drawing to those ids —
+// the selection-export path renders just the selected shapes.
+static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
+                            const std::vector<uint64_t>* only = nullptr) {
+    auto in_only = [&](uint64_t id) {
+        if (!only) return true;
+        for (auto i : *only) if (i == id) return true;
+        return false;
+    };
+    for (auto& s : g_doc.shapes) {
+        if (s.id == skipId || !in_only(s.id)) continue;
+        switch (s.type) {
+        case SH_TEXT:  draw_text_shape(dl, s); break;
+        case SH_ARROW: draw_arrow_shape(dl, s); break;
+        case SH_IMAGE: {
+            ImVec2 mn = W2S(s.pos), mx = W2S(s.pos + s.size);
+            ID3D11ShaderResourceView* srv = nullptr;
+            MediaKind mk = media_kind(s.asset);
+            if (mk == MK_STILL) srv = get_image_tex(s.asset)->srv;
+#ifdef TEI_LIBAV
+            else srv = video_srv(s, mk);
+#endif
+            ImU32 tint = with_opacity(IM_COL32_WHITE, s.opacity);
+            if (srv && s.rot == 0.f) {
+                dl->AddImageRounded((ImTextureID)(intptr_t)srv, mn, mx,
+                                    ImVec2(s.crop.x, s.crop.y), ImVec2(s.crop.z, s.crop.w),
+                                    tint, 5.f);
+            } else if (srv) {
+                ImVec2 c[4]; shape_obb(s, c);
+                ImVec2 sc[4]; for (int i = 0; i < 4; i++) sc[i] = W2S(c[i]);
+                dl->AddImageQuad((ImTextureID)(intptr_t)srv, sc[0], sc[1], sc[2], sc[3],
+                                 ImVec2(s.crop.x, s.crop.y), ImVec2(s.crop.z, s.crop.y),
+                                 ImVec2(s.crop.z, s.crop.w), ImVec2(s.crop.x, s.crop.w), tint);
+            } else {
+                dl->AddRectFilled(mn, mx, IM_COL32(120, 120, 128, 50), 5.f);
+                dl->AddRect(mn, mx, IM_COL32(120, 120, 128, 120), 5.f);
+                dl->AddText(nullptr, 0.f, mn + ImVec2(10, 10), g_th.textDim, s.asset.c_str());
+            }
+        } break;
+        case SH_GROUP: break;
+        }
+    }
+}
+
+// ──────────────────── LLM export (PNG · text outline) ──────────────────────
+// Copy-as-PNG renders the board (or just the selection) offscreen at 2×, so
+// a paste into a chat is crisp; "copy as text" dumps a reading-order outline
+// an LLM can ingest without vision. Same paths back `--export`/`--export-txt`.
+
+// bounds of every leaf shape on the board (groups contribute via their members)
+static bool board_content_bounds(WRect& out) {
+    bool first = true;
+    for (auto& s : g_doc.shapes) {
+        if (s.type == SH_GROUP) continue;
+        WRect b = shape_bounds(s);
+        if (first) { out = b; first = false; } else out.include(b);
+    }
+    return !first;
+}
+
+// A PNG export needs its own imgui frame (fonts rasterize per-zoom during
+// draw), so requests made mid-frame are queued and run right after Present.
+struct ExportJob {
+    bool  active = false;
+    WRect rect;                      // world rect captured at request time
+    std::vector<uint64_t> only;      // empty = whole board
+    std::string path;                // empty = clipboard
+    bool  quit = false;              // CLI: exit when done
+};
+static ExportJob g_export;
+
+// capture bounds + scope NOW (mid-frame, where text extents are safe to
+// measure); the render itself runs between frames
+static void request_png_export(bool selOnly, const char* path) {
+    ExportJob j;
+    if (selOnly && !g_sel.empty()) {
+        j.rect = selection_bounds();
+        j.only = g_sel;
+        for (auto id : g_sel) { Shape* s = find_shape(id);
+            if (s && s->type == SH_GROUP) collect_members(id, j.only); }
+    } else if (!board_content_bounds(j.rect)) return;   // empty board — nothing to export
+    const float pad = 32.f;
+    j.rect.mn = j.rect.mn - ImVec2(pad, pad);
+    j.rect.mx = j.rect.mx + ImVec2(pad, pad);
+    j.active = true;
+    if (path) j.path = path;
+    g_export = std::move(j);
+}
+
+// render a world rect into an offscreen RT via a synthetic imgui frame
+static bool render_rect_rgba(const WRect& r, const std::vector<uint64_t>* only,
+                             std::vector<unsigned char>& px, int& w, int& h) {
+    ImVec2 sz = r.size();
+    if (sz.x < 1.f || sz.y < 1.f) return false;
+    float scale = fminf(2.f, 8192.f / fmaxf(sz.x, sz.y));   // 2× unless the board is huge
+    w = (int)ceilf(sz.x * scale); h = (int)ceilf(sz.y * scale);
+    Camera saved = g_cam;
+    g_cam.zoom = scale;
+    g_cam.pan = ImVec2(-r.mn.x * scale, -r.mn.y * scale);
+    ImGui_ImplDX11_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float)w, (float)h);   // after the backend snapshot, before NewFrame
+    ImGui::NewFrame();
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    dl->AddRectFilled(ImVec2(0, 0), io.DisplaySize, g_th.canvasBg);
+    draw_doc_shapes(dl, 0, only && !only->empty() ? only : nullptr);
+    ImGui::Render();
+    g_cam = saved;
+
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = (UINT)w; td.Height = (UINT)h;
+    td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ID3D11Texture2D* tex = nullptr; ID3D11RenderTargetView* rtv = nullptr;
+    bool ok = SUCCEEDED(g_dev->CreateTexture2D(&td, nullptr, &tex)) &&
+              SUCCEEDED(g_dev->CreateRenderTargetView(tex, nullptr, &rtv));
+    if (ok) {
+        ImVec4 bg = ImGui::ColorConvertU32ToFloat4(g_th.canvasBg);
+        float c[4] = { bg.x, bg.y, bg.z, 1.f };
+        g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+        g_ctx->ClearRenderTargetView(rtv, c);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        ok = read_texture_rgba(tex, px, w, h);
+    }
+    if (rtv) rtv->Release();
+    if (tex) tex->Release();
+    return ok;
+}
+
+// PNG bytes + a CF_DIB fallback, so both browsers/chat apps and legacy
+// Windows apps can paste it
+static void set_clipboard_image(const unsigned char* rgba, int w, int h) {
+    int plen = 0;
+    unsigned char* png = stbi_write_png_to_mem(rgba, w * 4, w, h, 4, &plen);
+    if (!OpenClipboard(g_hwnd)) { free(png); return; }
+    EmptyClipboard();
+    if (png) {
+        if (HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, plen)) {
+            memcpy(GlobalLock(hg), png, plen);
+            GlobalUnlock(hg);
+            SetClipboardData(fmt_png(), hg);
+        }
+        free(png);
+    }
+    size_t stride = (size_t)w * 4;
+    if (HGLOBAL hd = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + stride * h)) {
+        BITMAPINFOHEADER* bi = (BITMAPINFOHEADER*)GlobalLock(hd);
+        memset(bi, 0, sizeof(*bi));
+        bi->biSize = sizeof(*bi); bi->biWidth = w; bi->biHeight = h;   // bottom-up
+        bi->biPlanes = 1; bi->biBitCount = 32; bi->biCompression = BI_RGB;
+        unsigned char* dst = (unsigned char*)(bi + 1);
+        for (int y = 0; y < h; y++) {
+            const unsigned char* src = rgba + (size_t)(h - 1 - y) * stride;
+            unsigned char* d = dst + (size_t)y * stride;
+            for (int x = 0; x < w; x++) {
+                d[x * 4 + 0] = src[x * 4 + 2]; d[x * 4 + 1] = src[x * 4 + 1];
+                d[x * 4 + 2] = src[x * 4 + 0]; d[x * 4 + 3] = 255;
+            }
+        }
+        GlobalUnlock(hd);
+        SetClipboardData(CF_DIB, hd);
+    }
+    CloseClipboard();
+}
+
+// run the queued PNG export (call between frames); returns the job's quit flag
+static bool run_pending_export() {
+    ExportJob job = std::move(g_export);
+    g_export = ExportJob{};
+    std::vector<unsigned char> px; int w = 0, h = 0;
+    bool ok = render_rect_rgba(job.rect, &job.only, px, w, h);
+    if (ok) {
+        if (!job.path.empty()) ok = stbi_write_png(job.path.c_str(), w, h, 4, px.data(), w * 4) != 0;
+        else set_clipboard_image(px.data(), w, h);
+    }
+    if (!job.path.empty())
+        fprintf(stderr, "teidraw: export %s -> %s\n", job.path.c_str(), ok ? "ok" : "FAILED");
+    return job.quit;
+}
+
+// ── text outline ──
+static std::string first_line_trunc(const std::string& t, size_t maxn = 48) {
+    size_t e = t.find('\n');
+    std::string s = t.substr(0, e == std::string::npos ? t.size() : e);
+    if (s.size() > maxn) {
+        s.resize(maxn);
+        while (!s.empty() && ((unsigned char)s.back() & 0xC0) == 0x80) s.pop_back();  // utf-8 boundary
+        s += "…";
+    }
+    return s;
+}
+
+static const char* media_word(const Shape& s) {
+    MediaKind mk = media_kind(s.asset);
+    return mk == MK_STILL ? "image" : mk == MK_GIF ? "gif" : "video";
+}
+
+// how an arrow endpoint reads in the outline: the bound shape's text/asset,
+// or bare coordinates when unbound
+static std::string outline_ref(const ArrowEnd& e) {
+    if (Shape* t = find_shape(e.bind)) {
+        if (t->type == SH_TEXT)  return "\"" + first_line_trunc(t->text) + "\"";
+        if (t->type == SH_IMAGE) return "[" + std::string(media_word(*t)) + " " + t->asset + "]";
+        return "[group]";
+    }
+    char buf[48];
+    snprintf(buf, sizeof buf, "(%d, %d)", (int)lroundf(e.p.x), (int)lroundf(e.p.y));
+    return buf;
+}
+
+// reading order: top→bottom, then left→right
+static void outline_sort(std::vector<const Shape*>& v) {
+    std::sort(v.begin(), v.end(), [](const Shape* a, const Shape* b) {
+        WRect ba = shape_bounds(*a), bb = shape_bounds(*b);
+        if (fabsf(ba.mn.y - bb.mn.y) > 1.f) return ba.mn.y < bb.mn.y;
+        return ba.mn.x < bb.mn.x;
+    });
+}
+
+static void outline_emit(const Shape& s, int depth, std::string& out) {
+    std::string ind(depth * 2, ' ');
+    WRect b = shape_bounds(s);
+    char pos[48];
+    snprintf(pos, sizeof pos, "(%d, %d)", (int)lroundf(b.mn.x), (int)lroundf(b.mn.y));
+    if (s.type == SH_TEXT) {
+        out += ind + "- text " + pos;
+        if (s.text.find('\n') == std::string::npos) { out += ": \"" + s.text + "\"\n"; return; }
+        out += ":\n";
+        const char* p = s.text.c_str();
+        const char* end = p + s.text.size();
+        while (p < end) {
+            const char* e = (const char*)memchr(p, '\n', end - p);
+            if (!e) e = end;
+            out += ind + "    " + std::string(p, e) + "\n";
+            p = e < end ? e + 1 : end;
+        }
+    } else if (s.type == SH_IMAGE) {
+        char dim[48];
+        snprintf(dim, sizeof dim, "%dx%d", (int)lroundf(s.size.x), (int)lroundf(s.size.y));
+        out += ind + "- " + media_word(s) + " " + pos + " " + dim + ": " + s.asset + "\n";
+    } else if (s.type == SH_GROUP) {
+        out += ind + "- group " + pos + ":\n";
+        std::vector<const Shape*> kids;   // members of an included group are all in
+        for (auto& c : g_doc.shapes) if (c.parent == s.id && c.type != SH_ARROW) kids.push_back(&c);
+        outline_sort(kids);
+        for (auto* k : kids) outline_emit(*k, depth + 1, out);
+    }
+}
+
+// reading-order outline of the board (or the selection): texts verbatim,
+// media as placeholders, groups nested, arrows as a connection list
+static std::string board_outline(bool selOnly) {
+    std::vector<uint64_t> scope;   // top-level ids to include
+    bool useSel = selOnly && !g_sel.empty();
+    if (useSel) scope = g_sel;
+    else for (auto& s : g_doc.shapes) if (!s.parent) scope.push_back(s.id);
+
+    std::vector<uint64_t> all = scope;   // + group members, for arrow collection
+    for (auto id : scope) { Shape* s = find_shape(id);
+        if (s && s->type == SH_GROUP) collect_members(id, all); }
+
+    std::vector<const Shape*> roots;   // by id, not parent — a drilled selection sits inside a group
+    for (auto& s : g_doc.shapes) {
+        if (s.type == SH_ARROW) continue;
+        for (auto id : scope) if (id == s.id) { roots.push_back(&s); break; }
+    }
+    outline_sort(roots);
+
+    size_t n = 0;
+    for (auto& s : g_doc.shapes) { for (auto id : all) if (id == s.id && s.type != SH_GROUP) { n++; break; } }
+    std::string out = "# teidraw board";
+    if (!g_projDir.empty()) out += " \"" + g_projDir + "\"";
+    out += useSel ? " (selection, " : " (";
+    out += std::to_string(n) + " shapes) — positions are canvas px, y grows downward\n\n";
+    for (auto* r : roots) outline_emit(*r, 0, out);
+
+    std::string arrows;
+    for (auto& s : g_doc.shapes) {
+        if (s.type != SH_ARROW) continue;
+        bool in = false; for (auto id : all) if (id == s.id) { in = true; break; }
+        if (!in) continue;
+        arrows += "- " + outline_ref(s.a) + " -> " + outline_ref(s.b);
+        if (!s.label.empty()) arrows += " (\"" + s.label + "\")";
+        arrows += "\n";
+    }
+    if (!arrows.empty()) out += "\n## arrows\n" + arrows;
+    return out;
+}
+
+static void copy_text_to_clipboard(const std::string& utf8) {
+    std::wstring w = to_w(utf8);
+    std::wstring crlf; crlf.reserve(w.size() + 64);
+    for (wchar_t c : w) { if (c == L'\n') crlf += L'\r'; crlf += c; }
+    if (!OpenClipboard(g_hwnd)) return;
+    EmptyClipboard();
+    if (HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, (crlf.size() + 1) * sizeof(wchar_t))) {
+        memcpy(GlobalLock(hg), crlf.c_str(), (crlf.size() + 1) * sizeof(wchar_t));
+        GlobalUnlock(hg);
+        SetClipboardData(CF_UNICODETEXT, hg);
+    }
+    CloseClipboard();
+}
+
 // ─────────────────────────── canvas interaction ────────────────────────────
 enum DragMode { DM_NONE = 0, DM_PENDING, DM_MOVE, DM_MARQUEE, DM_HANDLE, DM_CROP, DM_ROTATE,
                 DM_ARROW_A, DM_ARROW_B, DM_BEND, DM_NEW_ARROW, DM_PAN_R };
@@ -1924,6 +2240,9 @@ static void DrawContextMenu() {
         if (haveGroup && ImGui::MenuItem("ungroup", "Ctrl+Shift+G")) { ungroup_selected(); push_undo(); }
         if (ImGui::MenuItem("bring to front", "]")) { reorder_selected(true); push_undo(); }
         if (ImGui::MenuItem("send to back", "[")) { reorder_selected(false); push_undo(); }
+        ImGui::Separator();
+        if (ImGui::MenuItem("copy as PNG", "Ctrl+Shift+C")) request_png_export(true, nullptr);
+        if (ImGui::MenuItem("copy as text")) copy_text_to_clipboard(board_outline(true));
         bool haveCrop = false;
         for (auto id : g_sel) { Shape* s = find_shape(id);
             if (s && s->type == SH_IMAGE && (s->crop.x != 0 || s->crop.y != 0 || s->crop.z != 1 || s->crop.w != 1)) haveCrop = true; }
@@ -1970,6 +2289,9 @@ static void DrawContextMenu() {
             g_sel.clear();
             for (auto& s : g_doc.shapes) if (!s.parent) g_sel.push_back(s.id);
         }
+        ImGui::Separator();
+        if (ImGui::MenuItem("copy board as PNG", "Ctrl+Shift+C")) request_png_export(false, nullptr);
+        if (ImGui::MenuItem("copy board as text")) copy_text_to_clipboard(board_outline(false));
         ImGui::Separator();
         if (ImGui::MenuItem(g_darkMode ? "light mode" : "dark mode", "Ctrl+Shift+D")) {
             g_darkMode = !g_darkMode; ApplyTheme(); g_saveDueAt = ImGui::GetTime() + 0.4;
@@ -2417,39 +2739,7 @@ static void CanvasFrame() {
     }
 
     // ── draw shapes (doc order = z) ──
-    for (auto& s : g_doc.shapes) {
-        if (s.id == g_editText) continue;    // editor overlay draws it
-        switch (s.type) {
-        case SH_TEXT:  draw_text_shape(dl, s); break;
-        case SH_ARROW: draw_arrow_shape(dl, s); break;
-        case SH_IMAGE: {
-            ImVec2 mn = W2S(s.pos), mx = W2S(s.pos + s.size);
-            ID3D11ShaderResourceView* srv = nullptr;
-            MediaKind mk = media_kind(s.asset);
-            if (mk == MK_STILL) srv = get_image_tex(s.asset)->srv;
-#ifdef TEI_LIBAV
-            else srv = video_srv(s, mk);
-#endif
-            ImU32 tint = with_opacity(IM_COL32_WHITE, s.opacity);
-            if (srv && s.rot == 0.f) {
-                dl->AddImageRounded((ImTextureID)(intptr_t)srv, mn, mx,
-                                    ImVec2(s.crop.x, s.crop.y), ImVec2(s.crop.z, s.crop.w),
-                                    tint, 5.f);
-            } else if (srv) {
-                ImVec2 c[4]; shape_obb(s, c);
-                ImVec2 sc[4]; for (int i = 0; i < 4; i++) sc[i] = W2S(c[i]);
-                dl->AddImageQuad((ImTextureID)(intptr_t)srv, sc[0], sc[1], sc[2], sc[3],
-                                 ImVec2(s.crop.x, s.crop.y), ImVec2(s.crop.z, s.crop.y),
-                                 ImVec2(s.crop.z, s.crop.w), ImVec2(s.crop.x, s.crop.w), tint);
-            } else {
-                dl->AddRectFilled(mn, mx, IM_COL32(120, 120, 128, 50), 5.f);
-                dl->AddRect(mn, mx, IM_COL32(120, 120, 128, 120), 5.f);
-                dl->AddText(nullptr, 0.f, mn + ImVec2(10, 10), g_th.textDim, s.asset.c_str());
-            }
-        } break;
-        case SH_GROUP: break;
-        }
-    }
+    draw_doc_shapes(dl, g_editText);   // editor overlay draws the edited text
 
     bool uiHot = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) ||
                  ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup) ||
@@ -2482,7 +2772,10 @@ static void CanvasFrame() {
             g_sel.clear(); for (auto& s : g_doc.shapes) if (!s.parent) g_sel.push_back(s.id);
         }
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D)) { duplicate_selected(); push_undo(); }
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C)) copy_selection_to_clipboard(false);
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C)) {
+            if (io.KeyShift) request_png_export(!g_sel.empty(), nullptr);   // selection, else whole board
+            else copy_selection_to_clipboard(false);
+        }
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X)) copy_selection_to_clipboard(true);
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V)) {
             ImVec2 at = uiHot ? S2W(vp->Size * 0.5f) : S2W(io.MousePos);
@@ -2839,13 +3132,17 @@ static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 int main(int argc, char** argv) {
-    // teidraw [projectDir] [--shot out.png [--frames N]]
+    // teidraw [projectDir] [--shot out.png | --export out.png | --export-txt out.txt] [--frames N]
     const char* shotPath = nullptr; int shotFrames = 8;
+    const char* exportPng = nullptr; const char* exportTxt = nullptr;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
+        else if (!strcmp(argv[i], "--export") && i + 1 < argc) exportPng = argv[++i];
+        else if (!strcmp(argv[i], "--export-txt") && i + 1 < argc) exportTxt = argv[++i];
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) shotFrames = atoi(argv[++i]);
         else if (argv[i][0] != '-') g_projDir = argv[i];
     }
+    bool headless = shotPath || exportPng || exportTxt;
     if (g_projDir.empty()) g_projDir = "scratch";
 
     ImGui_ImplWin32_EnableDpiAwareness();
@@ -2938,19 +3235,41 @@ int main(int argc, char** argv) {
         // autosave debounce
         if (g_saveDueAt > 0 && ImGui::GetTime() >= g_saveDueAt) save_board_now();
 
+        // CLI exports: text extents need a live frame, so requests are made
+        // here (mid-frame) once media has had shotFrames frames to decode
+        if ((exportPng || exportTxt) && framesDone + 1 >= shotFrames) {
+            if (exportTxt) {
+                std::ofstream f(exportTxt, std::ios::binary);
+                std::string outline = board_outline(false);
+                f.write(outline.c_str(), (std::streamsize)outline.size());
+                fprintf(stderr, "teidraw: export %s -> %s\n", exportTxt, f.good() ? "ok" : "FAILED");
+                exportTxt = nullptr;
+                if (!exportPng) done = true;
+            }
+            if (exportPng) {
+                request_png_export(false, exportPng);
+                if (g_export.active) g_export.quit = true;
+                else { fprintf(stderr, "teidraw: export %s -> FAILED (empty board)\n", exportPng); done = true; }
+                exportPng = nullptr;
+            }
+        }
+
         ImGui::Render();
         float bg[4] = { 0, 0, 0, 1 };
         g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
         g_ctx->ClearRenderTargetView(g_rtv, bg);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-        g_sc->Present(shotPath ? 0 : 1, 0);
+        g_sc->Present(headless ? 0 : 1, 0);
+        framesDone++;
 
-        if (shotPath && ++framesDone >= shotFrames) {
+        if (shotPath && framesDone >= shotFrames) {
             bool ok = SaveBackbufferPNG(shotPath);
             fprintf(stderr, "teidraw: shot %s -> %s\n", shotPath, ok ? "ok" : "FAILED");
             done = true;
         }
+        // queued copy-as-PNG / --export: render offscreen between frames
+        if (g_export.active && run_pending_export()) done = true;
     }
 
     save_board_now();

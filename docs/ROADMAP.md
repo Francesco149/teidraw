@@ -19,8 +19,8 @@ ctrl+corner crop with ghost. Gif/video via libav: autoplay gifs, hover
 play/stop/seek/A-B pill, dynamic-texture upload. Shape clipboard.
 
 ## M3 — daily-driver gaps (next)
-- **LLM export**: copy board/selection as PNG to clipboard + `--export png`
-  CLI; structured text dump (shapes+arrows as an outline) for text-only models.
+- **LLM export** ✅: copy board/selection as PNG to clipboard (+ `--export
+  out.png` CLI); reading-order text outline (context menu / `--export-txt`).
 - Global settings file (%APPDATA%/teidraw/settings.json): theme, undo limit,
   last board; board picker overlay (recent boards, new-board) instead of
   CLI-arg-only.

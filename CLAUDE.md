@@ -51,6 +51,8 @@ Paste = shapes > PNG > DIB > files > plain text (becomes a text shape).
 nix develop --command make -C editor          # → build/teidraw.exe
 ./build/teidraw.exe [boardDir]                # opens on the Windows host (WSLInterop)
 ./build/teidraw.exe scratch --shot build/shot.png --frames 8   # headless screenshot
+./build/teidraw.exe dir --export out.png       # render board bounds → PNG, exit
+./build/teidraw.exe dir --export-txt out.txt   # reading-order text outline, exit
 ```
 Verify visually with `--shot` + Read the PNG. `scratch/` is the gitignored test
 board. `make -C editor shot` does the same.
