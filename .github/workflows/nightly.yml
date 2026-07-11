@@ -10,7 +10,7 @@
 # libav so the tarball's binary runs on any reasonably-recent distro; SDL
 # dlopens X11/Wayland/audio at runtime. This target is new and not yet
 # battle-tested — the release notes say so.
-name: nightly
+name: nightly # builds
 
 on:
   schedule:
