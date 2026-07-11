@@ -31,6 +31,10 @@
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -991,10 +995,12 @@ struct VideoDecoder {
     int        vstream = -1;
     AVRational tb{0, 1};
     double     fps = 0;
-    int        frames = 0, w = 0, h = 0;
+    std::atomic<int> frames{0};   // decode (worker) learns the real count at EOF; UI reads it
+    int        w = 0, h = 0;
     int        cur_idx = -1;
     bool       ok = false;
     unsigned long long lru = 0;
+    std::mutex mx;   // held around every libav call — decode runs on the worker thread
 
     bool open(const std::string& path) {
         if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return false;
@@ -1085,15 +1091,76 @@ struct VideoDecoder {
 static std::map<std::string, VideoDecoder*> g_decoders;   // asset rel path → resident decoder
 static unsigned long long g_decoderClock = 0;
 static const size_t kMaxDecoders = 6;
+static std::mutex g_decMx;   // guards g_decoders itself (lock order: g_decMx → decoder.mx)
+
+// ── async decode (M4 "keep the UI thread pure") ──
+// One worker thread runs every decode: seeks + forward-decode of long GOPs
+// used to hitch the frame loop. The UI thread still OPENS decoders (imports
+// need w/h synchronously) and decodes a shape's FIRST frame in-line (the
+// poster shows the instant a video lands; --shot stays deterministic) —
+// every later frame change is a request here. Latest-wins per shape, so
+// scrubbing coalesces to the newest index instead of queueing every step.
+struct DecodeReq { std::string asset; int idx = 0; unsigned gen = 0; };
+struct DecodeRes { uint64_t shape = 0; std::string asset; int idx = 0, w = 0, h = 0;
+                   unsigned gen = 0; std::vector<unsigned char> rgba; };
+static std::mutex g_vqMx;                       // guards the queues below
+static std::condition_variable g_vqCv;
+static std::map<uint64_t, DecodeReq> g_vqWant;  // shape id → newest wanted frame
+static std::vector<DecodeRes> g_vqDone;         // worker → UI (drained each frame)
+static unsigned g_vqGen = 0;                    // bumped per board — stale results dropped
+static bool g_vqQuit = false;
+static std::thread g_vqWorker;
+
+static void video_worker() {
+    for (;;) {
+        uint64_t shape; DecodeReq req;
+        {
+            std::unique_lock<std::mutex> lk(g_vqMx);
+            g_vqCv.wait(lk, [] { return g_vqQuit || !g_vqWant.empty(); });
+            if (g_vqQuit) return;
+            auto it = g_vqWant.begin();
+            shape = it->first; req = std::move(it->second);
+            g_vqWant.erase(it);
+        }
+        DecodeRes res; res.shape = shape; res.asset = req.asset; res.idx = req.idx; res.gen = req.gen;
+        VideoDecoder* d = nullptr;
+        std::unique_lock<std::mutex> dlk;
+        {
+            // acquire the decoder's mutex while g_decMx pins the map entry, so
+            // an evict/close on the UI thread can never delete it under us
+            std::lock_guard<std::mutex> lk(g_decMx);
+            auto it = g_decoders.find(req.asset);
+            if (it != g_decoders.end() && it->second->ok) {
+                d = it->second;
+                dlk = std::unique_lock<std::mutex>(d->mx);
+            }
+        }
+        if (d) {
+            res.w = d->w; res.h = d->h;
+            if (!d->decode_index(req.idx, res.rgba)) res.rgba.clear();
+            dlk.unlock();
+        }
+        {   // failures report back too (empty rgba): the UI clears its
+            // pending mark so the frame can be re-requested
+            std::lock_guard<std::mutex> lk(g_vqMx);
+            g_vqDone.push_back(std::move(res));
+        }
+    }
+}
 
 static VideoDecoder* get_decoder(const std::string& asset) {
+    std::lock_guard<std::mutex> lk(g_decMx);
+    if (!g_vqWorker.joinable()) g_vqWorker = std::thread(video_worker);
     auto it = g_decoders.find(asset);
     if (it != g_decoders.end()) { it->second->lru = ++g_decoderClock; return it->second->ok ? it->second : nullptr; }
     if (g_decoders.size() >= kMaxDecoders) {
         auto v = g_decoders.end();
         for (auto i = g_decoders.begin(); i != g_decoders.end(); ++i)
             if (v == g_decoders.end() || i->second->lru < v->second->lru) v = i;
-        if (v != g_decoders.end()) { v->second->close(); delete v->second; g_decoders.erase(v); }
+        if (v != g_decoders.end()) {
+            { std::lock_guard<std::mutex> dl(v->second->mx); v->second->close(); }   // wait out an in-flight decode
+            delete v->second; g_decoders.erase(v);
+        }
     }
     static bool quieted = false;
     if (!quieted) { av_log_set_level(AV_LOG_ERROR); quieted = true; }
@@ -1111,34 +1178,32 @@ struct PlayState {
     bool playing = false;
     double t = 0;
     int shownIdx = -1;
+    int reqIdx = -1;    // frame index requested from the decode worker, not yet delivered
     int w = 0, h = 0;
     ID3D11Texture2D* tex = nullptr;
     ID3D11ShaderResourceView* srv = nullptr;
-    void release() { if (srv) srv->Release(); if (tex) tex->Release(); srv = nullptr; tex = nullptr; shownIdx = -1; }
+    void release() { if (srv) srv->Release(); if (tex) tex->Release(); srv = nullptr; tex = nullptr; shownIdx = -1; reqIdx = -1; }
 };
 static std::map<uint64_t, PlayState> g_play;
 
 #ifdef TEI_LIBAV
-static bool upload_video_frame(PlayState& ps, VideoDecoder* d, int idx) {
-    std::vector<unsigned char> rgba;
-    if (!d->decode_index(idx, rgba) || rgba.empty()) return false;
-    if (!ps.tex || ps.w != d->w || ps.h != d->h) {
+static bool upload_rgba(PlayState& ps, const unsigned char* rgba, int w, int h) {
+    if (!ps.tex || ps.w != w || ps.h != h) {
         ps.release();
         D3D11_TEXTURE2D_DESC td = {};
-        td.Width = d->w; td.Height = d->h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
         td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DYNAMIC; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &ps.tex))) return false;
         g_dev->CreateShaderResourceView(ps.tex, nullptr, &ps.srv);
-        ps.w = d->w; ps.h = d->h;
+        ps.w = w; ps.h = h;
     }
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(g_ctx->Map(ps.tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return false;
     for (int y = 0; y < ps.h; y++)
-        memcpy((unsigned char*)m.pData + (size_t)y * m.RowPitch, &rgba[(size_t)y * ps.w * 4], (size_t)ps.w * 4);
+        memcpy((unsigned char*)m.pData + (size_t)y * m.RowPitch, rgba + (size_t)y * ps.w * 4, (size_t)ps.w * 4);
     g_ctx->Unmap(ps.tex, 0);
-    ps.shownIdx = idx;
     return true;
 }
 
@@ -1157,8 +1222,38 @@ static ID3D11ShaderResourceView* video_srv(const Shape& s, MediaKind mk) {
     }
     int idx = (int)(ps.t * d->fps + 0.5);
     if (d->frames > 0 && idx >= d->frames) idx = d->frames - 1;
-    if (idx != ps.shownIdx) upload_video_frame(ps, d, idx);
+    if (!ps.srv) {
+        // first frame in-line (see the worker comment); later ones are async
+        std::vector<unsigned char> rgba;
+        bool ok;
+        { std::lock_guard<std::mutex> lk(d->mx); ok = d->decode_index(idx, rgba); }
+        if (ok && !rgba.empty() && upload_rgba(ps, rgba.data(), d->w, d->h)) ps.shownIdx = idx;
+    } else if (idx != ps.shownIdx && idx != ps.reqIdx) {
+        {
+            std::lock_guard<std::mutex> lk(g_vqMx);
+            g_vqWant[s.id] = { s.asset, idx, g_vqGen };
+        }
+        g_vqCv.notify_one();
+        ps.reqIdx = idx;
+    }
     return ps.srv;
+}
+
+// apply worker-decoded frames (called once per frame, before the draw pass)
+static void drain_video_results() {
+    std::vector<DecodeRes> done;
+    { std::lock_guard<std::mutex> lk(g_vqMx); done.swap(g_vqDone); }
+    for (auto& r : done) {
+        if (r.gen != g_vqGen) continue;   // board switched while this decoded
+        auto pit = g_play.find(r.shape);
+        Shape* s = find_shape(r.shape);
+        if (pit == g_play.end() || !s || s->asset != r.asset) continue;   // shape deleted/replaced
+        PlayState& ps = pit->second;
+        if (r.idx == ps.reqIdx) ps.reqIdx = -1;
+        if (r.rgba.empty()) continue;     // decode failed; a later frame may retry
+        // stale (superseded) results still upload — progressive scrub feedback
+        if (upload_rgba(ps, r.rgba.data(), r.w, r.h)) ps.shownIdx = r.idx;
+    }
 }
 #endif
 
@@ -1535,8 +1630,19 @@ static void switch_board(const std::string& dirIn) {
     g_extCache.clear();
     g_idIndex.clear();
 #ifdef TEI_LIBAV
-    for (auto& [rel, d] : g_decoders) { d->close(); delete d; }
-    g_decoders.clear();
+    {   // invalidate in-flight decodes (gen bump) before touching the decoders
+        std::lock_guard<std::mutex> lk(g_vqMx);
+        g_vqGen++;
+        g_vqWant.clear(); g_vqDone.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_decMx);
+        for (auto& [rel, d] : g_decoders) {
+            { std::lock_guard<std::mutex> dl(d->mx); d->close(); }   // wait out an in-flight decode
+            delete d;
+        }
+        g_decoders.clear();
+    }
 #endif
     g_projDir = dir;
     load_board();
@@ -3800,6 +3906,9 @@ int main(int argc, char** argv) {
         }
         ImGui::NewFrame();
 
+#ifdef TEI_LIBAV
+        drain_video_results();   // worker-decoded frames land before the draw pass
+#endif
         CanvasFrame();
         DrawContextMenu();
         DrawVideoOverlay();
@@ -3854,6 +3963,13 @@ int main(int argc, char** argv) {
         if (g_export.active && run_pending_export()) done = true;
     }
 
+#ifdef TEI_LIBAV
+    if (g_vqWorker.joinable()) {
+        { std::lock_guard<std::mutex> lk(g_vqMx); g_vqQuit = true; }
+        g_vqCv.notify_all();
+        g_vqWorker.join();
+    }
+#endif
     save_board_now();
     save_settings();
     ImGui_ImplDX11_Shutdown();

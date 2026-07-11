@@ -31,8 +31,11 @@ play/stop/seek/A-B pill, dynamic-texture upload. Shape clipboard.
 
 
 ## M4 — polish & performance
-- Viewport culling + text-extent caching (only matters at 1000s of shapes).
-- Decode thread for video (keep UI thread pure); NVDEC/d3d11va option.
+- **Viewport culling + text-extent caching** ✅ (+ find_shape memo, marquee
+  dedup set — a 3000-shape board went ~6ms → ~0.03ms per frame in a working view).
+- **Decode thread for video** ✅ (worker owns all libav decode; UI opens
+  decoders + decodes posters in-line; scrubs coalesce latest-wins).
+  NVDEC/d3d11va stays an option if software decode ever falls short.
 - Video audio (WASAPI + swresample; the flake libav already has swresample).
 - More shapes (rect/ellipse/frame) IF daily use demands (rotation: done, session 2).
 - freetype glyph rasterizer for even better small-text rendering.

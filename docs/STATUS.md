@@ -1,6 +1,6 @@
 # STATUS — live front
 
-*Updated: 2026-07-11 (session 4). History lives in `git log` — this file only
+*Updated: 2026-07-11 (session 6). History lives in `git log` — this file only
 describes NOW.*
 
 ## Where things stand
@@ -56,6 +56,24 @@ key-repeat, bursts coalesce into one undo via a 0.6s debounce). DM_MOVE
 now applies an absolute offset from the drag origin (g_moveApplied)
 instead of incremental deltas so lock/snap can't drift.
 
+Session-6 = the M4 perf pass. **Big boards**: draw_doc_shapes culls shapes
+outside the padded view rect (bent arrows include the bezier control point),
+text_extent caches CalcTextSize per shape id (validated on family/px/text),
+find_shape memoizes id→index (validated per lookup, never stale), marquee
+dedupes via a hash set — a 3000-shape stress board went ~6ms → ~0.03ms per
+frame in a working view, `--shot` byte-identical before/after. **Video decode
+thread**: a single worker owns every libav decode behind per-decoder mutexes
+(lock order g_decMx → decoder.mx); the UI thread still opens decoders
+(imports need w/h synchronously) and decodes each shape's FIRST frame
+in-line (poster shows instantly, --shot stays deterministic), then every
+frame change is a latest-wins request (g_vqWant, keyed by shape) drained
+once per frame before the draw pass (drain_video_results). Seeks/A-B wraps —
+the old UI hitches — now happen off-thread; a superseded scrub result still
+uploads for progressive feedback. switch_board bumps g_vqGen so in-flight
+results from the old board can't land on the new one. Side effect of
+culling: offscreen gifs/videos stop decoding (playback time also pauses);
+they resume when scrolled back in — deliberate.
+
 ## Build & verify
 ```
 nix develop --command make -C editor            # build/teidraw.exe
@@ -71,7 +89,8 @@ render tests.
 
 ## NEXT TASK → M3 (docs/ROADMAP.md)
 1. Text wrap width; then the custom WYSIWYG canvas editor (see below).
-   (Snapping guides + nudge + shift axis-lock landed session 5.)
+   (Snapping guides + nudge + shift axis-lock landed session 5; M4 culling +
+   caches + video decode thread landed session 6 — audio is the big M4 item left.)
 
 ## Known rough edges / to keep in mind
 - **WYSIWYG-transform editing is fully OFF** (`kWysiwygAlignEdit` and
