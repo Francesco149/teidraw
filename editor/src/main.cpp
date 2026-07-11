@@ -387,6 +387,7 @@ struct Shape {
     ImVec2 size{0, 0};
     ImVec4 crop{0, 0, 1, 1};    // visible sub-rect of the source (u0,v0,u1,v1)
     float loopA = -1, loopB = -1;   // video A-B loop points (seconds; -1 = unset)
+    bool  sound = false;            // video audio on (off by default; pill toggle)
     // arrow
     ArrowEnd a, b;
     float bend = 0.f;       // signed offset of the on-curve midpoint ⊥ to the chord
@@ -399,6 +400,7 @@ struct Doc {
 };
 static Doc g_doc;
 static std::string g_projDir;    // project dir (board.json + assets/ + undo.jsonl)
+static bool g_headless = false;  // --shot/--export: no recents, no audio
 
 static void delete_shapes(const std::vector<uint64_t>& ids);   // fwd (load-time sanitize)
 // id → doc index, memoized: arrows resolve their bind target every frame, so
@@ -609,6 +611,7 @@ static json shape_to_json(const Shape& s) {
             j["crop"] = { s.crop.x, s.crop.y, s.crop.z, s.crop.w };
         if (s.loopA >= 0) j["loopA"] = s.loopA;
         if (s.loopB >= 0) j["loopB"] = s.loopB;
+        if (s.sound) j["sound"] = true;
         break;
     case SH_ARROW: {
         auto end = [](const ArrowEnd& e) {
@@ -650,6 +653,7 @@ static Shape shape_from_json(const json& j) {
             s.crop = ImVec4(j["crop"][0], j["crop"][1], j["crop"][2], j["crop"][3]);
         s.loopA = j.value("loopA", -1.f);
         s.loopB = j.value("loopB", -1.f);
+        s.sound = j.value("sound", false);
         break;
     case SH_ARROW: {
         auto end = [](const json& k) {
@@ -983,6 +987,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
 #include <libavutil/imgutils.h>
 }
 
@@ -999,6 +1004,7 @@ struct VideoDecoder {
     int        w = 0, h = 0;
     int        cur_idx = -1;
     bool       ok = false;
+    bool       hasAudio = false;
     unsigned long long lru = 0;
     std::mutex mx;   // held around every libav call — decode runs on the worker thread
 
@@ -1007,6 +1013,7 @@ struct VideoDecoder {
         if (avformat_find_stream_info(fmt, nullptr) < 0) return false;
         vstream = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
         if (vstream < 0) return false;
+        hasAudio = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0) >= 0;
         AVStream* st = fmt->streams[vstream];
         const AVCodec* codec = avcodec_find_decoder(st->codecpar->codec_id);
         if (!codec) return false;
@@ -1170,12 +1177,262 @@ static VideoDecoder* get_decoder(const std::string& asset) {
     g_decoders[asset] = d;
     return d->ok ? d : nullptr;
 }
+
+// ── audio (WASAPI render, one stream per sounding video) ──
+// A playing video with sound on gets its own thread: it opens the asset's
+// audio stream through a SEPARATE AVFormatContext (the video decoder's seek
+// position stays untouched), resamples to the device mix format with
+// swresample, and feeds a shared-mode WASAPI client — Windows mixes streams,
+// so overlapping videos need no mixer here. While a stream is live its
+// HARDWARE clock drives the video (ps.t adopts audio time each frame), so
+// A/V can't drift; UI seeks / A-B wraps request an audio seek and the video
+// free-runs on DeltaTime until it's applied (pending back to 0).
+#include <mmreg.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+
+// mingw: reference no GUID libs, just define what we use
+static const CLSID kCLSID_MMDeviceEnumerator = {0xBCDE0395,0xE52F,0x467C,{0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E}};
+static const IID   kIID_IMMDeviceEnumerator  = {0xA95664D2,0x9614,0x4F35,{0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6}};
+static const IID   kIID_IAudioClient         = {0x1CB9AD4C,0xDBFA,0x4C32,{0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2}};
+static const IID   kIID_IAudioRenderClient   = {0xF294ACFC,0x3146,0x4483,{0xA7,0xBF,0xAD,0xDC,0xA7,0xC2,0x60,0xE2}};
+static const GUID  kSubtypeIEEEFloat         = {0x00000003,0x0000,0x0010,{0x80,0x00,0x00,0xAA,0x00,0x38,0x9B,0x71}};
+
+struct AudioOut {
+    std::string asset;                // board-relative (sweep compares vs the shape)
+    std::string path;                 // absolute, opened by the thread
+    int lastTick = -1;                // last frame video_srv touched this stream (UI thread)
+    // commands (mx) — the UI never blocks on audio beyond these flag flips
+    std::mutex mx; std::condition_variable cv;
+    bool quit = false, want = false;  // want = should be audible
+    double seekTo = -1;               // >= 0: pending seek target (seconds)
+    // thread → UI
+    std::atomic<int> pending{1};      // un-applied seeks (starts at 1: the initial position)
+    std::atomic<double> clock{-1};    // audible position; stays -1 if the stream never opened
+    HANDLE ev = nullptr;              // WASAPI buffer event (also poked to wake the thread fast)
+    std::thread th;
+
+    // ── everything below is thread-private ──
+    AVFormatContext* fmt = nullptr; AVCodecContext* dec = nullptr; SwrContext* swr = nullptr;
+    AVFrame* frame = nullptr; AVPacket* pkt = nullptr;
+    int astream = -1; AVRational atb{0, 1};
+    IAudioClient* client = nullptr; IAudioRenderClient* render = nullptr;
+    UINT32 bufFrames = 0; int rate = 0, bytesPS = 0;
+    std::vector<unsigned char> fifo;  // resampled samples not yet handed to WASAPI
+    double basePts = 0;               // stream time of the first sample after the last seek
+    uint64_t written = 0;             // device frames written since the last seek
+    bool devOn = false, aeof = false;
+
+    bool open_av() {
+        if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return false;
+        if (avformat_find_stream_info(fmt, nullptr) < 0) return false;
+        astream = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+        if (astream < 0) return false;
+        AVStream* st = fmt->streams[astream];
+        const AVCodec* codec = avcodec_find_decoder(st->codecpar->codec_id);
+        if (!codec) return false;
+        dec = avcodec_alloc_context3(codec);
+        if (!dec || avcodec_parameters_to_context(dec, st->codecpar) < 0) return false;
+        if (avcodec_open2(dec, codec, nullptr) < 0) return false;
+        atb = st->time_base;
+        frame = av_frame_alloc(); pkt = av_packet_alloc();
+        return frame && pkt && dec->sample_rate > 0;
+    }
+    bool open_dev() {
+        IMMDeviceEnumerator* en = nullptr; IMMDevice* dev = nullptr;
+        WAVEFORMATEX* wfx = nullptr;
+        bool ok = false;
+        do {
+            if (FAILED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                                        kIID_IMMDeviceEnumerator, (void**)&en))) break;
+            if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev))) break;
+            if (FAILED(dev->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&client))) break;
+            if (FAILED(client->GetMixFormat(&wfx))) break;
+            bool isFloat = wfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+                           (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+                            !memcmp(&((WAVEFORMATEXTENSIBLE*)wfx)->SubFormat, &kSubtypeIEEEFloat, sizeof(GUID)));
+            if (!isFloat && wfx->wBitsPerSample != 16) break;   // exotic mix format: no audio
+            rate = (int)wfx->nSamplesPerSec;
+            bytesPS = wfx->nChannels * (isFloat ? 4 : 2);
+            if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                          500000 /*50ms*/, 0, wfx, nullptr))) break;
+            if (FAILED(client->SetEventHandle(ev))) break;
+            if (FAILED(client->GetBufferSize(&bufFrames))) break;
+            if (FAILED(client->GetService(kIID_IAudioRenderClient, (void**)&render))) break;
+            AVChannelLayout outLay;
+            av_channel_layout_default(&outLay, wfx->nChannels);
+            int sr = swr_alloc_set_opts2(&swr, &outLay, isFloat ? AV_SAMPLE_FMT_FLT : AV_SAMPLE_FMT_S16,
+                                         rate, &dec->ch_layout, dec->sample_fmt, dec->sample_rate, 0, nullptr);
+            av_channel_layout_uninit(&outLay);
+            if (sr < 0 || swr_init(swr) < 0) break;
+            ok = true;
+        } while (0);
+        if (wfx) CoTaskMemFree(wfx);
+        if (dev) dev->Release();
+        if (en) en->Release();
+        return ok;
+    }
+    bool next_frame() {   // decode the next audio frame into `frame`; false at stream end
+        for (;;) {
+            int rr = avcodec_receive_frame(dec, frame);
+            if (rr == 0) return true;
+            if (rr != AVERROR(EAGAIN)) return false;
+            int rp = av_read_frame(fmt, pkt);
+            if (rp < 0) { avcodec_send_packet(dec, nullptr); continue; }
+            if (pkt->stream_index != astream) { av_packet_unref(pkt); continue; }
+            avcodec_send_packet(dec, pkt);
+            av_packet_unref(pkt);
+        }
+    }
+    void fifo_push(AVFrame* fr) {   // resample fr (or flush swr with null) into the fifo
+        int inN = fr ? fr->nb_samples : 0;
+        int outMax = (int)av_rescale_rnd(swr_get_delay(swr, dec->sample_rate) + inN,
+                                         rate, dec->sample_rate, AV_ROUND_UP) + 64;
+        size_t at = fifo.size();
+        fifo.resize(at + (size_t)outMax * bytesPS);
+        unsigned char* dst = fifo.data() + at;
+        int n = swr_convert(swr, &dst, outMax,
+                            fr ? (const unsigned char**)fr->extended_data : nullptr, inN);
+        fifo.resize(at + (size_t)(n > 0 ? n : 0) * bytesPS);
+    }
+    void do_seek(double t) {
+        if (devOn) { client->Stop(); devOn = false; }
+        client->Reset();                       // drop anything still buffered on the device
+        fifo.clear(); written = 0; aeof = false;
+        basePts = t;
+        avcodec_flush_buffers(dec);
+        swr_init(swr);                          // discard resampler tail
+        av_seek_frame(fmt, astream, (int64_t)(t / av_q2d(atb)), AVSEEK_FLAG_BACKWARD);
+        while (next_frame()) {                  // decode-drop up to t, trim inside the first kept frame
+            int64_t p = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
+            double fpts = p != AV_NOPTS_VALUE ? p * av_q2d(atb) : t;
+            if (fpts + (double)frame->nb_samples / dec->sample_rate <= t) continue;
+            fifo_push(frame);
+            if (fpts < t) {
+                size_t drop = (size_t)((t - fpts) * rate) * bytesPS;
+                fifo.erase(fifo.begin(), fifo.begin() + (drop < fifo.size() ? drop : fifo.size()));
+            } else basePts = fpts;              // t falls before the first sample
+            break;
+        }
+        clock = basePts;
+    }
+    void fill() {
+        UINT32 pad = 0;
+        if (FAILED(client->GetCurrentPadding(&pad)) || pad >= bufFrames) return;
+        UINT32 free = bufFrames - pad;
+        while (fifo.size() < (size_t)free * bytesPS && !aeof) {
+            if (next_frame()) fifo_push(frame);
+            else { fifo_push(nullptr); aeof = true; }
+        }
+        BYTE* buf = nullptr;
+        if (FAILED(render->GetBuffer(free, &buf))) return;
+        size_t need = (size_t)free * bytesPS;
+        size_t have = fifo.size() < need ? fifo.size() : need;
+        memcpy(buf, fifo.data(), have);
+        memset(buf + have, 0, need - have);     // past stream end: silence, clock keeps running
+        render->ReleaseBuffer(free, 0);
+        fifo.erase(fifo.begin(), fifo.begin() + have);
+        written += free;
+        clock = basePts + ((double)written - (double)(pad + free)) / rate;
+    }
+    void run() {
+        HRESULT ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        bool ok = open_av() && open_dev();
+        for (;;) {
+            bool w; double sk;
+            {
+                std::unique_lock<std::mutex> lk(mx);
+                cv.wait(lk, [&] { return quit || seekTo >= 0 || want || devOn; });
+                if (quit) break;
+                w = want; sk = seekTo; seekTo = -1;
+            }
+            if (sk >= 0) {
+                if (ok) do_seek(sk);   // on failure clock stays -1: the video free-runs
+                pending--;
+            }
+            if (!ok) {                  // dead stream: park (seeks still consumed so pending stays sane)
+                std::unique_lock<std::mutex> lk(mx);
+                cv.wait(lk, [&] { return quit || seekTo >= 0; });
+                continue;
+            }
+            if (w && !devOn) { fill(); client->Start(); devOn = true; }
+            else if (!w && devOn) { client->Stop(); devOn = false; continue; }
+            if (devOn && WaitForSingleObject(ev, 100) == WAIT_OBJECT_0) fill();
+        }
+        if (client && devOn) client->Stop();
+        if (render) render->Release();
+        if (client) client->Release();
+        if (swr) swr_free(&swr);
+        if (frame) av_frame_free(&frame);
+        if (pkt) av_packet_free(&pkt);
+        if (dec) avcodec_free_context(&dec);
+        if (fmt) avformat_close_input(&fmt);
+        if (ci == S_OK || ci == S_FALSE) CoUninitialize();
+    }
+};
+static std::map<uint64_t, AudioOut*> g_audio;   // shape id → live audio stream (UI thread only)
+
+static void audio_destroy(AudioOut* a) {
+    { std::lock_guard<std::mutex> lk(a->mx); a->quit = true; }
+    a->cv.notify_all();
+    if (a->ev) SetEvent(a->ev);
+    if (a->th.joinable()) a->th.join();
+    if (a->ev) CloseHandle(a->ev);
+    delete a;
+}
+static void audio_destroy_all() {
+    for (auto& [id, a] : g_audio) audio_destroy(a);
+    g_audio.clear();
+}
+static void audio_play(AudioOut* a, bool on) {
+    bool changed;
+    { std::lock_guard<std::mutex> lk(a->mx); changed = a->want != on; a->want = on; }
+    if (changed) { a->cv.notify_all(); if (a->ev) SetEvent(a->ev); }
+}
+static void audio_seek(AudioOut* a, double t) {
+    {
+        std::lock_guard<std::mutex> lk(a->mx);
+        if (a->seekTo < 0) a->pending++;   // overwriting an unconsumed seek: already counted
+        a->seekTo = t;
+    }
+    a->cv.notify_all();
+    if (a->ev) SetEvent(a->ev);
+}
+static AudioOut* audio_ensure(uint64_t id, const std::string& asset, double t) {
+    auto it = g_audio.find(id);
+    if (it != g_audio.end()) {
+        if (it->second->asset == asset) return it->second;
+        audio_destroy(it->second); g_audio.erase(it);   // shape's video was replaced
+    }
+    AudioOut* a = new AudioOut();
+    a->asset = asset;
+    a->path = g_projDir + "/" + asset;
+    a->seekTo = t;   // consumed as the initial position (pending starts at 1)
+    a->ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    a->th = std::thread([a] { a->run(); });
+    g_audio[id] = a;
+    return a;
+}
+// pause streams whose video didn't draw+play this frame (culled offscreen,
+// paused, stopped); drop streams whose shape is gone or lost its sound flag
+static void audio_sweep() {
+    int tick = ImGui::GetFrameCount();
+    for (auto it = g_audio.begin(); it != g_audio.end();) {
+        Shape* s = find_shape(it->first);
+        if (!s || s->asset != it->second->asset || !s->sound) {
+            audio_destroy(it->second); it = g_audio.erase(it); continue;
+        }
+        if (it->second->lastTick != tick) audio_play(it->second, false);
+        ++it;
+    }
+}
 #endif // TEI_LIBAV
 
 // Per-shape playback state; the dynamic texture is updated only when the
 // wanted frame index actually changes.
 struct PlayState {
     bool playing = false;
+    bool audioSeek = false;   // UI moved t (seek/stop); re-aim the audio stream before adopting its clock
     double t = 0;
     int shownIdx = -1;
     int reqIdx = -1;    // frame index requested from the decode worker, not yet delivered
@@ -1185,6 +1442,15 @@ struct PlayState {
     void release() { if (srv) srv->Release(); if (tex) tex->Release(); srv = nullptr; tex = nullptr; shownIdx = -1; reqIdx = -1; }
 };
 static std::map<uint64_t, PlayState> g_play;
+
+// A video with an A-B loop opens AT A: the poster and the first play start
+// from the loop, not file start. (Every g_play access goes through here so a
+// selected-but-culled video can't sneak in a t=0 entry.)
+static PlayState& play_state(const Shape& s) {
+    auto ins = g_play.try_emplace(s.id);
+    if (ins.second && s.loopA >= 0) ins.first->second.t = s.loopA;
+    return ins.first->second;
+}
 
 #ifdef TEI_LIBAV
 static bool upload_rgba(PlayState& ps, const unsigned char* rgba, int w, int h) {
@@ -1212,13 +1478,25 @@ static bool upload_rgba(PlayState& ps, const unsigned char* rgba, int w, int h) 
 static ID3D11ShaderResourceView* video_srv(const Shape& s, MediaKind mk) {
     VideoDecoder* d = get_decoder(s.asset);
     if (!d) return nullptr;
-    PlayState& ps = g_play[s.id];
+    PlayState& ps = play_state(s);
     if (mk == MK_GIF) ps.playing = true;   // gifs just loop, no controls
     if (ps.playing) {
-        ps.t += ImGui::GetIO().DeltaTime;
         double dur = d->duration();
-        if (mk == MK_VIDEO && s.loopA >= 0 && s.loopB > s.loopA && ps.t > s.loopB) ps.t = s.loopA;
-        else if (dur > 0 && ps.t >= dur) ps.t = 0;
+        AudioOut* au = nullptr;
+        if (mk == MK_VIDEO && s.sound && d->hasAudio && !g_headless) {
+            au = audio_ensure(s.id, s.asset, ps.t);
+            au->lastTick = ImGui::GetFrameCount();
+            if (ps.audioSeek) audio_seek(au, ps.t);
+            audio_play(au, true);
+            double c = au->pending.load() == 0 ? au->clock.load() : -1.0;
+            if (c >= 0) ps.t = c;                     // audio master while the stream is live
+            else ps.t += ImGui::GetIO().DeltaTime;    // seek in flight / stream still opening / no device
+        } else ps.t += ImGui::GetIO().DeltaTime;
+        ps.audioSeek = false;   // consumed above; without a stream the position seeds at creation
+        bool wrapped = false;
+        if (mk == MK_VIDEO && s.loopA >= 0 && s.loopB > s.loopA && ps.t > s.loopB) { ps.t = s.loopA; wrapped = true; }
+        else if (dur > 0 && ps.t >= dur) { ps.t = (mk == MK_VIDEO && s.loopA >= 0) ? s.loopA : 0; wrapped = true; }
+        if (wrapped && au) audio_seek(au, ps.t);
     }
     int idx = (int)(ps.t * d->fps + 0.5);
     if (d->frames > 0 && idx >= d->frames) idx = d->frames - 1;
@@ -1260,6 +1538,9 @@ static void drain_video_results() {
 // drop playback state (and its GPU texture) + cached text extents for shapes
 // that no longer exist
 static void sweep_play_states() {
+#ifdef TEI_LIBAV
+    audio_sweep();
+#endif
     for (auto it = g_play.begin(); it != g_play.end();) {
         if (!find_shape(it->first)) { it->second.release(); it = g_play.erase(it); }
         else ++it;
@@ -1344,6 +1625,7 @@ static void replace_image_contents(Shape& s, const std::string& rel) {
         s.crop = ImVec4(0, 0, 1, 1);
     }
     s.loopA = s.loopB = -1;
+    s.sound = false;
 }
 
 // The (world) rect the FULL source image projects to, given the current
@@ -1529,7 +1811,6 @@ static void paste_clipboard(ImVec2 atW) {
 static std::string g_settingsDir;               // %APPDATA%/teidraw ("" = unavailable)
 static std::string g_boardsDir;                 // where "new board" mints dirs
 static std::vector<std::string> g_recentBoards; // absolute dirs, most recent first
-static bool g_headless = false;                 // --shot/--export: don't touch recents
 
 static bool path_eq(const std::string& a, const std::string& b) {
     if (a.size() != b.size()) return false;
@@ -1630,6 +1911,7 @@ static void switch_board(const std::string& dirIn) {
     g_extCache.clear();
     g_idIndex.clear();
 #ifdef TEI_LIBAV
+    audio_destroy_all();
     {   // invalidate in-flight decodes (gen bump) before touching the decoders
         std::lock_guard<std::mutex> lk(g_vqMx);
         g_vqGen++;
@@ -2776,7 +3058,7 @@ static void DrawContextMenu() {
 // the clicked position). Rotated videos rotate the pills rigidly (vertices
 // turned about the video center, hit points inverse-rotated), so hitboxes sit
 // exactly on the drawn pixels. Gifs just loop with no chrome.
-enum OverlayCtl { OV_PLAY = 0, OV_STOP, OV_SEEK, OV_A, OV_B, OV_CLR, OV_COUNT };
+enum OverlayCtl { OV_PLAY = 0, OV_STOP, OV_SEEK, OV_A, OV_B, OV_CLR, OV_SOUND, OV_COUNT };
 static uint64_t g_overlayVid = 0;       // video whose pills are showing (kept through fade-out)
 static float    g_ovAlphaFull = 0.f, g_ovAlphaMini = 0.f;   // fade envelopes
 static bool     g_ovLive = false;       // full pill accepts clicks (read by CanvasFrame)
@@ -2823,11 +3105,19 @@ static void fmt_time(char* buf, size_t n, double t) {
     snprintf(buf, n, "%d:%02d", s / 60, s % 60);
 }
 
-// play / pause / stop glyph centered at c
+// play / pause / stop / speaker glyph centered at c
 static void ov_icon(ImDrawList* dl, ImVec2 c, float r, int icon, ImU32 col) {
     if (icon == 0)      dl->AddTriangleFilled(c + ImVec2(-r * 0.7f, -r), c + ImVec2(-r * 0.7f, r), c + ImVec2(r, 0), col);
     else if (icon == 1) { dl->AddRectFilled(c + ImVec2(-r * 0.8f, -r), c + ImVec2(-r * 0.15f, r), col, 1.f);
                           dl->AddRectFilled(c + ImVec2(r * 0.15f, -r), c + ImVec2(r * 0.8f, r), col, 1.f); }
+    else if (icon == 3 || icon == 4) {   // speaker: 3 = sound on (waves), 4 = muted (slash)
+        dl->AddRectFilled(c + ImVec2(-r, -r * 0.4f), c + ImVec2(-r * 0.45f, r * 0.4f), col);
+        dl->AddTriangleFilled(c + ImVec2(-r * 0.55f, 0.f), c + ImVec2(r * 0.05f, -r * 0.85f), c + ImVec2(r * 0.05f, r * 0.85f), col);
+        if (icon == 3) {
+            dl->PathArcTo(c + ImVec2(r * 0.1f, 0.f), r * 0.45f, -0.9f, 0.9f); dl->PathStroke(col, 0, 1.5f);
+            dl->PathArcTo(c + ImVec2(r * 0.1f, 0.f), r * 0.85f, -0.9f, 0.9f); dl->PathStroke(col, 0, 1.5f);
+        } else dl->AddLine(c + ImVec2(r * 0.2f, -r * 0.75f), c + ImVec2(r * 0.95f, r * 0.75f), col, 1.5f);
+    }
     else                dl->AddRectFilled(c + ImVec2(-r * 0.8f, -r * 0.8f), c + ImVec2(r * 0.8f, r * 0.8f), col, 1.f);
 }
 
@@ -2882,7 +3172,7 @@ static void DrawVideoOverlay() {
     }
     VideoDecoder* d = get_decoder(v->asset);
     if (!d) { g_overlayVid = 0; g_ovLive = g_ovMiniLive = false; return; }
-    PlayState& ps = g_play[v->id];
+    PlayState& ps = play_state(*v);
     double dur = d->duration();
 
     // ── layout (unrotated screen space; control rects pill-local) ──
@@ -2893,7 +3183,8 @@ static void DrawVideoOverlay() {
     char times[40]; snprintf(times, sizeof times, "%s / %s", t0, t1);
     const float pad = 10.f, bh = 28.f, seekH = 16.f, gap = 6.f, small = 18.f;
     float timeW = f->CalcTextSizeA(fs, FLT_MAX, 0.f, times).x;
-    float row1W = bh + gap + bh + 10.f + timeW;
+    bool hasAud = d->hasAudio;
+    float row1W = bh + gap + bh + 10.f + timeW + (hasAud ? 10.f + bh : 0.f);
     float sliderW = fminf(fmaxf(lb.size().x * g_cam.zoom * 0.75f, 200.f), 340.f);
     bool haveLoop = v->loopA >= 0 || v->loopB >= 0;
     float W = fmaxf(sliderW, row1W) + pad * 2;
@@ -2910,6 +3201,8 @@ static void DrawVideoOverlay() {
     g_ovCtl[OV_B]    = { ImVec2(pad + 26.f, y2), ImVec2(pad + 48.f, y2 + small) };
     g_ovCtl[OV_CLR]  = haveLoop ? WRect{ ImVec2(pad + 52.f, y2), ImVec2(pad + 74.f, y2 + small) }
                                 : WRect{ ImVec2(-9999.f, -9999.f), ImVec2(-9999.f, -9999.f) };
+    g_ovCtl[OV_SOUND] = hasAud ? WRect{ ImVec2(W - pad - bh, pad), ImVec2(W - pad, pad + bh) }
+                               : WRect{ ImVec2(-9999.f, -9999.f), ImVec2(-9999.f, -9999.f) };
     // mini pill: bottom-right corner of the video, inset 8px
     const float mb = 22.f, mpad = 4.f;
     g_ovMiniSize = ImVec2(mpad + mb + 2.f + mb + mpad, mb + mpad * 2);
@@ -2923,11 +3216,13 @@ static void DrawVideoOverlay() {
         int ctl = g_overlayDownCtl; g_overlayDownCtl = -2;
         if (vlen(io.MousePos - g_dragStartS) < 4.f) switch (ctl) {
         case OV_PLAY: ps.playing = !ps.playing; break;
-        case OV_STOP: ps.playing = false; ps.t = 0; break;
+        case OV_STOP: ps.playing = false; ps.t = v->loopA >= 0 ? v->loopA : 0; ps.audioSeek = true; break;
         case OV_SEEK: if (dur > 0) {
             float u = (overlay_unrot(io.MousePos).x - g_ovTL.x - g_ovCtl[OV_SEEK].mn.x) / fmaxf(g_ovCtl[OV_SEEK].size().x, 1.f);
             ps.t = fminf(fmaxf(u, 0.f), 1.f) * dur;
+            ps.audioSeek = true;
         } break;
+        case OV_SOUND: v->sound = !v->sound; push_undo(); break;
         case OV_A: v->loopA = (float)ps.t; if (v->loopB >= 0 && v->loopB <= v->loopA) v->loopB = -1; push_undo(); break;
         case OV_B: v->loopB = (float)ps.t; if (v->loopA >= 0 && v->loopA >= v->loopB) v->loopA = -1; push_undo(); break;
         case OV_CLR: v->loopA = v->loopB = -1; push_undo(); break;
@@ -2968,6 +3263,7 @@ static void DrawVideoOverlay() {
         };
         icon_button(OV_PLAY, ps.playing ? 1 : 0);
         icon_button(OV_STOP, 2);
+        if (hasAud) icon_button(OV_SOUND, v->sound ? 3 : 4);
         dl->AddText(f, fs, TL + ImVec2(g_ovCtl[OV_STOP].mx.x + 10.f, pad + (bh - fs) * 0.5f), g_th.textDim, times);
         {   // seek bar: track + progress + A/B marks + knob
             WRect sk = g_ovCtl[OV_SEEK];
@@ -3964,6 +4260,7 @@ int main(int argc, char** argv) {
     }
 
 #ifdef TEI_LIBAV
+    audio_destroy_all();
     if (g_vqWorker.joinable()) {
         { std::lock_guard<std::mutex> lk(g_vqMx); g_vqQuit = true; }
         g_vqCv.notify_all();

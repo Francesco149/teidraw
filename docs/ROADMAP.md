@@ -36,7 +36,8 @@ play/stop/seek/A-B pill, dynamic-texture upload. Shape clipboard.
 - **Decode thread for video** ✅ (worker owns all libav decode; UI opens
   decoders + decodes posters in-line; scrubs coalesce latest-wins).
   NVDEC/d3d11va stays an option if software decode ever falls short.
-- Video audio (WASAPI + swresample; the flake libav already has swresample).
+- **Video audio** ✅ (WASAPI shared-mode + swresample; off by default, speaker
+  toggle on the pill; audio clock drives the video while sounding).
 - More shapes (rect/ellipse/frame) IF daily use demands (rotation: done, session 2).
 - freetype glyph rasterizer for even better small-text rendering.
 

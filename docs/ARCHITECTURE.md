@@ -51,7 +51,14 @@ Gif/video: resident `VideoDecoder` per asset (LRU cap 6) — avformat seek +
 avcodec decode + swscale→RGBA, forward-decode reuse for sequential playback —
 into one `D3D11_USAGE_DYNAMIC` texture per playing shape, mapped WRITE_DISCARD
 only when the wanted frame index changes. Gifs autoplay-loop chrome-free;
-videos get the hover pill (play/pause/stop/seek/A-B). No audio yet (roadmap).
+videos get the hover pill (play/pause/stop/seek/A-B/sound). Audio is per-shape
+opt-in (speaker toggle, persisted): a playing sounding video owns an `AudioOut`
+thread — its OWN avformat context (video decoder seeks stay untouched) →
+swresample to the device mix format → shared-mode WASAPI (Windows mixes, no
+in-app mixer). While live, the audio hardware clock DRIVES `ps.t`, so A/V
+can't drift; UI seeks and A-B wraps request an audio re-seek and the video
+free-runs on DeltaTime until it lands. A video with `loopA` set opens (and
+stops back) at A.
 
 ## Input / interaction
 One explicit drag state machine (`DragMode`): PENDING → MOVE/MARQUEE at a 4 px

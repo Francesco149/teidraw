@@ -1,6 +1,6 @@
 # STATUS — live front
 
-*Updated: 2026-07-11 (session 6). History lives in `git log` — this file only
+*Updated: 2026-07-11 (session 7). History lives in `git log` — this file only
 describes NOW.*
 
 ## Where things stand
@@ -74,6 +74,22 @@ results from the old board can't land on the new one. Side effect of
 culling: offscreen gifs/videos stop decoding (playback time also pauses);
 they resume when scrolled back in — deliberate.
 
+Session-7 = **video audio** (the last big M4 item). Per-shape opt-in: a
+speaker toggle on the full pill (shown only when the file has an audio
+stream), OFF by default, persisted in board.json (`sound`) and reset when the
+video is replaced. A playing sounding video owns an `AudioOut` thread: its
+OWN AVFormatContext (audio seeks never disturb the video decoder), decode →
+swresample to the device mix format → shared-mode WASAPI render (Windows
+mixes, so overlapping videos need no in-app mixer). While the stream is live
+its hardware clock DRIVES `ps.t` (audio master — A/V can't drift); UI seeks /
+stop / A-B wraps request an audio re-seek (`ps.audioSeek` / wrap path) and
+the video free-runs on DeltaTime until `pending` drains back to 0. Streams
+pause when the video pauses or culls offscreen (`lastTick` sweep in
+`audio_sweep`), die on sound-off/delete/replace/board-switch/exit. Fixed
+alongside: a video with an A-B loop now OPENS at A (poster + first play), and
+stop returns to A instead of 0 when a loop start is set (only-A-set videos
+also wrap to A at end of file).
+
 ## Build & verify
 ```
 nix develop --command make -C editor            # build/teidraw.exe
@@ -90,7 +106,8 @@ render tests.
 ## NEXT TASK → M3 (docs/ROADMAP.md)
 1. Text wrap width; then the custom WYSIWYG canvas editor (see below).
    (Snapping guides + nudge + shift axis-lock landed session 5; M4 culling +
-   caches + video decode thread landed session 6 — audio is the big M4 item left.)
+   caches + video decode thread landed session 6; video audio landed
+   session 7 — M4 is essentially done.)
 
 ## Known rough edges / to keep in mind
 - **WYSIWYG-transform editing is fully OFF** (`kWysiwygAlignEdit` and
@@ -122,5 +139,5 @@ render tests.
   Settings tests can point the app at a fake `%APPDATA%` via
   `WSLENV=APPDATA/p APPDATA=<dir> ./build/teidraw.exe …`.
 - Escape-while-crop-dragging commits instead of canceling.
-- No audio on videos yet (M4). Faux bold is double-strike, not a real weight
-  (real SemiBold statics would be the upgrade if it ever looks mushy).
+- Faux bold is double-strike, not a real weight (real SemiBold statics would
+  be the upgrade if it ever looks mushy).
