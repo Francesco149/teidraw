@@ -2660,7 +2660,24 @@ static void DrawVideoOverlay() {
     if (sel) g_overlayVid = sel->id;
     Shape* v = g_overlayVid ? find_shape(g_overlayVid) : nullptr;
     if (v && (v->type != SH_IMAGE || media_kind(v->asset) != MK_VIDEO)) v = nullptr;   // undo/replace churn
-    bool want = sel != nullptr && !dragging;
+    // hover-gated: the pill fades away when the pointer leaves both the video
+    // and the pill itself (short linger avoids flicker at the edges); a press
+    // that started on the pill holds it
+    bool hover = g_overlayDownCtl != -2;
+    if (sel && !hover) {
+        WRect b = shape_local_rect(*sel);
+        ImVec2 p = sel->rot != 0.f ? rot_about(S2W(io.MousePos), b.center(), -sel->rot) : S2W(io.MousePos);
+        hover = b.contains(p);
+    }
+    if (!hover && g_overlayVid) {   // pill rect from last frame's layout
+        ImVec2 l = overlay_local(io.MousePos);
+        hover = l.x >= 0 && l.y >= 0 && l.x <= g_ovSize.x && l.y <= g_ovSize.y;
+    }
+    static double loseAt = 0;
+    double now = ImGui::GetTime();
+    if (hover) loseAt = 0;
+    else if (!loseAt) loseAt = now + 0.3;
+    bool want = sel != nullptr && !dragging && (hover || now < loseAt);
     if (want)          g_overlayAlpha = fminf(1.f, g_overlayAlpha + io.DeltaTime / 0.12f);
     else if (dragging) g_overlayAlpha = 0.f;   // drags hide it instantly
     else               g_overlayAlpha = fmaxf(0.f, g_overlayAlpha - io.DeltaTime / 0.15f);

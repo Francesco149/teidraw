@@ -43,8 +43,9 @@ presses (overlay_contains → g_overlayDownCtl, downTarget = the video) and
 its release skips selection semantics for them; DrawVideoOverlay applies
 the action. Rotation is rigid vertex rotation about the video center with
 inverse-rotated hit points — hitboxes sit on the drawn pixels by
-construction. Fades 0.12s in / 0.15s out, instant-hide during real drags
-(DM_PENDING keeps it). **Snap-move guides** (HOLD CTRL to snap — off by
+construction. Hover-gated: fades out (0.3s linger + 0.15s) when the pointer
+leaves both video and pill, back in (0.12s) on re-hover; instant-hide
+during real drags (DM_PENDING and pill presses keep it). **Snap-move guides** (HOLD CTRL to snap — off by
 default per user; moving bounds' edges+centers pull to other top-level
 shapes' edges+centers, 8 screen px, accent guide lines through both
 boxes), **shift = axis-lock drag**, **arrow-key nudge** (1 px, shift 10,
