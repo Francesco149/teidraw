@@ -5541,7 +5541,9 @@ int main(int argc, char** argv) {
     // Headless runs render on the "offscreen" video driver when it's usable:
     // no window opens, nothing steals focus (the session-9 postmortem), and
     // shots are a deterministic 1600×1000. Falls back to a real window.
-    if (headless) SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+    // OVERRIDE priority, or an exported SDL_VIDEODRIVER (WSLg sets =wayland)
+    // silently outranks the hint and headless runs try a real display.
+    if (headless) SDL_SetHintWithPriority(SDL_HINT_VIDEO_DRIVER, "offscreen", SDL_HINT_OVERRIDE);
     bool vidOk = SDL_Init(SDL_INIT_VIDEO);
     if (!vidOk && headless) {   // no offscreen driver in this SDL: use a real window
         SDL_ResetHint(SDL_HINT_VIDEO_DRIVER);
