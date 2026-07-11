@@ -8,12 +8,9 @@ latency, with heuristics that guess what you meant.
 
 <br clear="left">
 
-<!--
-  DEMO VIDEO: edit this README on github.com and drag the demo .mp4 onto the
-  line below — GitHub uploads it and inserts a user-attachment URL that
-  renders as an embedded player. Then delete the placeholder line.
--->
-*(demo video coming soon)*
+https://github.com/user-attachments/assets/52881db0-0aff-48bb-91ca-2afc95dce8fe
+
+
 
 ## Download
 
