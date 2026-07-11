@@ -2393,81 +2393,107 @@ static void draw_arrow_shape(ImDrawList* dl, const Shape& s, bool ghostEnd = fal
     }
 }
 
-// Variable-width freehand stroke. Rails L/R offset each point along the
-// averaged segment normal by its pressure-driven radius; the ribbon renders
-// as ONE hand-built mesh for every opacity (strip triangles + cap fans + a
-// 1px outward AA fringe). One mesh is load-bearing twice over:
-//   - overdraw STACKS AA fringes: the rejected quads+discs-per-point fill
-//     laid 3-5 fringes on every edge pixel, multi-blending the ramp to ~full
-//     alpha — visually hard, aliased edges despite AA being "on".
-//   - translucent ink must fill exactly once or joints double-blend.
-// Concave-poly fill is also out: it ear-clips, and outlines self-intersect
-// wherever the path curls tighter than the pen radius → giant filled blobs.
+// Variable-width freehand stroke: per-SEGMENT rail quads + round-join wedges
+// on the outer side of every corner + semicircle caps, emitted as ONE mesh
+// with a 1px outward AA fringe on every true boundary edge. One mesh is
+// load-bearing twice over:
+//   - overdraw STACKS AA fringes: a quads+discs-per-point fill laid 3-5
+//     fringes on every edge pixel, multi-blending the ramp to ~full alpha —
+//     visually hard, aliased edges despite AA being "on".
+//   - translucent ink must fill (almost) exactly once or joints blotch.
+// Per-segment rails (not averaged normals) matter for the sparse points of
+// shift-chained straight lines: an averaged-normal ribbon thins by cos(θ/2)
+// at a corner and collapses outright near a reversal — the user's "shrinking,
+// disconnecting" sharp angles. The round wedge keeps full width through any
+// turn, reversals included (the wedge degenerates to a rail-gap sliver on
+// near-straight joints, so no crack ever opens). Known cost: the two quads
+// overlap in a small wedge on the INNER side of a sharp corner — invisible
+// when opaque, a tiny localized double-blend when translucent.
+// (Concave-poly outline fill was also tried and rejected: it ear-clips, and
+// outlines self-intersect at curls tighter than the pen radius → blobs.)
 static void draw_stroke_shape(ImDrawList* dl, const Shape& s) {
     int n = (int)s.pts.size();
     if (!n) return;
     ImU32 col = shape_ink(s);
-    ImVec2 c = shape_local_rect(s).center();
+    ImVec2 ctr = shape_local_rect(s).center();
     static std::vector<ImVec2> sp; static std::vector<float> rr;   // reused (single-threaded)
-    sp.resize(n); rr.resize(n);
+    sp.clear(); rr.clear(); sp.reserve(n); rr.reserve(n);
     for (int i = 0; i < n; i++) {
         ImVec2 w = s.pos + s.pts[i];
-        if (s.rot != 0.f) w = rot_about(w, c, s.rot);
-        sp[i] = W2S(w);
-        rr[i] = fmaxf(draw_radius(s, s.press[i]) * g_cam.zoom, 0.55f);   // stay visible zoomed out
+        if (s.rot != 0.f) w = rot_about(w, ctr, s.rot);
+        ImVec2 p = W2S(w);
+        float r = fmaxf(draw_radius(s, s.press[i]) * g_cam.zoom, 0.55f);   // stay visible zoomed out
+        if (!sp.empty() && vlen(p - sp.back()) < 0.01f) { rr.back() = fmaxf(rr.back(), r); continue; }
+        sp.push_back(p); rr.push_back(r);   // coincident points would make zero-length dirs
     }
-    if (n == 1) { dl->AddCircleFilled(sp[0], rr[0], col); return; }
-    static std::vector<ImVec2> L, R;
-    L.resize(n); R.resize(n);
-    ImVec2 dir(1, 0);
-    for (int i = 0; i < n; i++) {
-        ImVec2 d = sp[i == n - 1 ? i : i + 1] - sp[i == 0 ? i : i - 1];
-        float len = vlen(d);
-        if (len > 0.0001f) dir = d * (1.f / len);   // zero-length: keep the last heading
-        ImVec2 nn(-dir.y, dir.x);
-        L[i] = sp[i] + nn * rr[i];
-        R[i] = sp[i] - nn * rr[i];
+    int m = (int)sp.size();
+    if (m == 1) { dl->AddCircleFilled(sp[0], rr[0], col); return; }
+
+    static std::vector<ImVec2> sd, sn;   // unit dir + left normal per segment
+    sd.resize(m - 1); sn.resize(m - 1);
+    for (int i = 0; i + 1 < m; i++) {
+        ImVec2 d = sp[i + 1] - sp[i];
+        d = d * (1.f / vlen(d));         // nonzero by the dedupe above
+        sd[i] = d; sn[i] = ImVec2(-d.y, d.x);
     }
-    struct RV { ImVec2 p, o; };            // outline ring vertex + outward unit
-    static std::vector<RV> ring;
-    ring.clear(); ring.reserve(2 * n + 14);
-    auto radial = [](ImVec2 v, ImVec2 c) {
-        ImVec2 d = v - c; float l = vlen(d);
-        return l > 1e-4f ? d * (1.f / l) : ImVec2(1, 0);
+
+    struct V { ImVec2 p; ImU32 c; };
+    static std::vector<V> vb; static std::vector<int> ib;
+    vb.clear(); ib.clear();
+    ImU32 col0 = col & 0x00FFFFFF;
+    auto vtx = [&](ImVec2 p, ImU32 cc) { vb.push_back({ p, cc }); return (int)vb.size() - 1; };
+    auto tri = [&](int a, int b, int c) { ib.push_back(a); ib.push_back(b); ib.push_back(c); };
+    // 1px AA fringe extruded outward from boundary edge a→b
+    auto fringe = [&](int a, int b, ImVec2 oa, ImVec2 ob) {
+        int fa = vtx(vb[a].p + oa, col0), fb = vtx(vb[b].p + ob, col0);
+        tri(a, b, fb); tri(a, fb, fa);
     };
-    auto arc = [&](ImVec2 p, float r, ImVec2 from) {   // 7 pts sweeping half a turn
-        float a0 = atan2f(from.y, from.x);
-        for (int k = 1; k < 8; k++) {
-            float a = a0 - IM_PI * (float)k / 8.f;
+    // filled fan around ctr from angle a0 sweeping `sweep`, fringed radially —
+    // serves round joins (small sweeps) and end caps (±π)
+    auto wedge = [&](ImVec2 c, float r, float a0, float sweep) {
+        int steps = (int)ceilf(fabsf(sweep) / 0.4f);
+        steps = steps < 1 ? 1 : (steps > 24 ? 24 : steps);
+        int ci = vtx(c, col);
+        int prev = -1; ImVec2 pu;
+        for (int k = 0; k <= steps; k++) {
+            float a = a0 + sweep * (float)k / (float)steps;
             ImVec2 u(cosf(a), sinf(a));
-            ring.push_back({ p + u * r, u });
+            int q = vtx(c + u * r, col);
+            if (prev >= 0) { tri(ci, prev, q); fringe(prev, q, pu, u); }
+            prev = q; pu = u;
         }
     };
-    for (int i = 0; i < n; i++) ring.push_back({ L[i], radial(L[i], sp[i]) });
-    arc(sp[n - 1], rr[n - 1], L[n - 1] - sp[n - 1]);   // end cap: L → R through the heading
-    for (int i = n - 1; i >= 0; i--) ring.push_back({ R[i], radial(R[i], sp[i]) });
-    arc(sp[0], rr[0], R[0] - sp[0]);                   // start cap: R → L through −heading
-    int m = (int)ring.size();                          // = 2n + 14
-    auto rI = [&](int i) { return n + 7 + (n - 1 - i); };   // ring slot of R[i]
-    dl->PrimReserve((2 * (n - 1) + 16 + 2 * m) * 3, 2 * m + 2);
-    ImVec2 uv = dl->_Data->TexUvWhitePixel;
-    ImU32 col0 = col & 0x00FFFFFF;
-    unsigned base = dl->_VtxCurrentIdx;
-    for (int i = 0; i < m; i++) dl->PrimWriteVtx(ring[i].p, uv, col);                 // inner ring
-    for (int i = 0; i < m; i++) dl->PrimWriteVtx(ring[i].p + ring[i].o, uv, col0);    // fringe ring
-    dl->PrimWriteVtx(sp[0], uv, col);                                                 // cap fan centers
-    dl->PrimWriteVtx(sp[n - 1], uv, col);
-    auto tri = [&](int a, int b, int c) {
-        dl->PrimWriteIdx((ImDrawIdx)(base + a)); dl->PrimWriteIdx((ImDrawIdx)(base + b));
-        dl->PrimWriteIdx((ImDrawIdx)(base + c));
-    };
-    for (int i = 0; i + 1 < n; i++) { tri(i, i + 1, rI(i + 1)); tri(i, rI(i + 1), rI(i)); }
-    for (int j = n - 1; j < n + 7; j++) tri(2 * m + 1, j, j + 1);            // end cap fan (L[n-1]…arc…R[n-1])
-    for (int j = 2 * n + 6; j < 2 * n + 14; j++) tri(2 * m, j, (j + 1) % m); // start cap fan (R[0]…arc…L[0])
-    for (int j = 0; j < m; j++) {                                            // AA fringe around the ring
-        int k = (j + 1) % m;
-        tri(j, k, m + k); tri(j, m + k, m + j);
+
+    for (int i = 0; i + 1 < m; i++) {   // rail quads, fringed along both rails
+        ImVec2 nn = sn[i];
+        int a = vtx(sp[i] + nn * rr[i], col);
+        int b = vtx(sp[i + 1] + nn * rr[i + 1], col);
+        int c = vtx(sp[i + 1] - nn * rr[i + 1], col);
+        int d = vtx(sp[i] - nn * rr[i], col);
+        tri(a, b, c); tri(a, c, d);
+        fringe(a, b, nn, nn);
+        fringe(d, c, nn * -1.f, nn * -1.f);
     }
+    for (int i = 1; i + 1 < m; i++) {   // round joins on the outer side of each turn
+        ImVec2 d0 = sd[i - 1], d1 = sd[i];
+        float cross = d0.x * d1.y - d0.y * d1.x;
+        float dot = d0.x * d1.x + d0.y * d1.y;
+        float ang = atan2f(cross, dot);
+        if (ang == 0.f) continue;                      // collinear: rails already meet
+        float sg = cross < 0.f ? 1.f : -1.f;           // rail corners spread on this side
+        ImVec2 qa = sn[i - 1] * sg;
+        // normals rotate with the dirs, so sweeping by the signed turn angle
+        // carries sg·n[i-1] exactly onto sg·n[i]
+        wedge(sp[i], rr[i], atan2f(qa.y, qa.x), ang);
+    }
+    wedge(sp[0], rr[0], atan2f(sn[0].y, sn[0].x), IM_PI);              // start cap (through −dir)
+    wedge(sp[m - 1], rr[m - 1], atan2f(sn[m - 2].y, sn[m - 2].x), -IM_PI);   // end cap (through +dir)
+
+    dl->PrimReserve((int)ib.size(), (int)vb.size());
+    ImVec2 uv = dl->_Data->TexUvWhitePixel;
+    unsigned base = dl->_VtxCurrentIdx;
+    for (auto& v : vb) dl->PrimWriteVtx(v.p, uv, v.c);
+    for (int idx : ib) dl->PrimWriteIdx((ImDrawIdx)(base + (unsigned)idx));
 }
 
 // doc order = z order. `only` (when non-null) limits drawing to those ids —

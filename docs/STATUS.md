@@ -145,15 +145,21 @@ toggling shift mid-drag flips straight/freehand within one gesture
 frame). One undo per gesture. Strokes use the S/M/L/XL ladder as width
 (`kDrawSizes` 2.5/4.5/7/12 world px, style panel size row applies, align is
 text-only), palette color + opacity work. Rendering (`draw_stroke_shape`):
-pressure-radius rails around each point, filled as ONE hand-built mesh at
-every opacity — strip triangles + cap fans + a single 1px outward AA fringe
-via PrimReserve. One mesh is load-bearing twice (user-reported lessons):
-overlapping-primitive fills STACK their AA fringes (a quads+discs-per-point
-first cut multi-blended every edge pixel to ~full alpha = hard aliased edges
-despite AA "on" — diagnosed by pixel-scanning exports for ramp values), and
-translucent ink must fill exactly once or joints blotch. AddConcavePolyFilled
-is also out: it ear-clips, and outlines self-intersect at curls tighter than
-the pen radius → giant filled blobs. Simulated pressure runs on SCREEN-space
+per-SEGMENT rail quads + round-join wedges on the outer side of every corner
++ semicircle caps, emitted as ONE hand-built mesh (PrimReserve) with a 1px
+outward AA fringe on every true boundary edge. Hard-won shape (three
+user-reported failures): (a) overlapping-primitive fills STACK their AA
+fringes — a quads+discs-per-point first cut multi-blended every edge pixel to
+~full alpha = hard aliased edges despite AA "on"; diagnosed by pixel-scanning
+exports for ramp values. (b) translucent ink must fill (almost) exactly once
+or joints blotch; AddConcavePolyFilled is out too — it ear-clips, and
+outlines self-intersect at curls tighter than the pen radius → giant blobs.
+(c) AVERAGED-normal rails thin by cos(θ/2) at corners and collapse outright
+near reversals — shift-chained straight lines have sparse points with real
+corners ("shrinking, disconnecting sharp angles"); per-segment rails + round
+wedges keep full width through any turn. Residual known cost: quads overlap
+in a small wedge on the INNER side of a sharp corner — invisible opaque,
+tiny localized double-blend translucent. Simulated pressure runs on SCREEN-space
 hand speed (zoom-independent) through an EXPONENTIAL curve (`exp(-speed/1400)`
 → careful ~0.8, easy ~0.5, brisk ~0.24), radius sweep 0.25–1.15x of nominal;
 two earlier cuts read as "pressure does nothing" — one normalized by stroke
