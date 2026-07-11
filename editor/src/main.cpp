@@ -380,6 +380,7 @@ struct Shape {
     int   family = FF_HAND;
     int   tsize = kDefaultTextSize;
     float scale = 1.f;      // continuous scale from corner-resize (multiplies font px)
+    float wrapW = 0.f;      // wrap-box width, world units (0 = auto-size to the text)
     ImVec2 pos{0, 0};       // text/image local-rect top-left (world, pre-rotation)
     float rot = 0.f;        // radians, about the local rect's center
     // image / video
@@ -448,26 +449,99 @@ static bool members_common_rot(uint64_t gid, float* out) {
 // ── shape geometry ──
 static float text_px(const Shape& s) { return kTextSizes[s.tsize] * s.scale; }
 
-// CalcTextSize is the hot path at 1000s of shapes — bounds, hit tests, draw,
+// list lines ("• foo", "12. foo", optionally indented) pin to the left edge
+// even when the text block is centered/right-aligned
+static bool is_list_line(const char* b, const char* e) {
+    while (b < e && *b == ' ') b++;
+    if (e - b >= 3 && !memcmp(b, "\xe2\x80\xa2", 3)) return true;
+    const char* d = b;
+    while (d < e && isdigit((unsigned char)*d)) d++;
+    return d > b && d < e && *d == '.' && (d + 1 == e || d[1] == ' ');
+}
+
+static int utf8_len(const char* c) {
+    return (*c & 0x80) == 0 ? 1 : (*c & 0xE0) == 0xC0 ? 2 : (*c & 0xF0) == 0xE0 ? 3 : 4;
+}
+
+// ── text layout ──
+// THE line-breaking + alignment engine: rendering, extents, caret hit-testing
+// and the editor all read the same lines, so what you click is what you see.
+// Byte ranges partition the text: [b,we) is displayed/measured; (we..e] holds
+// the hard '\n' or the blanks a soft wrap consumed (a caret in that gap sits
+// at the end of this line). Line i's top is i·px; alignment offsets are per
+// line inside blockW, list lines pinned left (same heuristic everywhere).
+struct TextLine { int b, we, e; float x, w; bool pin; };
+struct TextLayout {
+    std::vector<TextLine> lines;
+    float blockW = 0;    // wrapW when wrapping, else the widest line
+    ImVec2 ext{0, 0};    // local rect extent: (blockW, lines·px)
+};
+static void layout_text(const std::string& text, ImFont* f, float px, int align,
+                        float wrapW, TextLayout& out) {
+    out.lines.clear();
+    ImGui::PushFont(f, px);
+    const char* base = text.c_str();
+    const char* end = base + text.size();
+    const char* b = base;
+    for (;;) {   // hard lines — including the empty one after a trailing '\n'
+        const char* hl = (const char*)memchr(b, '\n', end - b);
+        if (!hl) hl = end;
+        bool pin = is_list_line(b, hl);   // per HARD line, so a wrapped list
+        const char* sb = b;               // item's continuations stay pinned too
+        for (;;) {   // soft-wrap the hard line (single pass when wrap is off)
+            const char* se = hl;
+            bool wrapped = false;
+            if (wrapW > 0.f && sb < hl) {
+                se = f->CalcWordWrapPosition(px, sb, hl, wrapW);
+                if (se <= sb) { const char* n = sb + utf8_len(sb); se = n > hl ? hl : n; }   // always progress
+                wrapped = se < hl;
+            }
+            const char* we = se;
+            if (wrapped) while (we > sb && we[-1] == ' ') we--;   // blanks the wrap consumed
+            const char* ns = se;
+            if (wrapped) while (ns < hl && *ns == ' ') ns++;      // continuation starts at the next word
+            TextLine ln;
+            ln.b = (int)(sb - base); ln.we = (int)(we - base);
+            ln.e = (int)((wrapped ? ns : hl) - base);
+            ln.w = we > sb ? ImGui::CalcTextSize(sb, we).x : 0.f;
+            ln.x = 0.f;
+            ln.pin = pin;
+            out.lines.push_back(ln);
+            if (!wrapped) break;
+            sb = ns;
+        }
+        if (hl >= end) break;
+        b = hl + 1;
+    }
+    float maxW = 0.f;
+    for (auto& ln : out.lines) maxW = fmaxf(maxW, ln.w);
+    out.blockW = wrapW > 0.f ? wrapW : maxW;
+    if (text.empty()) out.blockW = ImGui::CalcTextSize(" ").x;   // stay hittable
+    if (align)
+        for (auto& ln : out.lines)
+            if (!ln.pin)
+                ln.x = align == 1 ? (out.blockW - ln.w) * 0.5f : (out.blockW - ln.w);
+    out.ext = ImVec2(out.blockW, px * (float)out.lines.size());
+    ImGui::PopFont();
+}
+
+// Layout is the hot path at 1000s of shapes — bounds, hit tests, draw,
 // marquee and snapping all funnel through text_extent. Cache per shape id,
 // validated against every input that shapes the metric (deterministic for a
-// given font+px+text, so no time-based invalidation needed).
-struct TextExt { int family = -1; float px = 0; std::string text; ImVec2 ext; };
+// given font+px+wrap+text, so no time-based invalidation needed).
+struct TextExt { int family = -1; float px = 0, wrapW = -1; std::string text; ImVec2 ext; };
 static std::unordered_map<uint64_t, TextExt> g_extCache;
 static ImVec2 text_extent(const Shape& s) {
     float px = text_px(s);
     auto it = g_extCache.find(s.id);
     if (it != g_extCache.end()) {
         TextExt& c = it->second;
-        if (c.family == s.family && c.px == px && c.text == s.text) return c.ext;
+        if (c.family == s.family && c.px == px && c.wrapW == s.wrapW && c.text == s.text) return c.ext;
     }
-    ImFont* f = g_fonts[s.family];
-    const char* txt = s.text.empty() ? " " : s.text.c_str();
-    ImGui::PushFont(f, px);
-    ImVec2 sz = ImGui::CalcTextSize(txt);
-    ImGui::PopFont();
-    g_extCache[s.id] = { s.family, px, s.text, sz };
-    return sz;
+    static TextLayout lay;
+    layout_text(s.text, g_fonts[s.family], px, s.align, s.wrapW, lay);
+    g_extCache[s.id] = { s.family, px, s.wrapW, s.text, lay.ext };
+    return lay.ext;
 }
 
 // Text/image shapes live in a LOCAL axis-aligned rect (pos..pos+size/extent)
@@ -603,6 +677,7 @@ static json shape_to_json(const Shape& s) {
         j["x"] = s.pos.x; j["y"] = s.pos.y;
         if (s.rot != 0.f) j["rot"] = s.rot;
         if (s.align) j["algn"] = s.align;
+        if (s.wrapW > 0.f) j["wrap"] = s.wrapW;
         break;
     case SH_IMAGE:
         j["asset"] = s.asset; j["x"] = s.pos.x; j["y"] = s.pos.y;
@@ -645,6 +720,7 @@ static Shape shape_from_json(const json& j) {
         s.scale = j.value("scale", 1.f);
         s.pos = ImVec2(j.value("x", 0.f), j.value("y", 0.f));
         s.rot = j.value("rot", 0.f);
+        s.wrapW = j.value("wrap", 0.f);
         break;
     case SH_IMAGE:
         s.asset = j.value("asset", std::string());
@@ -2022,44 +2098,27 @@ static void add_text_bold(ImDrawList* dl, ImFont* f, float px, ImVec2 p, ImU32 c
     dl->AddText(f, px, ImVec2(p.x + px * 0.03f, p.y), col, b, e);
 }
 
-// list lines ("• foo", "12. foo", optionally indented) pin to the left edge
-// even when the text block is centered/right-aligned
-static bool is_list_line(const char* b, const char* e) {
-    while (b < e && *b == ' ') b++;
-    if (e - b >= 3 && !memcmp(b, "\xe2\x80\xa2", 3)) return true;
-    const char* d = b;
-    while (d < e && isdigit((unsigned char)*d)) d++;
-    return d > b && d < e && *d == '.' && (d + 1 == e || d[1] == ' ');
-}
-
 static void draw_text_shape(ImDrawList* dl, const Shape& s) {
-    float px = text_px(s) * g_cam.zoom;
+    float pxW = text_px(s);              // world px — the layout space
+    float px = pxW * g_cam.zoom;
     ImVec2 sp = W2S(s.pos);
     ImU32 col = shape_ink(s);
     ImFont* f = g_fonts[s.family];
     float rp = fminf(px, kMaxGlyphPx);   // raster size; geometry scales the rest
     float k = px / rp;
+    float lk = rp / pxW;                 // layout (world) units → raster units
     int vtx0 = dl->VtxBuffer.Size;
-    // draw line by line at the origin so alignment offsets are easy, then
-    // scale+translate (and rotate) the whole vertex range into place
+    // lay out in world units (breaks/offsets match hit-testing exactly), draw
+    // line by line at the origin, then scale+translate (and rotate) the whole
+    // vertex range into place
+    static TextLayout lay;   // reused across calls (single-threaded)
+    layout_text(s.text, f, pxW, s.align, s.wrapW, lay);
     ImGui::PushFont(f, rp);
-    float totalW = ImGui::CalcTextSize(s.text.c_str()).x;
-    const char* b = s.text.c_str();
-    const char* end = b + s.text.size();
-    float y = 0;
-    while (b < end) {
-        const char* e = (const char*)memchr(b, '\n', end - b);
-        if (!e) e = end;
-        if (e > b) {
-            float x = 0.f;
-            if (s.align && !is_list_line(b, e)) {
-                float w = ImGui::CalcTextSize(b, e).x;
-                x = s.align == 1 ? (totalW - w) * 0.5f : (totalW - w);
-            }
-            add_text_bold(dl, f, rp, ImVec2(x, y), col, b, e);
-        }
-        y += rp;
-        b = e < end ? e + 1 : end;
+    const char* base = s.text.c_str();
+    for (int i = 0; i < (int)lay.lines.size(); i++) {
+        const TextLine& ln = lay.lines[i];
+        if (ln.we > ln.b)
+            add_text_bold(dl, f, rp, ImVec2(ln.x * lk, i * rp), col, base + ln.b, base + ln.we);
     }
     ImGui::PopFont();
     for (int i = vtx0; i < dl->VtxBuffer.Size; i++) {
@@ -2442,7 +2501,7 @@ static void copy_text_to_clipboard(const std::string& utf8) {
 
 // ─────────────────────────── canvas interaction ────────────────────────────
 enum DragMode { DM_NONE = 0, DM_PENDING, DM_MOVE, DM_MARQUEE, DM_HANDLE, DM_CROP, DM_ROTATE,
-                DM_ARROW_A, DM_ARROW_B, DM_BEND, DM_NEW_ARROW, DM_PAN_R };
+                DM_WRAP, DM_ARROW_A, DM_ARROW_B, DM_BEND, DM_NEW_ARROW, DM_PAN_R };
 static DragMode g_drag = DM_NONE;
 static ImVec2   g_dragStartW, g_dragStartS;    // world/screen at mousedown
 static WRect    g_moveStartBounds;             // selection bounds when the move began
@@ -2464,6 +2523,9 @@ static float current_rot_delta(ImVec2 mw, bool shiftSnap) {
     return dth;
 }
 static std::vector<std::pair<uint64_t, Shape>> g_handleStartShapes;  // id → snapshot
+static double   g_wrapClickAt = -1;            // side-handle double-click (= reset to auto-size)
+static uint64_t g_wrapClickId = 0;
+static int      g_wrapClickIdx = -1;
 static uint64_t g_newArrowId = 0;
 static bool     g_rDrag = false;               // right button turned into a pan
 
@@ -2527,6 +2589,19 @@ static uint64_t create_text_at(ImVec2 w) {
     s.pos.y -= kTextSizes[s.tsize] * 0.5f;
     g_doc.shapes.push_back(s);
     return s.id;
+}
+
+// Re-box a text: new left edge + wrap width in the SNAPSHOT's local frame
+// (wrap 0 = auto-size). Reflow changes the extent, and rotation pivots on the
+// rect's own center — so place the new rect's center where the OLD frame maps
+// it, keeping the fixed edge and top visually pinned while the box changes.
+static void apply_text_wrap(Shape& s, const Shape& snap, float newLeft, float newW) {
+    ImVec2 c0 = shape_local_rect(snap).center();
+    s.wrapW = newW;
+    ImVec2 ext = text_extent(s);
+    ImVec2 cl(newLeft + ext.x * 0.5f, snap.pos.y + ext.y * 0.5f);
+    ImVec2 cw = snap.rot != 0.f ? rot_about(cl, c0, snap.rot) : cl;
+    s.pos = cw - ext * 0.5f;
 }
 
 // bind an arrow end to whatever shape sits under `w` (excluding the arrow itself)
@@ -2702,6 +2777,16 @@ static int draw_selection_ui(ImDrawList* dl, bool handlesActive) {
     const float r = 5.f;
     for (int i = 0; i < 4; i++)
         if (vlen(m - g_selCorners[i]) < r + 3) hover = i;
+    // side handles on a single text: drag sets the wrap width (dbl-click resets)
+    bool sides = single && single->type == SH_TEXT;
+    ImVec2 sideMid[2];
+    if (sides) {
+        sideMid[0] = (g_selCorners[0] + g_selCorners[3]) * 0.5f;   // 8 = left edge
+        sideMid[1] = (g_selCorners[1] + g_selCorners[2]) * 0.5f;   // 9 = right edge
+        if (hover < 0)
+            for (int i = 0; i < 2; i++)
+                if (vlen(m - sideMid[i]) < r + 2) hover = 8 + i;
+    }
     if (hover < 0)   // rotate ring: a band just outside each corner handle
         for (int i = 0; i < 4; i++) {
             float d = vlen(m - g_selCorners[i]);
@@ -2711,7 +2796,13 @@ static int draw_selection_ui(ImDrawList* dl, bool handlesActive) {
         dl->AddCircleFilled(g_selCorners[i], r, g_th.handleFill);
         dl->AddCircle(g_selCorners[i], r, g_th.selStroke, 0, 1.5f);
     }
-    if (hover >= 4) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (sides)
+        for (int i = 0; i < 2; i++) {
+            dl->AddCircleFilled(sideMid[i], 3.5f, g_th.handleFill);
+            dl->AddCircle(sideMid[i], 3.5f, g_th.selStroke, 0, 1.5f);
+        }
+    if (hover >= 8) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    else if (hover >= 4) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     return hover;
 }
 
@@ -3421,37 +3512,22 @@ static float g_editShiftTopY = 0.f, g_editShiftPx = 1.f;
 static const bool kWysiwygAlignEdit = false;
 static const bool kWysiwygRotEdit = false;
 
-// map a canvas click to a byte offset in the shape's text (committed layout:
-// alignment + list-pinning + rotation aware) so the editor opens with the
-// caret exactly under the mouse
-static int caret_index_from_click(const Shape& s, ImVec2 clickW) {
-    if (s.text.empty()) return 0;
-    WRect lr = shape_local_rect(s);
-    ImVec2 p = s.rot != 0.f ? rot_about(clickW, lr.center(), -s.rot) : clickW;
+// map a LOCAL-frame point to a byte offset via the committed layout (wrap +
+// alignment + list-pinning aware): line by y, nearest inter-char boundary by x
+static int caret_index_at_local(const Shape& s, const TextLayout& lay, ImVec2 pl) {
+    if (lay.lines.empty()) return 0;
     float lh = text_px(s);
-    ImGui::PushFont(g_fonts[s.family], lh);
-    float totalW = ImGui::CalcTextSize(s.text.c_str()).x;
+    int li = (int)floorf((pl.y - s.pos.y) / lh);
+    li = li < 0 ? 0 : (li >= (int)lay.lines.size() ? (int)lay.lines.size() - 1 : li);
+    const TextLine& ln = lay.lines[li];
     const char* base = s.text.c_str();
-    const char* end = base + s.text.size();
-    int line = (int)floorf((p.y - lr.mn.y) / lh);
-    const char* b = base;
-    for (int li = 0; li < line; li++) {
-        const char* nl = (const char*)memchr(b, '\n', end - b);
-        if (!nl) break;
-        b = nl + 1;
-    }
-    const char* e = (const char*)memchr(b, '\n', end - b);
-    if (!e) e = end;
-    float dx = 0.f;
-    if (s.align && !is_list_line(b, e)) {
-        float w = ImGui::CalcTextSize(b, e).x;
-        dx = s.align == 1 ? (totalW - w) * 0.5f : (totalW - w);
-    }
-    float x = (p.x - lr.mn.x) - dx;
+    const char* b = base + ln.b;
+    const char* e = base + ln.we;
+    float x = (pl.x - s.pos.x) - ln.x;
+    ImGui::PushFont(g_fonts[s.family], lh);
     const char* c = b;
     while (c < e) {   // nearest inter-character boundary wins
-        int cl = (*c & 0x80) == 0 ? 1 : (*c & 0xE0) == 0xC0 ? 2 : (*c & 0xF0) == 0xE0 ? 3 : 4;
-        const char* n = (c + cl > e) ? e : c + cl;
+        const char* n = (c + utf8_len(c) > e) ? e : c + utf8_len(c);
         float w0 = ImGui::CalcTextSize(b, c).x;
         float w1 = ImGui::CalcTextSize(b, n).x;
         if (x < (w0 + w1) * 0.5f) break;
@@ -3459,6 +3535,17 @@ static int caret_index_from_click(const Shape& s, ImVec2 clickW) {
     }
     ImGui::PopFont();
     return (int)(c - base);
+}
+
+// map a canvas click to a byte offset in the shape's text (committed layout,
+// rotation aware) so the editor opens with the caret exactly under the mouse
+static int caret_index_from_click(const Shape& s, ImVec2 clickW) {
+    if (s.text.empty()) return 0;
+    WRect lr = shape_local_rect(s);
+    ImVec2 p = s.rot != 0.f ? rot_about(clickW, lr.center(), -s.rot) : clickW;
+    static TextLayout lay;
+    layout_text(s.text, g_fonts[s.family], text_px(s), s.align, s.wrapW, lay);
+    return caret_index_at_local(s, lay, p);
 }
 
 static void edit_line_offsets(const std::string& text, ImFont* f, float px, int align, std::vector<float>& out) {
@@ -3829,6 +3916,27 @@ static void CanvasFrame() {
                     goto down_done;
                 }
             }
+            if (hoverHandle >= 8 && g_sel.size() == 1) {
+                // side handle on a text: drag = set wrap width; a quick second
+                // press on the same handle = back to auto-size
+                Shape* s = find_shape(g_sel[0]);
+                if (s && s->type == SH_TEXT) {
+                    double now = ImGui::GetTime();
+                    bool dbl = now - g_wrapClickAt < 0.32 && g_wrapClickId == s->id && g_wrapClickIdx == hoverHandle;
+                    g_wrapClickAt = now; g_wrapClickId = s->id; g_wrapClickIdx = hoverHandle;
+                    if (dbl && s->wrapW > 0.f) {
+                        Shape snap = *s;
+                        apply_text_wrap(*s, snap, snap.pos.x, 0.f);
+                        push_undo();
+                        g_drag = DM_NONE;
+                    } else {
+                        g_drag = DM_WRAP; g_handleIdx = hoverHandle;
+                        g_handleStartShapes.clear();
+                        g_handleStartShapes.push_back({ s->id, *s });
+                    }
+                }
+                goto down_done;
+            }
             if (hoverHandle >= 0) {
                 g_handleStartShapes.clear();
                 std::vector<uint64_t> all = g_sel;
@@ -3931,7 +4039,8 @@ static void CanvasFrame() {
             Shape* s = find_shape(id); if (!s) continue;
             auto sc = [&](ImVec2 p) { return fixed + (p - fixed) * k; };
             switch (s->type) {
-            case SH_TEXT:  s->pos = sc(snap.pos); s->scale = snap.scale * k; break;
+            case SH_TEXT:  s->pos = sc(snap.pos); s->scale = snap.scale * k;
+                           s->wrapW = snap.wrapW * k; break;   // wrap box scales with the glyphs
             case SH_IMAGE: s->pos = sc(snap.pos); s->size = snap.size * k; break;
             case SH_ARROW:
                 if (!snap.a.bind) s->a.p = sc(snap.a.p);
@@ -3963,6 +4072,22 @@ static void CanvasFrame() {
             }
         }
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    }
+
+    if (g_drag == DM_WRAP && !g_handleStartShapes.empty()) {
+        Shape* s = find_shape(g_handleStartShapes[0].first);
+        const Shape& snap = g_handleStartShapes[0].second;
+        if (s) {
+            // work in the snapshot's local frame (fixed all drag, like crop)
+            WRect lr0 = shape_local_rect(snap);
+            ImVec2 ml = snap.rot != 0.f ? rot_about(mw, lr0.center(), -snap.rot) : mw;
+            float minW = text_px(snap) * 1.5f;   // never collapse below ~a char
+            float newLeft, newW;
+            if (g_handleIdx == 9) { newLeft = lr0.mn.x; newW = fmaxf(ml.x - lr0.mn.x, minW); }
+            else                  { newW = fmaxf(lr0.mx.x - ml.x, minW); newLeft = lr0.mx.x - newW; }
+            apply_text_wrap(*s, snap, newLeft, newW);
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        }
     }
 
     if (g_drag == DM_CROP && !g_handleStartShapes.empty()) {
@@ -4072,7 +4197,8 @@ static void CanvasFrame() {
         }
 
         if (g_drag == DM_MOVE || g_drag == DM_HANDLE || g_drag == DM_CROP ||
-            g_drag == DM_ROTATE || g_drag == DM_ARROW_A || g_drag == DM_ARROW_B || g_drag == DM_BEND)
+            g_drag == DM_ROTATE || g_drag == DM_WRAP ||
+            g_drag == DM_ARROW_A || g_drag == DM_ARROW_B || g_drag == DM_BEND)
             push_undo();
 
         if (g_drag == DM_NEW_ARROW) {
