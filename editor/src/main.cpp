@@ -3043,13 +3043,14 @@ static void draw_update(ImVec2 mw) {
         // 0.22, brisk ~2000 ≈ 0.14, hard flick ≈ 0.
         float speed = vlen(mw - g_drawPrevMouse) / dt * g_cam.zoom;
         float target = g_penPressure >= 0.f ? g_penPressure : expf(-speed / 1000.f);
-        // Asymmetric adaptation (perfect-freehand's trick): thinning is snappy,
-        // thickening is SLOW and scales with speed — it freezes as the hand
-        // stops. Otherwise the deceleration frames at the end of a flick let
-        // the pressure spring back and the tail ends in a blob instead of
-        // staying thin (user report). Real pen pressure just tracks fast.
+        // Asymmetric adaptation (perfect-freehand's trick): thinning is snappy;
+        // thickening is quick once the hand is actually MOVING slowly (~83ms —
+        // slower felt sluggish when easing off mid-stroke, per user) but scales
+        // to zero at rest, so the brief deceleration at the end of a flick
+        // can't spring the width back — tails keep their thin tip instead of
+        // ending in a blob. Real pen pressure just tracks fast.
         float rate = (g_penPressure >= 0.f || target < g_drawPressure)
-                     ? 40.f : fminf(8.f, speed / 150.f);
+                     ? 40.f : 12.f * fminf(1.f, speed / 350.f);
         g_drawPressure += (target - g_drawPressure) * fminf(dt * rate, 1.f);
         ImVec2 lastW = draw_from_local(*s, s->pts.back());
         if (vlen(g_drawSmooth - lastW) * g_cam.zoom > 2.f) {   // min 2 screen px per point

@@ -165,7 +165,7 @@ hand speed (zoom-independent) through an EXPONENTIAL curve (`exp(-speed/1000)`
 nominal, strokes open at pressure 0.85 (fat head) — tuned per user against a
 tldraw sample stroke. Adaptation is ASYMMETRIC (perfect-freehand's trick):
 thinning is snappy (40/s), thickening is slow and SCALES WITH SPEED
-(≤8/s, ∝speed/150 — frozen at rest), because symmetric adaptation let the
+(12/s once moving, scaling to zero below ~350px/s — frozen at rest), because symmetric adaptation let the
 deceleration frames at the end of a flick spring the width back up — tails
 ended in a blob instead of staying thin. Iterated four times on user feedback;
 tune against the replay harness (scratchpad python that replicates
