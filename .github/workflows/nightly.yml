@@ -116,7 +116,7 @@ jobs:
           cd "ffmpeg-${FFMPEG_VER}"
           ./configure --prefix="$HOME/deps" --enable-static --disable-shared \
             --disable-programs --disable-doc --disable-network --disable-autodetect \
-            --disable-avdevice --disable-avfilter --disable-postproc --disable-debug
+            --disable-avdevice --disable-avfilter --disable-debug
           make -j"$(nproc)"
           make install
       - name: fetch header deps (imgui / stb / nlohmann)
