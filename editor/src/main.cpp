@@ -2608,37 +2608,56 @@ static void DrawContextMenu() {
 }
 
 // ── video controls (selected video only) ──
-// Selecting a video grows a floating pill at its center: play/stop, time,
-// click-to-seek bar, A-B loop. The pill is drawn BY HAND on the foreground
-// drawlist and hit-tested manually (no imgui window), so the canvas always
-// owns the mouse: dragging anywhere on the pill — seek bar included — moves
-// the video; a STILL CLICK acts the control under it on release (seek jumps
-// to the clicked position). Rotated videos rotate the pill rigidly (vertices
+// A selected video shows a MINI pill (play/stop) tucked in its bottom-right
+// corner while the pointer is over it; hovering the mini pill escalates to
+// the FULL pill (seek bar, time, A-B loop) centered on the video, which drops
+// back after a 0.5s timeout once the pointer leaves it. Everything is drawn
+// BY HAND on the foreground drawlist and hit-tested manually (no imgui
+// window), so the canvas always owns the mouse: dragging anywhere on a pill —
+// seek bar included — moves the video (the pills fade out smoothly with the
+// drag); a STILL CLICK acts the control under it on release (seek jumps to
+// the clicked position). Rotated videos rotate the pills rigidly (vertices
 // turned about the video center, hit points inverse-rotated), so hitboxes sit
 // exactly on the drawn pixels. Gifs just loop with no chrome.
 enum OverlayCtl { OV_PLAY = 0, OV_STOP, OV_SEEK, OV_A, OV_B, OV_CLR, OV_COUNT };
-static uint64_t g_overlayVid = 0;      // video whose pill is showing (kept through fade-out)
-static float    g_overlayAlpha = 0.f;  // fade envelope
-static bool     g_ovLive = false;      // pill accepts clicks (read by CanvasFrame)
-static ImVec2   g_ovTL, g_ovSize;      // pill rect (unrotated screen space)
-static ImVec2   g_ovPivot;             // rotation pivot = video center (screen)
+static uint64_t g_overlayVid = 0;       // video whose pills are showing (kept through fade-out)
+static float    g_ovAlphaFull = 0.f, g_ovAlphaMini = 0.f;   // fade envelopes
+static bool     g_ovLive = false;       // full pill accepts clicks (read by CanvasFrame)
+static bool     g_ovMiniLive = false;   // mini pill is shown + would accept clicks
+static bool     g_ovFull = false;       // escalated to the full pill
+static double   g_ovFullLoseAt = 0;     // de-escalation deadline once the full pill isn't hovered
+static ImVec2   g_ovTL, g_ovSize;          // full pill rect (unrotated screen space)
+static ImVec2   g_ovMiniTL, g_ovMiniSize;  // mini pill rect
+static ImVec2   g_ovPivot;              // rotation pivot = video center (screen)
 static float    g_ovRot = 0.f;
-static WRect    g_ovCtl[OV_COUNT];     // control hit rects, pill-local
-static int      g_overlayDownCtl = -2; // at press: control index, -1 = pill dead-space, -2 = press not on pill
+static WRect    g_ovCtl[OV_COUNT];      // full-pill control hit rects, pill-local
+static WRect    g_ovMiniCtl[2];         // mini-pill buttons (play, stop), mini-local
+static int      g_overlayDownCtl = -2;  // at press: control index, -1 = pill dead-space, -2 = press not on a pill
 
-static ImVec2 overlay_local(ImVec2 s) {
-    ImVec2 p = g_ovRot != 0.f ? rot_about(s, g_ovPivot, -g_ovRot) : s;
-    return p - g_ovTL;
+static ImVec2 overlay_unrot(ImVec2 s) { return g_ovRot != 0.f ? rot_about(s, g_ovPivot, -g_ovRot) : s; }
+static bool ov_in(ImVec2 s, ImVec2 tl, ImVec2 size) {
+    ImVec2 p = overlay_unrot(s) - tl;
+    return p.x >= 0 && p.y >= 0 && p.x <= size.x && p.y <= size.y;
 }
+// the mini AREA keeps responding while the full pill is up: the user just saw
+// play/stop there and may click before (or while) the swap animates. Where
+// the full pill overlaps it, the full pill's controls win (checked first).
 static bool overlay_contains(ImVec2 s) {
-    if (!g_ovLive) return false;
-    ImVec2 l = overlay_local(s);
-    return l.x >= 0 && l.y >= 0 && l.x <= g_ovSize.x && l.y <= g_ovSize.y;
+    return (g_ovLive && ov_in(s, g_ovTL, g_ovSize)) ||
+           ((g_ovMiniLive || g_ovLive) && ov_in(s, g_ovMiniTL, g_ovMiniSize));
 }
 static int overlay_ctl_at(ImVec2 s) {
-    if (!g_ovLive) return -1;
-    ImVec2 l = overlay_local(s);
-    for (int i = 0; i < OV_COUNT; i++) if (g_ovCtl[i].contains(l)) return i;
+    if (g_ovLive && ov_in(s, g_ovTL, g_ovSize)) {
+        ImVec2 l = overlay_unrot(s) - g_ovTL;
+        for (int i = 0; i < OV_COUNT; i++) if (g_ovCtl[i].contains(l)) return i;
+        return -1;
+    }
+    if ((g_ovMiniLive || g_ovLive) && ov_in(s, g_ovMiniTL, g_ovMiniSize)) {
+        ImVec2 l = overlay_unrot(s) - g_ovMiniTL;
+        if (g_ovMiniCtl[0].contains(l)) return OV_PLAY;
+        if (g_ovMiniCtl[1].contains(l)) return OV_STOP;
+        return -1;
+    }
     return -1;
 }
 
@@ -2647,11 +2666,19 @@ static void fmt_time(char* buf, size_t n, double t) {
     snprintf(buf, n, "%d:%02d", s / 60, s % 60);
 }
 
+// play / pause / stop glyph centered at c
+static void ov_icon(ImDrawList* dl, ImVec2 c, float r, int icon, ImU32 col) {
+    if (icon == 0)      dl->AddTriangleFilled(c + ImVec2(-r * 0.7f, -r), c + ImVec2(-r * 0.7f, r), c + ImVec2(r, 0), col);
+    else if (icon == 1) { dl->AddRectFilled(c + ImVec2(-r * 0.8f, -r), c + ImVec2(-r * 0.15f, r), col, 1.f);
+                          dl->AddRectFilled(c + ImVec2(r * 0.15f, -r), c + ImVec2(r * 0.8f, r), col, 1.f); }
+    else                dl->AddRectFilled(c + ImVec2(-r * 0.8f, -r * 0.8f), c + ImVec2(r * 0.8f, r * 0.8f), col, 1.f);
+}
+
 static void DrawVideoOverlay() {
 #ifdef TEI_LIBAV
     ImGuiIO& io = ImGui::GetIO();
     bool editing = g_editText || g_editLabelArrow;
-    bool dragging = g_drag != DM_NONE && g_drag != DM_PENDING;   // pending = a press, maybe on the pill
+    bool dragging = g_drag != DM_NONE && g_drag != DM_PENDING;   // pending = a press, maybe on a pill
     Shape* sel = nullptr;   // the single selected video, if that's the selection
     if (!editing && g_sel.size() == 1) {
         Shape* c = find_shape(g_sel[0]);
@@ -2660,40 +2687,48 @@ static void DrawVideoOverlay() {
     if (sel) g_overlayVid = sel->id;
     Shape* v = g_overlayVid ? find_shape(g_overlayVid) : nullptr;
     if (v && (v->type != SH_IMAGE || media_kind(v->asset) != MK_VIDEO)) v = nullptr;   // undo/replace churn
-    // hover-gated: the pill fades away when the pointer leaves both the video
-    // and the pill itself (short linger avoids flicker at the edges); a press
-    // that started on the pill holds it
-    bool hover = g_overlayDownCtl != -2;
-    if (sel && !hover) {
+
+    // ── mini/full state machine (pill rects are last frame's layout) ──
+    bool pressHold = g_overlayDownCtl != -2;   // a press that started on a pill holds things open
+    bool hoverVid = false;
+    if (sel) {
         WRect b = shape_local_rect(*sel);
         ImVec2 p = sel->rot != 0.f ? rot_about(S2W(io.MousePos), b.center(), -sel->rot) : S2W(io.MousePos);
-        hover = b.contains(p);
+        hoverVid = b.contains(p);
     }
-    if (!hover && g_overlayVid) {   // pill rect from last frame's layout
-        ImVec2 l = overlay_local(io.MousePos);
-        hover = l.x >= 0 && l.y >= 0 && l.x <= g_ovSize.x && l.y <= g_ovSize.y;
-    }
-    static double loseAt = 0;
+    bool hoverMini = g_overlayVid && ov_in(io.MousePos, g_ovMiniTL, g_ovMiniSize);
+    bool hoverFull = g_overlayVid && ov_in(io.MousePos, g_ovTL, g_ovSize);
     double now = ImGui::GetTime();
-    if (hover) loseAt = 0;
-    else if (!loseAt) loseAt = now + 0.3;
-    bool want = sel != nullptr && !dragging && (hover || now < loseAt);
-    if (want)          g_overlayAlpha = fminf(1.f, g_overlayAlpha + io.DeltaTime / 0.12f);
-    else if (dragging) g_overlayAlpha = 0.f;   // drags hide it instantly
-    else               g_overlayAlpha = fmaxf(0.f, g_overlayAlpha - io.DeltaTime / 0.15f);
-    g_ovLive = want && v != nullptr;
-    if (!v || g_overlayAlpha <= 0.f) {
+    if (!sel) { g_ovFull = false; g_ovFullLoseAt = 0; }
+    else if (!g_ovFull) {
+        // hovering the (visible) mini pill escalates to the full controls
+        if (hoverMini && g_ovAlphaMini > 0.5f && !pressHold) { g_ovFull = true; g_ovFullLoseAt = 0; }
+    } else {
+        if (hoverFull || hoverMini || pressHold) g_ovFullLoseAt = 0;
+        else if (!g_ovFullLoseAt) g_ovFullLoseAt = now + 0.5;   // timeout starts when the pointer leaves
+        else if (now >= g_ovFullLoseAt) { g_ovFull = false; g_ovFullLoseAt = 0; }
+    }
+    bool wantFull = sel && !dragging && g_ovFull;
+    bool wantMini = sel && !dragging && !g_ovFull && (hoverVid || hoverMini || pressHold);
+    auto fade = [&](float a, bool want) {
+        return want ? fminf(1.f, a + io.DeltaTime / 0.12f) : fmaxf(0.f, a - io.DeltaTime / 0.15f);
+    };
+    g_ovAlphaFull = fade(g_ovAlphaFull, wantFull);
+    g_ovAlphaMini = fade(g_ovAlphaMini, wantMini);
+    g_ovLive = wantFull && v != nullptr;
+    g_ovMiniLive = wantMini && v != nullptr;
+    if (!v || (g_ovAlphaFull <= 0.f && g_ovAlphaMini <= 0.f)) {
         if (!v) g_overlayVid = 0;
-        g_ovLive = false;
+        g_ovLive = g_ovMiniLive = false;
         if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) g_overlayDownCtl = -2;
         return;
     }
     VideoDecoder* d = get_decoder(v->asset);
-    if (!d) { g_overlayVid = 0; g_ovLive = false; return; }
+    if (!d) { g_overlayVid = 0; g_ovLive = g_ovMiniLive = false; return; }
     PlayState& ps = g_play[v->id];
     double dur = d->duration();
 
-    // ── layout (pill-local px; origin = pill top-left) ──
+    // ── layout (unrotated screen space; control rects pill-local) ──
     WRect lb = shape_local_rect(*v);
     ImVec2 cs = W2S(lb.center());
     ImFont* f = ImGui::GetFont(); float fs = ImGui::GetFontSize();
@@ -2718,6 +2753,12 @@ static void DrawVideoOverlay() {
     g_ovCtl[OV_B]    = { ImVec2(pad + 26.f, y2), ImVec2(pad + 48.f, y2 + small) };
     g_ovCtl[OV_CLR]  = haveLoop ? WRect{ ImVec2(pad + 52.f, y2), ImVec2(pad + 74.f, y2 + small) }
                                 : WRect{ ImVec2(-9999.f, -9999.f), ImVec2(-9999.f, -9999.f) };
+    // mini pill: bottom-right corner of the video, inset 8px
+    const float mb = 22.f, mpad = 4.f;
+    g_ovMiniSize = ImVec2(mpad + mb + 2.f + mb + mpad, mb + mpad * 2);
+    g_ovMiniTL = W2S(lb.mx) - g_ovMiniSize - ImVec2(8.f, 8.f);
+    g_ovMiniCtl[0] = { ImVec2(mpad, mpad), ImVec2(mpad + mb, mpad + mb) };
+    g_ovMiniCtl[1] = { ImVec2(mpad + mb + 2.f, mpad), ImVec2(mpad + mb + 2.f + mb, mpad + mb) };
 
     // ── still-click actions. Press bookkeeping is CanvasFrame's: it targets
     // the video for drags and hands us the pressed control index. ──
@@ -2727,7 +2768,7 @@ static void DrawVideoOverlay() {
         case OV_PLAY: ps.playing = !ps.playing; break;
         case OV_STOP: ps.playing = false; ps.t = 0; break;
         case OV_SEEK: if (dur > 0) {
-            float u = (overlay_local(io.MousePos).x - g_ovCtl[OV_SEEK].mn.x) / fmaxf(g_ovCtl[OV_SEEK].size().x, 1.f);
+            float u = (overlay_unrot(io.MousePos).x - g_ovTL.x - g_ovCtl[OV_SEEK].mn.x) / fmaxf(g_ovCtl[OV_SEEK].size().x, 1.f);
             ps.t = fminf(fmaxf(u, 0.f), 1.f) * dur;
         } break;
         case OV_A: v->loopA = (float)ps.t; if (v->loopB >= 0 && v->loopB <= v->loopA) v->loopB = -1; push_undo(); break;
@@ -2736,77 +2777,91 @@ static void DrawVideoOverlay() {
         }
     }
 
-    // ── draw (unrotated, then the vertex range is rotated + faded) ──
+    // ── draw (unrotated, then each pill's vertex range is rotated + faded) ──
     ImDrawList* dl = ImGui::GetForegroundDrawList();
-    int vtx0 = dl->VtxBuffer.Size;
-    ImVec2 TL = g_ovTL;
-    ImVec2 lm = overlay_local(io.MousePos);
+    ImVec2 um = overlay_unrot(io.MousePos);
     bool mdown = ImGui::IsMouseDown(ImGuiMouseButton_Left);
-    auto hot = [&](int i) {   // hover highlight; while pressing only the pressed control lights
-        if (!g_ovLive) return false;
-        return mdown ? g_overlayDownCtl == i : g_ovCtl[i].contains(lm);
-    };
-    dl->AddRectFilled(TL, TL + g_ovSize, g_th.panelBg, 10.f);
-    dl->AddRect(TL, TL + g_ovSize, g_th.panelBorder, 10.f);
-    auto icon_button = [&](int i, int icon /*0 play 1 pause 2 stop*/) {
-        ImVec2 p = TL + g_ovCtl[i].mn, sz = g_ovCtl[i].size();
-        if (hot(i)) dl->AddRectFilled(p, p + sz, IM_COL32(255, 255, 255, mdown ? 36 : 20), 6.f);
-        ImVec2 c = p + sz * 0.5f;
-        ImU32 col = g_th.textMain;
-        float r = 6.f;
-        if (icon == 0)      dl->AddTriangleFilled(c + ImVec2(-r * 0.7f, -r), c + ImVec2(-r * 0.7f, r), c + ImVec2(r, 0), col);
-        else if (icon == 1) { dl->AddRectFilled(c + ImVec2(-r * 0.8f, -r), c + ImVec2(-r * 0.15f, r), col, 1.f);
-                              dl->AddRectFilled(c + ImVec2(r * 0.15f, -r), c + ImVec2(r * 0.8f, r), col, 1.f); }
-        else                dl->AddRectFilled(c + ImVec2(-r * 0.8f, -r * 0.8f), c + ImVec2(r * 0.8f, r * 0.8f), col, 1.f);
-    };
-    icon_button(OV_PLAY, ps.playing ? 1 : 0);
-    icon_button(OV_STOP, 2);
-    dl->AddText(f, fs, TL + ImVec2(g_ovCtl[OV_STOP].mx.x + 10.f, pad + (bh - fs) * 0.5f), g_th.textDim, times);
-    {   // seek bar: track + progress + A/B marks + knob
-        WRect sk = g_ovCtl[OV_SEEK];
-        float ty = (sk.mn.y + sk.mx.y) * 0.5f;
-        ImVec2 tmn = TL + ImVec2(sk.mn.x, ty - 3.f), tmx = TL + ImVec2(sk.mx.x, ty + 3.f);
-        dl->AddRectFilled(tmn, tmx, IM_COL32(128, 128, 128, 70), 3.f);
-        float u = dur > 0 ? (float)(ps.t / dur) : 0.f;
-        u = u < 0 ? 0 : (u > 1 ? 1 : u);
-        float kx = tmn.x + (tmx.x - tmn.x) * u;
-        dl->AddRectFilled(tmn, ImVec2(kx, tmx.y), g_th.accent, 3.f);
-        auto mark = [&](float sec, ImU32 col) {
-            if (sec < 0 || dur <= 0) return;
-            float x = tmn.x + (tmx.x - tmn.x) * (float)(sec / dur);
-            dl->AddRectFilled(ImVec2(x - 1.5f, tmn.y - 3.f), ImVec2(x + 1.5f, tmx.y + 3.f), col, 1.f);
+    int vtxM0 = dl->VtxBuffer.Size;
+    if (g_ovAlphaMini > 0.f) {
+        ImVec2 TL = g_ovMiniTL;
+        dl->AddRectFilled(TL, TL + g_ovMiniSize, g_th.panelBg, 8.f);
+        dl->AddRect(TL, TL + g_ovMiniSize, g_th.panelBorder, 8.f);
+        for (int i = 0; i < 2; i++) {
+            int id = i == 0 ? OV_PLAY : OV_STOP;
+            ImVec2 p = TL + g_ovMiniCtl[i].mn, sz = g_ovMiniCtl[i].size();
+            bool hv = g_ovMiniLive && (mdown ? g_overlayDownCtl == id : g_ovMiniCtl[i].contains(um - TL));
+            if (hv) dl->AddRectFilled(p, p + sz, IM_COL32(255, 255, 255, mdown ? 36 : 20), 5.f);
+            ov_icon(dl, p + sz * 0.5f, 5.f, i == 0 ? (ps.playing ? 1 : 0) : 2, g_th.textMain);
+        }
+    }
+    int vtxF0 = dl->VtxBuffer.Size;
+    if (g_ovAlphaFull > 0.f) {
+        ImVec2 TL = g_ovTL;
+        ImVec2 lm = um - TL;
+        auto hot = [&](int i) {   // hover highlight; while pressing only the pressed control lights
+            if (!g_ovLive) return false;
+            return mdown ? g_overlayDownCtl == i : g_ovCtl[i].contains(lm);
         };
-        mark(v->loopA, IM_COL32(120, 220, 120, 230));
-        mark(v->loopB, IM_COL32(235, 120, 120, 230));
-        dl->AddCircleFilled(ImVec2(kx, TL.y + ty), hot(OV_SEEK) ? 7.f : 5.5f, g_th.textMain);
+        dl->AddRectFilled(TL, TL + g_ovSize, g_th.panelBg, 10.f);
+        dl->AddRect(TL, TL + g_ovSize, g_th.panelBorder, 10.f);
+        auto icon_button = [&](int i, int icon) {
+            ImVec2 p = TL + g_ovCtl[i].mn, sz = g_ovCtl[i].size();
+            if (hot(i)) dl->AddRectFilled(p, p + sz, IM_COL32(255, 255, 255, mdown ? 36 : 20), 6.f);
+            ov_icon(dl, p + sz * 0.5f, 6.f, icon, g_th.textMain);
+        };
+        icon_button(OV_PLAY, ps.playing ? 1 : 0);
+        icon_button(OV_STOP, 2);
+        dl->AddText(f, fs, TL + ImVec2(g_ovCtl[OV_STOP].mx.x + 10.f, pad + (bh - fs) * 0.5f), g_th.textDim, times);
+        {   // seek bar: track + progress + A/B marks + knob
+            WRect sk = g_ovCtl[OV_SEEK];
+            float ty = (sk.mn.y + sk.mx.y) * 0.5f;
+            ImVec2 tmn = TL + ImVec2(sk.mn.x, ty - 3.f), tmx = TL + ImVec2(sk.mx.x, ty + 3.f);
+            dl->AddRectFilled(tmn, tmx, IM_COL32(128, 128, 128, 70), 3.f);
+            float u = dur > 0 ? (float)(ps.t / dur) : 0.f;
+            u = u < 0 ? 0 : (u > 1 ? 1 : u);
+            float kx = tmn.x + (tmx.x - tmn.x) * u;
+            dl->AddRectFilled(tmn, ImVec2(kx, tmx.y), g_th.accent, 3.f);
+            auto mark = [&](float sec, ImU32 col) {
+                if (sec < 0 || dur <= 0) return;
+                float x = tmn.x + (tmx.x - tmn.x) * (float)(sec / dur);
+                dl->AddRectFilled(ImVec2(x - 1.5f, tmn.y - 3.f), ImVec2(x + 1.5f, tmx.y + 3.f), col, 1.f);
+            };
+            mark(v->loopA, IM_COL32(120, 220, 120, 230));
+            mark(v->loopB, IM_COL32(235, 120, 120, 230));
+            dl->AddCircleFilled(ImVec2(kx, TL.y + ty), hot(OV_SEEK) ? 7.f : 5.5f, g_th.textMain);
+        }
+        auto text_button = [&](int i, const char* lbl) {
+            ImVec2 p = TL + g_ovCtl[i].mn, q = TL + g_ovCtl[i].mx;
+            dl->AddRectFilled(p, q, IM_COL32(255, 255, 255, hot(i) ? 36 : 14), 4.f);
+            ImVec2 ts = f->CalcTextSizeA(fs * 0.85f, FLT_MAX, 0.f, lbl);
+            dl->AddText(f, fs * 0.85f, (p + q) * 0.5f - ts * 0.5f, g_th.textMain, lbl);
+        };
+        text_button(OV_A, "A");
+        text_button(OV_B, "B");
+        if (haveLoop) {
+            text_button(OV_CLR, "x");
+            dl->AddText(f, fs * 0.85f, TL + ImVec2(pad + 80.f, y2 + 2.f), g_th.textDim, "loop");
+        }
     }
-    auto text_button = [&](int i, const char* lbl) {
-        ImVec2 p = TL + g_ovCtl[i].mn, q = TL + g_ovCtl[i].mx;
-        dl->AddRectFilled(p, q, IM_COL32(255, 255, 255, hot(i) ? 36 : 14), 4.f);
-        ImVec2 ts = f->CalcTextSizeA(fs * 0.85f, FLT_MAX, 0.f, lbl);
-        dl->AddText(f, fs * 0.85f, (p + q) * 0.5f - ts * 0.5f, g_th.textMain, lbl);
-    };
-    text_button(OV_A, "A");
-    text_button(OV_B, "B");
-    if (haveLoop) {
-        text_button(OV_CLR, "x");
-        dl->AddText(f, fs * 0.85f, TL + ImVec2(pad + 80.f, y2 + 2.f), g_th.textDim, "loop");
-    }
-
+    int vtxEnd = dl->VtxBuffer.Size;
     if (v->rot != 0.f) {
         float sn = sinf(v->rot), cn = cosf(v->rot);
-        for (int i = vtx0; i < dl->VtxBuffer.Size; i++) {
+        for (int i = vtxM0; i < vtxEnd; i++) {
             ImDrawVert& vx = dl->VtxBuffer[i];
             float dx = vx.pos.x - cs.x, dy = vx.pos.y - cs.y;
             vx.pos.x = cs.x + dx * cn - dy * sn;
             vx.pos.y = cs.y + dx * sn + dy * cn;
         }
     }
-    if (g_overlayAlpha < 1.f)
-        for (int i = vtx0; i < dl->VtxBuffer.Size; i++) {
+    auto fade_range = [&](int a, int b, float alpha) {
+        if (alpha >= 1.f) return;
+        for (int i = a; i < b; i++) {
             ImDrawVert& vx = dl->VtxBuffer[i];
-            vx.col = (vx.col & 0x00FFFFFF) | ((ImU32)((vx.col >> 24) * g_overlayAlpha) << 24);
+            vx.col = (vx.col & 0x00FFFFFF) | ((ImU32)((vx.col >> 24) * alpha) << 24);
         }
+    };
+    fade_range(vtxM0, vtxF0, g_ovAlphaMini);
+    fade_range(vtxF0, vtxEnd, g_ovAlphaFull);
 #endif
 }
 

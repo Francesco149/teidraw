@@ -32,20 +32,23 @@ stale nextId / empty texts. Single TU, builds warning-free.
 Session-5 polish + M3 move feel: arrows bound to a text stay pinned to their
 world point while the text reflows (anchors re-normalized per edit frame);
 a selected group drags from anywhere inside its bounding box (plain click
-inside still deselects). **Video pill, third iteration (imgui-window
-versions ripped out)**: the pill only exists while the video is the single
-selected shape, is drawn BY HAND on the foreground drawlist and hit-tested
-manually — no imgui window, so the canvas always owns the mouse. Dragging
-anywhere on the pill (seek bar included) moves the video; a STILL CLICK
-(<4px) acts the control under it on release — seek jumps to the clicked
-position, play/stop/A/B/x likewise. CanvasFrame's mousedown claims pill
-presses (overlay_contains → g_overlayDownCtl, downTarget = the video) and
-its release skips selection semantics for them; DrawVideoOverlay applies
-the action. Rotation is rigid vertex rotation about the video center with
-inverse-rotated hit points — hitboxes sit on the drawn pixels by
-construction. Hover-gated: fades out (0.3s linger + 0.15s) when the pointer
-leaves both video and pill, back in (0.12s) on re-hover; instant-hide
-during real drags (DM_PENDING and pill presses keep it). **Snap-move guides** (HOLD CTRL to snap — off by
+inside still deselects). **Video controls, final shape (imgui-window
+versions ripped out)**: a selected video shows a MINI pill (play/stop) in
+its bottom-right corner while the pointer is over the video; hovering the
+mini pill escalates to the FULL pill (seek, time, A-B loop) centered on
+the video, which de-escalates 0.5s after the pointer leaves it. Both are
+drawn BY HAND on the foreground drawlist and hit-tested manually — no
+imgui window, so the canvas always owns the mouse. Dragging anywhere on a
+pill (seek bar included) moves the video, pills fading out smoothly with
+the drag; a STILL CLICK (<4px) acts the control under it on release —
+seek jumps to the clicked position, play/stop/A/B/x likewise. The mini
+AREA stays click-responsive while the full pill is up (user just saw
+play/stop there; overlapping full controls win). CanvasFrame's mousedown
+claims pill presses (overlay_contains → g_overlayDownCtl, downTarget =
+the video) and its release skips selection semantics for them;
+DrawVideoOverlay applies the action. Rotation is rigid vertex rotation
+about the video center with inverse-rotated hit points — hitboxes sit on
+the drawn pixels by construction. **Snap-move guides** (HOLD CTRL to snap — off by
 default per user; moving bounds' edges+centers pull to other top-level
 shapes' edges+centers, 8 screen px, accent guide lines through both
 boxes), **shift = axis-lock drag**, **arrow-key nudge** (1 px, shift 10,
