@@ -3038,13 +3038,14 @@ static void draw_update(ImVec2 mw) {
             // simulated from HAND speed (screen px/s — zoom must not change
             // the feel). Exponential, not linear: a linear ramp to a flick
             // speed parks every ordinary stroke in the top fifth of the range
-            // and the taper never shows. Here careful ~300px/s ≈ 0.8, easy
-            // ~1000 ≈ 0.5, brisk ~2000 ≈ 0.24, flick ≈ 0 — visible contrast
-            // across speeds a hand actually uses.
+            // and the taper never shows. Tuned so a SMALL flick (~1500px/s)
+            // draws at half the width of careful strokes (tldraw's feel, per
+            // user): careful ~300px/s ≈ 0.74, easy ~1000 ≈ 0.37, small flick
+            // ~1500 ≈ 0.22, brisk ~2000 ≈ 0.14, hard flick ≈ 0.
             float speed = vlen(mw - g_drawPrevMouse) / dt * g_cam.zoom;
-            target = expf(-speed / 1400.f);
+            target = expf(-speed / 1000.f);
         }
-        g_drawPressure += (target - g_drawPressure) * fminf(dt * (g_penPressure >= 0.f ? 40.f : 30.f), 1.f);
+        g_drawPressure += (target - g_drawPressure) * fminf(dt * 40.f, 1.f);
         ImVec2 lastW = draw_from_local(*s, s->pts.back());
         if (vlen(g_drawSmooth - lastW) * g_cam.zoom > 2.f) {   // min 2 screen px per point
             s->pts.push_back(draw_to_local(*s, g_drawSmooth));

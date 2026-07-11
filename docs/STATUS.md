@@ -160,12 +160,14 @@ corners ("shrinking, disconnecting sharp angles"); per-segment rails + round
 wedges keep full width through any turn. Residual known cost: quads overlap
 in a small wedge on the INNER side of a sharp corner — invisible opaque,
 tiny localized double-blend translucent. Simulated pressure runs on SCREEN-space
-hand speed (zoom-independent) through an EXPONENTIAL curve (`exp(-speed/1400)`
-→ careful ~0.8, easy ~0.5, brisk ~0.24), radius sweep 0.25–1.15x of nominal;
-two earlier cuts read as "pressure does nothing" — one normalized by stroke
-width in world px and saturated thin at real speeds, one ramped linearly to a
-flick speed and parked every ordinary stroke in the top fifth of the range.
-Tuning knobs live in draw_update (curve constant, `dt*30` adaptation) and
+hand speed (zoom-independent) through an EXPONENTIAL curve (`exp(-speed/1000)`
+→ careful ~0.74, easy ~0.37, small flick ~0.22), radius sweep 0.25–1.15x of
+nominal — tuned per user so a SMALL flick draws at HALF the width of careful
+strokes (tldraw's feel). Two earlier cuts read as "pressure does nothing" (one
+normalized by stroke width in world px and saturated thin at real speeds, one
+ramped linearly to a flick speed and parked every ordinary stroke in the top
+fifth of the range) and a third was directionally right but too subtle.
+Tuning knobs live in draw_update (curve constant, `dt*40` adaptation) and
 draw_radius (sweep).
 Pen: stderr prints "pen pressure active" on first Windows Ink pointer event —
 if it never prints while inking, enable Windows Ink in the tablet driver.
