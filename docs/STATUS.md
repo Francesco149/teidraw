@@ -220,6 +220,17 @@ vendored in `assets/fonts/` (OFL texts alongside; CI needs no nix fonts), the
 icon (TEI wordmark over a 3-row checkerboard, `tools/make-icon.sh`) baked
 into both binaries, `make linux` target + sdl3/pkg-config in the flake.
 
+Session-10 also set the repo up for **public release**: dense README (icon
+header, controls table, download links to `releases/latest/download/…`, a
+marked placeholder where the user drag-drops the demo .mp4 while editing the
+README on github.com), and `.github/workflows/nightly.yml` — nightly cron +
+manual dispatch, skips when HEAD already carries a nightly tag, auto-bumps
+`nightly-N`, builds the Windows exe via the nix devshell (nix store cached)
+and a PORTABLE Linux binary on ubuntu-22.04 (oldest-LTS glibc baseline;
+static SDL3 + static builtin-codec ffmpeg, cached; offscreen --shot smoke
+test), publishes both as the latest release with the Linux
+"not battle-tested" caveat in the notes, prunes to the last 7 nightlies.
+
 ## Build & verify
 ```
 nix develop --command make -C editor            # build/teidraw.exe
@@ -234,8 +245,12 @@ minted duplicate ids once). Use a throwaway dir under the scratchpad for
 render tests.
 
 ## NEXT TASK (docs/ROADMAP.md)
-M5 (linux port) landed session 10; the repo is being set up for public
-release (README, nightly CI). Open threads: hands-on testing of the
+M5 (linux port) + release setup (README, nightly CI) landed session 10.
+USER ACTIONS to go live: create the GitHub repo + `git push -u origin
+master --tags`, record the demo video and drag it into the README's marked
+placeholder on github.com, then run the `nightly` workflow once by hand
+(Actions → nightly → run) so `releases/latest` exists before sharing the
+link. Open threads: hands-on testing of the
 session-8 editor + session-9 draw tool on Windows (stroke feel/thinning
 constants in the `── freehand stroke capture ──` block, shift chaining, pen
 pressure on the user's Wacom CTL-480 with Windows Ink on), first real-user

@@ -1,0 +1,188 @@
+# Nightly builds: every night with new commits, build both targets and roll
+# them into an auto-bumped `nightly-N` tag + release (marked latest, so the
+# README's /releases/latest/download/ links always point at the newest one).
+# Old nightlies are pruned, the last 7 kept. `workflow_dispatch` forces a
+# build even without new commits.
+#
+# Windows: the primary target, built exactly like dev (nix devshell, mingw
+# cross, static libav) — a single self-contained exe.
+# Linux: built on the oldest LTS runner (glibc baseline) with STATIC SDL3 +
+# libav so the tarball's binary runs on any reasonably-recent distro; SDL
+# dlopens X11/Wayland/audio at runtime. This target is new and not yet
+# battle-tested — the release notes say so.
+name: nightly
+
+on:
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SDL_VER: 3.4.10        # keep in step with the nixpkgs pin (flake.lock)
+  FFMPEG_VER: 8.1.1
+  IMGUI_VER: v1.92.4     # keep in step with flake.nix
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: decide
+        run: |
+          # skip when HEAD already shipped as a nightly (manual runs never skip)
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && \
+             git tag --points-at HEAD | grep -q '^nightly-'; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no new commits since the last nightly — skipping"
+            exit 0
+          fi
+          last=$(git tag -l 'nightly-*' | sed 's/^nightly-//' | grep -E '^[0-9]+$' | sort -n | tail -1)
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "tag=nightly-$(( ${last:-0} + 1 ))" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: check
+    if: needs.check.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 6G
+      - name: build
+        run: |
+          nix develop --command make -C editor
+          nix develop --command bash -c '$MINGW_STRIP build/teidraw.exe'
+      - name: package
+        run: |
+          mkdir -p out/teidraw
+          cp build/teidraw.exe LICENSE README.md out/teidraw/
+          (cd out && zip -r teidraw-windows-x64.zip teidraw)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/teidraw-windows-x64.zip
+
+  linux:
+    needs: check
+    if: needs.check.outputs.run == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: apt deps (SDL backends need headers; the .so's are dlopened at runtime)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config nasm zip \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev libegl1-mesa-dev \
+            libgl1-mesa-dev libdbus-1-dev libudev-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev
+      - name: cache static SDL3 + ffmpeg
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: ~/deps
+          key: linux-deps-sdl${{ env.SDL_VER }}-ffmpeg${{ env.FFMPEG_VER }}-v1
+      - name: build static SDL3
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://github.com/libsdl-org/SDL/releases/download/release-${SDL_VER}/SDL3-${SDL_VER}.tar.gz" | tar xz
+          cmake -S "SDL3-${SDL_VER}" -B sdl-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/deps" \
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+          cmake --build sdl-build
+          cmake --install sdl-build
+      - name: build static ffmpeg (builtin codecs only, like the Windows cross build)
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VER}.tar.xz" | tar xJ
+          cd "ffmpeg-${FFMPEG_VER}"
+          ./configure --prefix="$HOME/deps" --enable-static --disable-shared \
+            --disable-programs --disable-doc --disable-network --disable-autodetect \
+            --disable-avdevice --disable-avfilter --disable-postproc --disable-debug
+          make -j"$(nproc)"
+          make install
+      - name: fetch header deps (imgui / stb / nlohmann)
+        run: |
+          git clone --depth 1 --branch "$IMGUI_VER" https://github.com/ocornut/imgui deps-src/imgui
+          git clone --depth 1 https://github.com/nothings/stb deps-src/stb
+          mkdir -p deps-src/json/nlohmann
+          curl -fsSL -o deps-src/json/nlohmann/json.hpp \
+            https://github.com/nlohmann/json/releases/download/v3.12.0/json.hpp
+      - name: build
+        run: |
+          export PKG_CONFIG_PATH="$HOME/deps/lib/pkgconfig:$HOME/deps/lib/x86_64-linux-gnu/pkgconfig"
+          make -C editor linux \
+            IMGUI="$PWD/deps-src/imgui" STBI="$PWD/deps-src/stb" JSON_INC="$PWD/deps-src/json" \
+            SDL3_CFLAGS="$(pkg-config --cflags sdl3)" \
+            SDL3_LIBS="$(pkg-config --static --libs sdl3)" \
+            LIN_FFMPEG_CFLAGS="$(pkg-config --cflags libavformat libavcodec libswscale libswresample libavutil)" \
+            LIN_FFMPEG_LIBS="$(pkg-config --static --libs libavformat libavcodec libswscale libswresample libavutil)"
+          strip build/teidraw
+      - name: smoke test (offscreen --shot + --export-txt, no display needed)
+        run: |
+          ./build/teidraw /tmp/ciboard --shot /tmp/ci-shot.png --frames 4
+          ./build/teidraw /tmp/ciboard --export-txt /tmp/ci-outline.txt
+          test -s /tmp/ci-shot.png
+          echo "dynamic deps:" && ldd build/teidraw
+      - name: package
+        run: |
+          mkdir -p out/teidraw
+          cp build/teidraw LICENSE README.md out/teidraw/
+          tar czf out/teidraw-linux-x64.tar.gz -C out teidraw
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: out/teidraw-linux-x64.tar.gz
+
+  release:
+    needs: [check, windows, linux]
+    if: needs.check.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: out
+      - name: tag + release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          git tag "$TAG"
+          git push origin "$TAG"
+          cat > notes.md <<EOF
+          Automated nightly build of \`$(git rev-parse --short HEAD)\`.
+
+          - **teidraw-windows-x64.zip** — the primary build (daily-driven).
+          - **teidraw-linux-x64.tar.gz** — ⚠️ the Linux build is new and **not battle-tested** yet; feedback (issues, PRs) very welcome.
+
+          Boards are plain folders (\`board.json\` + \`assets/\`); settings live in \`%APPDATA%\teidraw\` / \`~/.config/teidraw\`.
+          EOF
+          gh release create "$TAG" out/teidraw-windows-x64.zip out/teidraw-linux-x64.tar.gz \
+            --latest --title "$TAG ($(date -u +%F))" --notes-file notes.md
+      - name: prune old nightlies (keep the last 7)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 200 --json tagName -q '.[].tagName' \
+            | grep '^nightly-' | sort -t- -k2,2n | head -n -7 \
+            | while read -r t; do gh release delete "$t" --cleanup-tag --yes; done
