@@ -37,13 +37,20 @@ vertices turned about the pill center + pre-frame pointer inverse-rotation,
 the proven rotated-editor trick — sliders/buttons are fine with it, unlike
 InputText), never appears while a mouse button is held or a canvas drag is
 live, and fades in/out (0.12s in / 0.35s linger + 0.25s out, vertex-alpha
-pass so hand-drawn icon colors fade too). **Snap-move guides** (moving
-bounds' edges+centers pull to other top-level shapes' edges+centers, 8
-screen px, accent guide lines through both boxes; ctrl = free move),
-**shift = axis-lock drag**, **arrow-key nudge** (1 px, shift 10, key-repeat,
-bursts coalesce into one undo via a 0.6s debounce). DM_MOVE now applies an
-absolute offset from the drag origin (g_moveApplied) instead of incremental
-deltas so lock/snap can't drift.
+pass so hand-drawn icon colors fade too). Pill capture is surgical: its
+dead-space (padding between widgets) doesn't count as UI — clicks/drags
+there grab the video on the canvas (g_overlayBgHover un-sets uiHot;
+unrotated pills only, since under the rotation remap the canvas would see
+pill-space coords); on a ROTATED pill, a pointer inside the unrotated
+window rect but off the visual (the "ghost") turns the window NoInputs
+that frame, so hitboxes sit exactly on the pixels drawn. **Snap-move
+guides** (HOLD CTRL to snap — off by default per user; moving bounds'
+edges+centers pull to other top-level shapes' edges+centers, 8 screen px,
+accent guide lines through both boxes), **shift = axis-lock drag**,
+**arrow-key nudge** (1 px, shift 10, key-repeat, bursts coalesce into one
+undo via a 0.6s debounce). DM_MOVE now applies an absolute offset from the
+drag origin (g_moveApplied) instead of incremental deltas so lock/snap
+can't drift.
 
 ## Build & verify
 ```

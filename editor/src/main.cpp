@@ -2099,11 +2099,11 @@ static void try_bind(ArrowEnd& e, ImVec2 w, uint64_t selfId) {
     }
 }
 
-// ── move snapping ──
-// While dragging, edges and centers of the moving bounds pull toward other
-// top-level shapes' edges/centers within a screen-px threshold; each matched
-// alignment draws an accent guide line through both boxes. Ctrl suppresses
-// snapping, shift locks the drag to the dominant axis (handled by the caller).
+// ── move snapping (hold ctrl while dragging) ──
+// Edges and centers of the moving bounds pull toward other top-level shapes'
+// edges/centers within a screen-px threshold; each matched alignment draws an
+// accent guide line through both boxes. Off by default — ctrl opts in; shift
+// locks the drag to the dominant axis (both handled by the caller).
 static void snap_move(ImVec2& want, const WRect& start, ImDrawList* dl) {
     std::vector<uint64_t> moving = g_sel;
     for (auto id : g_sel) { Shape* s = find_shape(id); if (s && s->type == SH_GROUP) collect_members(id, moving); }
@@ -2622,10 +2622,13 @@ static float    g_overlayAlpha = 0.f;   // fade envelope
 static double   g_overlayLoseAt = 0;    // linger deadline after hover loss (0 = hovered)
 static float    g_overlayRemapRot = 0.f;   // nonzero: pre-frame pointer remap active
 static ImVec2   g_overlayPivot, g_overlayMn, g_overlayMx;   // pill rect (unrotated screen space)
+static bool     g_overlayBgHover = false;  // pointer on pill dead-space (no widget) — canvas may take the mouse
+static bool     g_overlayGhost = false;    // pointer inside the unrotated rect but OFF the rotated visual
 
 static void overlay_reset() {
     g_overlayVid = 0; g_overlayHot = false;
     g_overlayAlpha = 0.f; g_overlayLoseAt = 0; g_overlayRemapRot = 0.f;
+    g_overlayBgHover = false;
 }
 
 static bool IconButton(const char* id, int icon /*0 play 1 pause 2 stop*/) {
@@ -2653,7 +2656,9 @@ static void DrawVideoOverlay() {
 #ifdef TEI_LIBAV
     ImGuiIO& io = ImGui::GetIO();
     double now = ImGui::GetTime();
-    if (g_editText || g_editLabelArrow || g_drag != DM_NONE) { overlay_reset(); return; }
+    // a real canvas drag hides the pill instantly; DM_PENDING is just a press
+    // (possibly on the pill's own dead-space) — don't blink it away for those
+    if (g_editText || g_editLabelArrow || (g_drag != DM_NONE && g_drag != DM_PENDING)) { overlay_reset(); return; }
     // topmost video whose central region contains the pointer (in the video's
     // local frame, so the trigger area turns with a rotated video)
     uint64_t hover = 0;
@@ -2698,8 +2703,8 @@ static void DrawVideoOverlay() {
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                              ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
-                             ImGuiWindowFlags_NoNav;
-    if (!want) flags |= ImGuiWindowFlags_NoInputs;   // fading out: click-through
+                             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove;
+    if (!want || g_overlayGhost) flags |= ImGuiWindowFlags_NoInputs;   // fading out / ghost rect: click-through
     ImGui::SetNextWindowPos(cs, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::Begin("##vidctl", nullptr, flags);
 
@@ -2762,6 +2767,12 @@ static void DrawVideoOverlay() {
             v.col = (v.col & 0x00FFFFFF) | ((ImU32)((v.col >> 24) * g_overlayAlpha) << 24);
         }
     g_overlayHot = want && (ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) || ImGui::IsAnyItemActive());
+    // pointer on the pill but not on any widget: let the canvas take the mouse
+    // (drag the video from under the pill's dead-space). Unrotated pills only —
+    // under the rotation remap the canvas would see pill-space coordinates.
+    g_overlayBgHover = want && s->rot == 0.f &&
+                       ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
+                       !ImGui::IsAnyItemHovered() && !ImGui::IsAnyItemActive();
     ImGui::End();
 #endif
 }
@@ -3125,6 +3136,9 @@ static void CanvasFrame() {
     bool uiHot = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) ||
                  ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup) ||
                  io.WantCaptureMouse;
+    // the video pill's dead-space doesn't count as UI: clicks/drags there act
+    // on the canvas (grab the video itself), only its widgets capture
+    if (g_overlayBgHover && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup)) uiHot = false;
     bool editing = (g_editText || g_editLabelArrow);
 
     // selection UI + gizmos (draw even when uiHot, interaction gated below)
@@ -3316,7 +3330,7 @@ static void CanvasFrame() {
         // shift axis-lock and snapping can adjust it without accumulating drift
         ImVec2 want = mw - g_dragStartW;
         if (io.KeyShift) { if (fabsf(want.x) >= fabsf(want.y)) want.y = 0; else want.x = 0; }
-        if (!io.KeyCtrl) snap_move(want, g_moveStartBounds, dl);   // ctrl = free move
+        if (io.KeyCtrl) snap_move(want, g_moveStartBounds, dl);   // ctrl = snap to other shapes
         ImVec2 d = want - g_moveApplied;
         if (d.x != 0 || d.y != 0) move_selected(d);
         g_moveApplied = want;
@@ -3633,14 +3647,22 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        // Rotated video pill: same trick — when the pointer lands on the pill
-        // (tested in its unrotated space, last frame's rect) inverse-rotate it
-        // so the pill's widgets see straight coordinates.
+        // Rotated video pill: same trick — when the pointer lands on the
+        // VISUAL pill (tested in its unrotated space, last frame's rect)
+        // inverse-rotate it so the pill's widgets see straight coordinates.
+        // A pointer inside the unrotated window rect but OFF the visual is in
+        // the "ghost": the pill runs NoInputs that frame so imgui's window
+        // hit-test (which only knows the unrotated rect) can't eat the click —
+        // hitboxes stay exactly on the pixels the user sees.
+        g_overlayGhost = false;
         if (g_overlayRemapRot != 0.f) {
             ImVec2 p = rot_about(io.MousePos, g_overlayPivot, -g_overlayRemapRot);
-            if (p.x >= g_overlayMn.x - 4.f && p.x <= g_overlayMx.x + 4.f &&
-                p.y >= g_overlayMn.y - 4.f && p.y <= g_overlayMx.y + 4.f)
-                io.MousePos = p;
+            auto in_rect = [](ImVec2 q) {
+                return q.x >= g_overlayMn.x - 4.f && q.x <= g_overlayMx.x + 4.f &&
+                       q.y >= g_overlayMn.y - 4.f && q.y <= g_overlayMx.y + 4.f;
+            };
+            if (in_rect(p)) io.MousePos = p;
+            else g_overlayGhost = in_rect(io.MousePos);
         }
         ImGui::NewFrame();
 
