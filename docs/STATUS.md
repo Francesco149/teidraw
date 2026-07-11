@@ -21,13 +21,29 @@ outline with texts verbatim, media placeholders, group nesting, arrows as a
 connection list), **global settings** (%APPDATA%/teidraw/settings.json:
 theme, zoom anim, undo limit + context-menu presets, boards dir, recent
 boards — theme prefs moved OUT of board.json, adopted once from boards that
-still carry them), **board picker** (modal via Ctrl+O / context menu; auto
-on bare launch with no last board: recents with left-elided paths, new-board
-under Documents/teidraw, native folder dialog; switch_board tears down all
-per-board caches). Bare `teidraw` reopens the last board; window title shows
-the board name. Board format **v2** (v1 tsize indices migrate at load);
-loads sanitize duplicate ids / stale nextId / empty texts. Single TU, builds
-warning-free.
+still carry them), **board picker** (modal via Ctrl+O / context menu, esc
+closes it when a board is open; auto on bare launch with no last board:
+recents with left-elided paths, new-board under Documents/teidraw, native
+folder dialog; switch_board tears down all per-board caches). Bare `teidraw`
+reopens the last board; window title shows the board name. Board format
+**v2** (v1 tsize indices migrate at load); loads sanitize duplicate ids /
+stale nextId / empty texts. Single TU, builds warning-free.
+
+Session-5 polish + M3 move feel: arrows bound to a text stay pinned to their
+world point while the text reflows (anchors re-normalized per edit frame);
+a selected group drags from anywhere inside its bounding box (plain click
+inside still deselects); the video pill rotates with a rotated video (draw
+vertices turned about the pill center + pre-frame pointer inverse-rotation,
+the proven rotated-editor trick — sliders/buttons are fine with it, unlike
+InputText), never appears while a mouse button is held or a canvas drag is
+live, and fades in/out (0.12s in / 0.35s linger + 0.25s out, vertex-alpha
+pass so hand-drawn icon colors fade too). **Snap-move guides** (moving
+bounds' edges+centers pull to other top-level shapes' edges+centers, 8
+screen px, accent guide lines through both boxes; ctrl = free move),
+**shift = axis-lock drag**, **arrow-key nudge** (1 px, shift 10, key-repeat,
+bursts coalesce into one undo via a 0.6s debounce). DM_MOVE now applies an
+absolute offset from the drag origin (g_moveApplied) instead of incremental
+deltas so lock/snap can't drift.
 
 ## Build & verify
 ```
@@ -43,8 +59,8 @@ minted duplicate ids once). Use a throwaway dir under the scratchpad for
 render tests.
 
 ## NEXT TASK → M3 (docs/ROADMAP.md)
-1. Snapping guides + arrow-key nudge + shift axis-lock drag.
-2. Text wrap width; then the custom WYSIWYG canvas editor (see below).
+1. Text wrap width; then the custom WYSIWYG canvas editor (see below).
+   (Snapping guides + nudge + shift axis-lock landed session 5.)
 
 ## Known rough edges / to keep in mind
 - **WYSIWYG-transform editing is fully OFF** (`kWysiwygAlignEdit` and

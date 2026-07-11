@@ -1997,7 +1997,9 @@ enum DragMode { DM_NONE = 0, DM_PENDING, DM_MOVE, DM_MARQUEE, DM_HANDLE, DM_CROP
                 DM_ARROW_A, DM_ARROW_B, DM_BEND, DM_NEW_ARROW, DM_PAN_R };
 static DragMode g_drag = DM_NONE;
 static ImVec2   g_dragStartW, g_dragStartS;    // world/screen at mousedown
-static ImVec2   g_lastDragW;
+static WRect    g_moveStartBounds;             // selection bounds when the move began
+static ImVec2   g_moveApplied;                 // offset applied so far (move = absolute, not incremental)
+static double   g_nudgeUndoAt = 0;             // arrow-key nudges coalesce into one undo entry
 static uint64_t g_downLeaf = 0, g_downTarget = 0;
 static bool     g_downWasSelected = false;
 static int      g_handleIdx = -1;              // 0 tl, 1 tr, 2 br, 3 bl
@@ -2094,6 +2096,51 @@ static void try_bind(ArrowEnd& e, ImVec2 w, uint64_t selfId) {
                               sz.y > 0 ? (p.y - b.mn.y) / sz.y : 0.5f);
             return;
         }
+    }
+}
+
+// ── move snapping ──
+// While dragging, edges and centers of the moving bounds pull toward other
+// top-level shapes' edges/centers within a screen-px threshold; each matched
+// alignment draws an accent guide line through both boxes. Ctrl suppresses
+// snapping, shift locks the drag to the dominant axis (handled by the caller).
+static void snap_move(ImVec2& want, const WRect& start, ImDrawList* dl) {
+    std::vector<uint64_t> moving = g_sel;
+    for (auto id : g_sel) { Shape* s = find_shape(id); if (s && s->type == SH_GROUP) collect_members(id, moving); }
+    auto in_moving = [&](uint64_t id) { for (auto m : moving) if (m == id) return true; return false; };
+    float th = screen_px(8.f);
+    WRect mb{ start.mn + want, start.mx + want };
+    float mine[2][3] = { { mb.mn.x, (mb.mn.x + mb.mx.x) * 0.5f, mb.mx.x },
+                         { mb.mn.y, (mb.mn.y + mb.mx.y) * 0.5f, mb.mx.y } };
+    float bestD[2] = { th, th };
+    float bestOff[2] = { 0, 0 }, bestPos[2] = { 0, 0 };
+    WRect bestBox[2]; bool hit[2] = { false, false };
+    for (auto& s : g_doc.shapes) {
+        if (s.parent || s.type == SH_ARROW || in_moving(s.id)) continue;
+        WRect b = shape_bounds(s);
+        float cand[2][3] = { { b.mn.x, (b.mn.x + b.mx.x) * 0.5f, b.mx.x },
+                             { b.mn.y, (b.mn.y + b.mx.y) * 0.5f, b.mx.y } };
+        for (int ax = 0; ax < 2; ax++)
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++) {
+                    float diff = cand[ax][i] - mine[ax][j];
+                    if (fabsf(diff) < bestD[ax]) {
+                        bestD[ax] = fabsf(diff); bestOff[ax] = diff;
+                        bestPos[ax] = cand[ax][i]; bestBox[ax] = b; hit[ax] = true;
+                    }
+                }
+    }
+    if (hit[0]) want.x += bestOff[0];
+    if (hit[1]) want.y += bestOff[1];
+    if (!hit[0] && !hit[1]) return;
+    WRect fb{ start.mn + want, start.mx + want };   // final (snapped) moving bounds
+    if (hit[0]) {
+        float y0 = fminf(fb.mn.y, bestBox[0].mn.y), y1 = fmaxf(fb.mx.y, bestBox[0].mx.y);
+        dl->AddLine(W2S(ImVec2(bestPos[0], y0)), W2S(ImVec2(bestPos[0], y1)), g_th.accent, 1.f);
+    }
+    if (hit[1]) {
+        float x0 = fminf(fb.mn.x, bestBox[1].mn.x), x1 = fmaxf(fb.mx.x, bestBox[1].mx.x);
+        dl->AddLine(W2S(ImVec2(x0, bestPos[1])), W2S(ImVec2(x1, bestPos[1])), g_th.accent, 1.f);
     }
 }
 
@@ -2318,6 +2365,11 @@ static void DrawBoardPicker() {
                                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
                                 ImGuiWindowFlags_NoTitleBar))
         return;
+    // esc closes the picker (only when there's a board to fall back to; while
+    // the name field is active esc just cancels that edit — checked before
+    // items so ActiveId still reflects last frame)
+    if (!noBoard && !ImGui::IsAnyItemActive() && ImGui::IsKeyPressed(ImGuiKey_Escape))
+        ImGui::CloseCurrentPopup();
 
     ImDrawList* wdl = ImGui::GetWindowDrawList();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_th.textDim), noBoard ? "boards" : "boards · esc to close");
@@ -2558,9 +2610,23 @@ static void DrawContextMenu() {
 // ── video hover controls ──
 // Hovering the middle of a video shows a floating play/stop/seek/AB-loop pill
 // (gifs just loop with no chrome). The overlay sticks while its widgets are in
-// use even if the pointer wanders off the trigger region.
+// use even if the pointer wanders off the trigger region. It never appears
+// while a mouse button is held (drags — move/pan/marquee — must not summon
+// it; seek and buttons are click-driven), fades in/out with a linger so it
+// doesn't flicker at the region edge, and rotates with a rotated video (draw
+// vertices turned about the pill center; the pointer is inverse-rotated
+// pre-frame, same trick as the rotated-editor machinery).
 static uint64_t g_overlayVid = 0;
 static bool     g_overlayHot = false;   // last frame: window hovered or widget active
+static float    g_overlayAlpha = 0.f;   // fade envelope
+static double   g_overlayLoseAt = 0;    // linger deadline after hover loss (0 = hovered)
+static float    g_overlayRemapRot = 0.f;   // nonzero: pre-frame pointer remap active
+static ImVec2   g_overlayPivot, g_overlayMn, g_overlayMx;   // pill rect (unrotated screen space)
+
+static void overlay_reset() {
+    g_overlayVid = 0; g_overlayHot = false;
+    g_overlayAlpha = 0.f; g_overlayLoseAt = 0; g_overlayRemapRot = 0.f;
+}
 
 static bool IconButton(const char* id, int icon /*0 play 1 pause 2 stop*/) {
     ImVec2 sz(28, 28);
@@ -2586,37 +2652,56 @@ static void fmt_time(char* buf, size_t n, double t) {
 static void DrawVideoOverlay() {
 #ifdef TEI_LIBAV
     ImGuiIO& io = ImGui::GetIO();
-    if (g_editText || g_editLabelArrow || g_drag != DM_NONE) { g_overlayVid = 0; g_overlayHot = false; return; }
-    // topmost video whose central region contains the pointer
+    double now = ImGui::GetTime();
+    if (g_editText || g_editLabelArrow || g_drag != DM_NONE) { overlay_reset(); return; }
+    // topmost video whose central region contains the pointer (in the video's
+    // local frame, so the trigger area turns with a rotated video)
     uint64_t hover = 0;
     ImVec2 mw = S2W(io.MousePos);
     for (int i = (int)g_doc.shapes.size() - 1; i >= 0 && !hover; i--) {
         Shape& s = g_doc.shapes[i];
         if (s.type != SH_IMAGE || media_kind(s.asset) != MK_VIDEO) continue;
-        WRect b = shape_bounds(s);
+        WRect b = shape_local_rect(s);
+        ImVec2 p = s.rot != 0.f ? rot_about(mw, b.center(), -s.rot) : mw;
         ImVec2 c = b.center(), half = b.size() * 0.35f;
         WRect mid{ c - half, c + half };
-        if (mid.contains(mw)) hover = s.id;
+        if (mid.contains(p)) hover = s.id;
     }
-    uint64_t target = hover ? hover : (g_overlayHot ? g_overlayVid : 0);
-    g_overlayVid = target;
-    if (!target) { g_overlayHot = false; return; }
-    Shape* s = find_shape(target);
-    if (!s) { g_overlayVid = 0; g_overlayHot = false; return; }   // deleted / board switched away
+    // a press that didn't start on the pill (shape drag, pan, marquee about to
+    // happen) must not summon it; once its own widgets are in use it sticks
+    bool buttonsDown = ImGui::IsMouseDown(ImGuiMouseButton_Left) ||
+                       ImGui::IsMouseDown(ImGuiMouseButton_Right) ||
+                       ImGui::IsMouseDown(ImGuiMouseButton_Middle);
+    bool sticky = g_overlayHot && g_overlayVid != 0;
+    bool want = sticky || (hover != 0 && !buttonsDown);
+    if (want) {
+        if (!sticky) g_overlayVid = hover;
+        g_overlayLoseAt = 0;
+        g_overlayAlpha = fminf(1.f, g_overlayAlpha + io.DeltaTime / 0.12f);
+    } else if (g_overlayVid) {
+        if (!g_overlayLoseAt) g_overlayLoseAt = now + 0.35;   // linger before fading
+        if (now >= g_overlayLoseAt) g_overlayAlpha -= io.DeltaTime / 0.25f;
+        if (g_overlayAlpha <= 0.f) { overlay_reset(); return; }
+    }
+    if (!g_overlayVid) { g_overlayRemapRot = 0.f; return; }
+    Shape* s = find_shape(g_overlayVid);
+    if (!s) { overlay_reset(); return; }   // deleted / board switched away
     VideoDecoder* d = get_decoder(s->asset);
-    if (!d) { g_overlayHot = false; return; }
+    if (!d) { overlay_reset(); return; }
     PlayState& ps = g_play[s->id];
     double dur = d->duration();
 
-    WRect b = shape_bounds(*s);
-    ImVec2 cs = W2S(b.center());
-    float wpx = b.size().x * g_cam.zoom;
+    WRect lb = shape_local_rect(*s);
+    ImVec2 cs = W2S(lb.center());   // rotation pivots the rect center, so it's rot-invariant
+    float wpx = lb.size().x * g_cam.zoom;
     float sliderW = fminf(fmaxf(wpx * 0.75f, 200.f), 400.f);
 
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                             ImGuiWindowFlags_NoNav;
+    if (!want) flags |= ImGuiWindowFlags_NoInputs;   // fading out: click-through
     ImGui::SetNextWindowPos(cs, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::Begin("##vidctl", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+    ImGui::Begin("##vidctl", nullptr, flags);
 
     if (IconButton("##pp", ps.playing ? 1 : 0)) ps.playing = !ps.playing;
     ImGui::SameLine();
@@ -2652,7 +2737,31 @@ static void DrawVideoOverlay() {
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_th.textDim), "loop");
     }
 
-    g_overlayHot = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) || ImGui::IsAnyItemActive();
+    // rotate the finished pill into the video's frame + apply the fade.
+    // Everything (window bg included) sits in this one drawlist, so a vertex
+    // pass covers colors that bypass style alpha (icon glyphs, A/B marks).
+    ImGuiWindow* win = ImGui::GetCurrentWindow();
+    g_overlayPivot = win->Pos + win->Size * 0.5f;
+    g_overlayMn = win->Pos; g_overlayMx = win->Pos + win->Size;
+    g_overlayRemapRot = (want && s->rot != 0.f) ? s->rot : 0.f;
+    if (s->rot != 0.f) {
+        float sn = sinf(s->rot), cn = cosf(s->rot);
+        for (int i = 0; i < wdl->VtxBuffer.Size; i++) {
+            ImDrawVert& v = wdl->VtxBuffer[i];
+            float dx = v.pos.x - g_overlayPivot.x, dy = v.pos.y - g_overlayPivot.y;
+            v.pos.x = g_overlayPivot.x + dx * cn - dy * sn;
+            v.pos.y = g_overlayPivot.y + dx * sn + dy * cn;
+        }
+        ImVec2 ds = io.DisplaySize;   // rotated content escapes the window clip
+        for (int i = 0; i < wdl->CmdBuffer.Size; i++)
+            wdl->CmdBuffer[i].ClipRect = ImVec4(0, 0, ds.x, ds.y);
+    }
+    if (g_overlayAlpha < 1.f)
+        for (int i = 0; i < wdl->VtxBuffer.Size; i++) {
+            ImDrawVert& v = wdl->VtxBuffer[i];
+            v.col = (v.col & 0x00FFFFFF) | ((ImU32)((v.col >> 24) * g_overlayAlpha) << 24);
+        }
+    g_overlayHot = want && (ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) || ImGui::IsAnyItemActive());
     ImGui::End();
 #endif
 }
@@ -2851,10 +2960,29 @@ static void DrawTextEditOverlay() {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNav);
     if (g_editTextTakeFocus) { ImGui::SetKeyboardFocusHere(); g_editTextTakeFocus = false; }
+    // Text reflow must not swing bound arrows around: normalized anchors
+    // stretch with the rect, so remember each bound end's world point now and
+    // re-derive its anchor after the edit — an arrow bound near the left edge
+    // stays put while typing extends the right edge.
+    std::vector<std::pair<ArrowEnd*, ImVec2>> pinned;
+    if (!isLabel)
+        for (auto& a : g_doc.shapes) if (a.type == SH_ARROW) {
+            if (a.a.bind == s->id) pinned.push_back({ &a.a, arrow_end_pos(a.a) });
+            if (a.b.bind == s->id) pinned.push_back({ &a.b, arrow_end_pos(a.b) });
+        }
     std::string before = *str;
     ImGui::InputTextMultiline("##t", str, box,
                               ImGuiInputTextFlags_NoHorizontalScroll | ImGuiInputTextFlags_CallbackEdit,
                               TextEditCallback);
+    if (!pinned.empty() && *str != before) {
+        WRect nb = shape_local_rect(*s);
+        ImVec2 nsz = nb.size();
+        for (auto& [e, w] : pinned) {
+            ImVec2 p = s->rot != 0.f ? rot_about(w, nb.center(), -s->rot) : w;
+            e->anchor.x = nsz.x > 0 ? fminf(fmaxf((p.x - nb.mn.x) / nsz.x, 0.f), 1.f) : 0.5f;
+            e->anchor.y = nsz.y > 0 ? fminf(fmaxf((p.y - nb.mn.y) / nsz.y, 0.f), 1.f) : 0.5f;
+        }
+    }
     // ── WYSIWYG pass: make the live editor match the committed rendering ──
     // 1) faux-bold second strike  2) per-line alignment offsets applied to
     // the editor's finished vertices (glyphs, caret, selection quads shift
@@ -3057,7 +3185,19 @@ static void CanvasFrame() {
             if (g_drill) g_drill = 0;
             else clear_selection();
         }
+        // arrow keys nudge the selection (1 canvas px, shift = 10); repeats
+        // while held, and the burst coalesces into a single undo entry
+        if (!g_sel.empty() && g_drag == DM_NONE && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup)) {
+            float step = io.KeyShift ? 10.f : 1.f;
+            ImVec2 nd(0, 0);
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))  nd.x -= step;
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) nd.x += step;
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))    nd.y -= step;
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))  nd.y += step;
+            if (nd.x != 0 || nd.y != 0) { move_selected(nd); g_nudgeUndoAt = ImGui::GetTime() + 0.6; }
+        }
     } else g_spacePan = false;
+    if (g_nudgeUndoAt > 0 && ImGui::GetTime() >= g_nudgeUndoAt) { push_undo(); g_nudgeUndoAt = 0; }
 
     if (g_editRemap) return;   // pointer lives in a rotated editor's space; canvas input suspended
     if (uiHot && g_drag == DM_NONE) return;
@@ -3092,7 +3232,7 @@ static void CanvasFrame() {
 
     // ── left button state machine ──
     if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !uiHot) {
-        g_dragStartS = io.MousePos; g_dragStartW = mw; g_lastDragW = mw;
+        g_dragStartS = io.MousePos; g_dragStartW = mw;
 
         if (g_tool == TOOL_TEXT) {
             uint64_t id = create_text_at(mw);
@@ -3143,6 +3283,14 @@ static void CanvasFrame() {
             }
             g_downLeaf = hit_test(mw);
             g_downTarget = resolve_target(g_downLeaf);
+            if (!g_downTarget) {
+                // empty space inside a selected group's box still grabs the
+                // group (drag anywhere in the bounds; a plain click deselects)
+                for (auto id : g_sel) {
+                    Shape* s = find_shape(id);
+                    if (s && s->type == SH_GROUP && shape_bounds(*s).contains(mw)) { g_downTarget = id; break; }
+                }
+            }
             g_downWasSelected = g_downTarget && is_selected(g_downTarget);
             g_drag = DM_PENDING;
         }
@@ -3156,15 +3304,22 @@ static void CanvasFrame() {
                 g_sel.push_back(g_downTarget);
             }
             g_drag = DM_MOVE;
+            g_moveStartBounds = selection_bounds();
+            g_moveApplied = ImVec2(0, 0);
         } else {
             g_drag = DM_MARQUEE;
         }
     }
 
     if (g_drag == DM_MOVE) {
-        ImVec2 d = mw - g_lastDragW;
+        // absolute offset from the drag origin (not incremental deltas), so
+        // shift axis-lock and snapping can adjust it without accumulating drift
+        ImVec2 want = mw - g_dragStartW;
+        if (io.KeyShift) { if (fabsf(want.x) >= fabsf(want.y)) want.y = 0; else want.x = 0; }
+        if (!io.KeyCtrl) snap_move(want, g_moveStartBounds, dl);   // ctrl = free move
+        ImVec2 d = want - g_moveApplied;
         if (d.x != 0 || d.y != 0) move_selected(d);
-        g_lastDragW = mw;
+        g_moveApplied = want;
         ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
     }
 
@@ -3477,6 +3632,15 @@ int main(int argc, char** argv) {
                     g_editRemap = true;
                 }
             }
+        }
+        // Rotated video pill: same trick — when the pointer lands on the pill
+        // (tested in its unrotated space, last frame's rect) inverse-rotate it
+        // so the pill's widgets see straight coordinates.
+        if (g_overlayRemapRot != 0.f) {
+            ImVec2 p = rot_about(io.MousePos, g_overlayPivot, -g_overlayRemapRot);
+            if (p.x >= g_overlayMn.x - 4.f && p.x <= g_overlayMx.x + 4.f &&
+                p.y >= g_overlayMn.y - 4.f && p.y <= g_overlayMx.y + 4.f)
+                io.MousePos = p;
         }
         ImGui::NewFrame();
 
