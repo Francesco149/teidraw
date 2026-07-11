@@ -161,14 +161,17 @@ wedges keep full width through any turn. Residual known cost: quads overlap
 in a small wedge on the INNER side of a sharp corner — invisible opaque,
 tiny localized double-blend translucent. Simulated pressure runs on SCREEN-space
 hand speed (zoom-independent) through an EXPONENTIAL curve (`exp(-speed/1000)`
-→ careful ~0.74, easy ~0.37, small flick ~0.22), radius sweep 0.25–1.15x of
-nominal — tuned per user so a SMALL flick draws at HALF the width of careful
-strokes (tldraw's feel). Two earlier cuts read as "pressure does nothing" (one
-normalized by stroke width in world px and saturated thin at real speeds, one
-ramped linearly to a flick speed and parked every ordinary stroke in the top
-fifth of the range) and a third was directionally right but too subtle.
-Tuning knobs live in draw_update (curve constant, `dt*40` adaptation) and
-draw_radius (sweep).
+→ careful ~0.74, easy ~0.37, small flick ~0.22), radius sweep 0.2–1.3x of
+nominal, strokes open at pressure 0.85 (fat head) — tuned per user against a
+tldraw sample stroke. Adaptation is ASYMMETRIC (perfect-freehand's trick):
+thinning is snappy (40/s), thickening is slow and SCALES WITH SPEED
+(≤8/s, ∝speed/150 — frozen at rest), because symmetric adaptation let the
+deceleration frames at the end of a flick spring the width back up — tails
+ended in a blob instead of staying thin. Iterated four times on user feedback;
+tune against the replay harness (scratchpad python that replicates
+draw_update's math over a speed profile) rather than by eye. Knobs: curve
+constant + rates in draw_update, sweep in draw_radius, bases in kDrawSizes
+(3/5.5/9/15).
 Pen: stderr prints "pen pressure active" on first Windows Ink pointer event —
 if it never prints while inking, enable Windows Ink in the tablet driver.
 Hit-testing walks the ink polyline (max(radius, 6px) threshold, box
