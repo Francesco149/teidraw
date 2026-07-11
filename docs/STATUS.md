@@ -156,6 +156,19 @@ the ink polyline (max(radius, 6px) threshold, box prefilter), not the rect.
 change, keeping ink world-stationary under rotation via the crop/wrap
 center-remap trick. Corner resize scales pts+scale in lockstep so the box
 scales like an image. Text outline export says `- drawing (x, y) WxH`.
+**NaN-poisoning postmortem (fixed same session)**: losing focus mid-stroke
+(a `--shot` run stealing focus on the host, alt-tab) invalidates io.MousePos
+to −FLT_MAX; one S2W of that is ±inf, and ONE bad point NaN-poisons the whole
+stroke through draw_recalc_bounds' renormalization (inf − inf). nlohmann then
+dumps NaN as **null**, and `j.value()` THROWS on present-but-null keys → the
+board crashes on every subsequent load. Guards now: `draw_pt_ok` rejects
+invalid pointer positions at capture (begin/update/end + commit-time sweep),
+the stroke serializer never writes a non-finite number, and the stroke loader
+reads tolerantly (bad points dropped, an all-bad stroke deletes itself via
+the load sanitizer, zeroed w/h re-derives from ink). A board corrupted by the
+pre-fix binary heals itself on open — the user's test2-remastered did (bad
+stroke lost, all other shapes intact; `.bak-corrupt-20260711` copies of the
+poisoned files left in the board dir).
 
 ## Build & verify
 ```
@@ -206,8 +219,11 @@ pressure on the user's Wacom CTL-480 with Windows Ink on).
   More dev flags: `--sel <id>` selects a shape (selection-UI shots),
   `--edit <id>` opens the text editor on it, `--bs <frame>` presses Backspace
   on that frame. CAVEAT: headless runs still open a real focused window on
-  the host (stray keystrokes land in it) and SAVE the board on exit — never
-  point repeated scripted runs at a board whose exact content matters.
+  the host (stray keystrokes land in it, and it STEALS FOCUS — it cut a live
+  editor's stroke mid-gesture once, see the session-9 NaN postmortem; warn
+  the user before shooting while they have a session open) and SAVE the
+  board on exit — never point repeated scripted runs at a board whose exact
+  content matters.
   Settings tests can point the app at a fake `%APPDATA%` via
   `WSLENV=APPDATA/p APPDATA=<dir> ./build/teidraw.exe …`.
 - Escape-while-crop-dragging commits instead of canceling.

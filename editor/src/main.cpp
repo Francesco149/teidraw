@@ -460,6 +460,14 @@ static const float kDrawSizes[4] = { 2.f, 3.5f, 5.f, 10.f };
 static float draw_width(const Shape& s) { return kDrawSizes[s.tsize] * s.scale; }
 static float draw_radius(const Shape& s, float p) { return draw_width(s) * 0.5f * (0.35f + 0.75f * p); }
 
+// Reject NaN/inf AND imgui's "no mouse" sentinel (-FLT_MAX): on focus loss
+// mid-stroke (alt-tab, another window opening on the host) io.MousePos goes
+// invalid, and one S2W of it is ±inf — a single such point NaN-poisons the
+// whole stroke through draw_recalc_bounds' renormalization (inf − inf), and
+// nlohmann serializes NaN as null, corrupting the board file. Capture guards
+// with this, and the (de)serializers below never trust a stroke number.
+static bool draw_pt_ok(ImVec2 v) { return fabsf(v.x) < 1e30f && fabsf(v.y) < 1e30f; }
+
 // list lines ("• foo", "12. foo", optionally indented) pin to the left edge
 // even when the text block is centered/right-aligned
 static bool is_list_line(const char* b, const char* e) {
@@ -835,13 +843,16 @@ static json shape_to_json(const Shape& s) {
         if (s.rot != 0.f) j["rot"] = s.rot;   // the group's persistent frame
         break;
     case SH_DRAW: {
-        j["x"] = s.pos.x; j["y"] = s.pos.y;
-        j["w"] = s.size.x; j["h"] = s.size.y;
+        // non-finite → 0 backstop: nlohmann dumps NaN/inf as null, and a null
+        // where a number belongs makes the NEXT load throw — a corrupt board
+        auto fin = [](float v) { return fabsf(v) < 1e30f ? v : 0.f; };
+        j["x"] = fin(s.pos.x); j["y"] = fin(s.pos.y);
+        j["w"] = fin(s.size.x); j["h"] = fin(s.size.y);
         j["tsize"] = s.tsize;
-        if (s.scale != 1.f) j["scale"] = s.scale;
-        if (s.rot != 0.f) j["rot"] = s.rot;
+        if (s.scale != 1.f) j["scale"] = fin(s.scale);
+        if (s.rot != 0.f) j["rot"] = fin(s.rot);
         // flat [x,y,p, x,y,p, …], quantized — a long stroke is hundreds of points
-        auto q = [](float v) { return roundf(v * 100.f) * 0.01f; };
+        auto q = [&](float v) { return roundf(fin(v) * 100.f) * 0.01f; };
         json pa = json::array();
         for (size_t i = 0; i < s.pts.size(); i++) {
             pa.push_back(q(s.pts[i].x)); pa.push_back(q(s.pts[i].y)); pa.push_back(q(s.press[i]));
@@ -894,20 +905,30 @@ static Shape shape_from_json(const json& j) {
     case SH_GROUP:
         s.rot = j.value("rot", 0.f);
         break;
-    case SH_DRAW:
-        s.pos = ImVec2(j.value("x", 0.f), j.value("y", 0.f));
-        s.size = ImVec2(j.value("w", 0.f), j.value("h", 0.f));
-        s.tsize = j.value("tsize", kDefaultTextSize);
-        s.scale = j.value("scale", 1.f);
-        s.rot = j.value("rot", 0.f);
+    case SH_DRAW: {
+        // tolerant reads: j.value() THROWS on a present-but-null key, and a
+        // board poisoned by the NaN→null bug (or a hand edit) must load, not
+        // crash — bad points are dropped, an all-bad stroke ends up empty and
+        // the load-time sanitizer deletes it
+        auto num = [&](const char* k, float def) {
+            auto it = j.find(k);
+            return it != j.end() && it->is_number() ? (float)*it : def;
+        };
+        s.pos = ImVec2(num("x", 0.f), num("y", 0.f));
+        s.size = ImVec2(num("w", 0.f), num("h", 0.f));
+        s.tsize = j.contains("tsize") && j["tsize"].is_number_integer() ? (int)j["tsize"] : kDefaultTextSize;
+        s.tsize = s.tsize < 0 ? 0 : (s.tsize > 3 ? 3 : s.tsize);   // indexes kDrawSizes
+        s.scale = num("scale", 1.f);
+        s.rot = num("rot", 0.f);
         if (j.contains("pts") && j["pts"].is_array()) {
             const json& pa = j["pts"];
             for (size_t i = 0; i + 2 < pa.size(); i += 3) {
+                if (!pa[i].is_number() || !pa[i + 1].is_number() || !pa[i + 2].is_number()) continue;
                 s.pts.push_back(ImVec2(pa[i], pa[i + 1]));
                 s.press.push_back(pa[i + 2]);
             }
         }
-        break;
+    } break;
     }
     return s;
 }
@@ -957,6 +978,7 @@ static bool doc_from_json_string(const std::string& str, bool restoreCam) {
         for (auto& s : g_doc.shapes) if (s.type == SH_DRAW) {
             if (s.pts.empty()) { dead.push_back(s.id); continue; }
             while (s.press.size() < s.pts.size()) s.press.push_back(0.6f);   // hand-edited boards
+            if (s.size.x <= 0.f && s.size.y <= 0.f) draw_recalc_bounds(s);   // nulled w/h heal
         }
         if (!dead.empty()) delete_shapes(dead);
     }
@@ -2937,6 +2959,7 @@ static ImVec2 draw_from_local(const Shape& s, ImVec2 l) {
 }
 
 static void draw_begin(ImVec2 mw, bool shift) {
+    if (!draw_pt_ok(mw)) return;
     Shape* ext = nullptr;
     if (shift && g_lastDrawId) {
         ext = find_shape(g_lastDrawId);
@@ -2970,10 +2993,12 @@ static void draw_update(ImVec2 mw) {
     Shape* s = find_shape(g_drawId);
     if (!s || s->type != SH_DRAW) { g_drag = DM_NONE; g_drawId = 0; return; }   // undo mid-drag etc.
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-        // the release slipped past us (space-pan etc. return before the
-        // release handler) — commit instead of inking a ghost cursor trail
+        // the release slipped past us (space-pan / focus loss release the
+        // button before the release handler) — commit instead of inking a
+        // ghost cursor trail (draw_end self-guards against an invalid mw)
         draw_end(mw); g_drag = DM_NONE; return;
     }
+    if (!draw_pt_ok(mw)) return;   // pointer invalid this frame: stroke pauses
     ImGuiIO& io = ImGui::GetIO();
     float dt = io.DeltaTime > 0.f ? io.DeltaTime : 1.f / 120.f;
 
@@ -3015,7 +3040,7 @@ static void draw_update(ImVec2 mw) {
 static void draw_end(ImVec2 mw) {
     Shape* s = find_shape(g_drawId);
     if (s && s->type == SH_DRAW) {
-        if (!g_drawStraight && !s->pts.empty()) {
+        if (!g_drawStraight && !s->pts.empty() && draw_pt_ok(mw)) {
             // land the ink exactly where the cursor let go (streamline trails it)
             ImVec2 lastW = draw_from_local(*s, s->pts.back());
             if (vlen(mw - lastW) * g_cam.zoom > 0.5f) {
@@ -3023,9 +3048,18 @@ static void draw_end(ImVec2 mw) {
                 s->press.push_back(g_drawPressure);
             }
         }
-        draw_recalc_bounds(*s);
-        g_lastDrawId = g_drawId;   // the next shift+press chains onto this stroke
-        push_undo();
+        // belt-and-braces: a poisoned point must never reach the board file
+        for (int i = (int)s->pts.size() - 1; i >= 0; i--)
+            if (!draw_pt_ok(s->pts[i]) || !(s->press[i] == s->press[i])) {
+                s->pts.erase(s->pts.begin() + i); s->press.erase(s->press.begin() + i);
+            }
+        if (s->pts.empty()) {
+            std::vector<uint64_t> one{ g_drawId }; delete_shapes(one);
+        } else {
+            draw_recalc_bounds(*s);
+            g_lastDrawId = g_drawId;   // the next shift+press chains onto this stroke
+            push_undo();
+        }
     }
     g_drawId = 0;
 }
