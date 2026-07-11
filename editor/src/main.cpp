@@ -518,6 +518,7 @@ struct TextLayout {
     std::vector<TextLine> lines;
     float blockW = 0;    // wrapW when wrapping, else the widest line
     ImVec2 ext{0, 0};    // local rect extent: (blockW, lines·px)
+    float minX = 0;      // ≤0: numbered markers ("10.") poke left of the box
 };
 static void layout_text(const std::string& text, ImFont* f, float px, int align,
                         float wrapW, TextLayout& out) {
@@ -529,26 +530,51 @@ static void layout_text(const std::string& text, ImFont* f, float px, int align,
     for (;;) {   // hard lines — including the empty one after a trailing '\n'
         const char* hl = (const char*)memchr(b, '\n', end - b);
         if (!hl) hl = end;
-        bool pin = is_list_line(b, hl);   // per HARD line, so a wrapped list
-        const char* fuse = nullptr;       // item's continuations stay pinned too
+        // List lines hang: continuations indent to the text column (right
+        // after "• " / "N. "). Numbered markers right-align their DOTS to a
+        // shared single-digit column, so "10." pokes out the LEFT of the box
+        // instead of shifting its text (tldraw's look); bullets are one width
+        // and stay inside. The marker fuses with its first word — a pair too
+        // wide for the box hard-cuts the word at the edge (indented
+        // continuations are no wider, so breaking earlier can never help).
+        bool pin = is_list_line(b, hl);   // decided per HARD line
+        float indentX = 0.f, firstX = 0.f;
+        const char* mkEnd = b;            // text column starts here (bytes)
+        const char* fw = b;               // first word ends here
         if (pin) {
-            // the marker and the first word wrap as ONE unit — never strand a
-            // bare "•" / "12." on its own line
             const char* q = b; while (q < hl && *q == ' ') q++;
-            if (hl - q >= 3 && !memcmp(q, "\xe2\x80\xa2", 3)) q += 3;
-            else { while (q < hl && isdigit((unsigned char)*q)) q++; if (q < hl && *q == '.') q++; }
+            const char* mk = q;
+            bool num = !(hl - q >= 3 && !memcmp(q, "\xe2\x80\xa2", 3));
+            if (!num) q += 3;
+            else while (q < hl && isdigit((unsigned char)*q)) q++;
+            const char* dg = q;           // after the bullet / the digits
+            if (num && q < hl && *q == '.') q++;
             if (q < hl && *q == ' ') q++;
-            while (q < hl && *q != ' ') q++;
-            fuse = q;
+            mkEnd = q;
+            fw = q; while (fw < hl && *fw != ' ') fw++;
+            float markerW = ImGui::CalcTextSize(b, mkEnd).x;
+            if (!num) indentX = markerW;   // firstX stays 0
+            else {
+                indentX = ImGui::CalcTextSize(b, mk).x + ImGui::CalcTextSize("0").x
+                        + ImGui::CalcTextSize(dg, mkEnd).x;
+                firstX = indentX - markerW;
+            }
         }
         const char* sb = b;
+        bool firstSeg = true;
         for (;;) {   // soft-wrap the hard line (single pass when wrap is off)
+            float x0 = firstSeg ? firstX : indentX;   // 0 for non-list lines
             const char* se = hl;
             bool wrapped = false;
             if (wrapW > 0.f && sb < hl) {
-                se = f->CalcWordWrapPosition(px, sb, hl, wrapW);
+                se = f->CalcWordWrapPosition(px, sb, hl, fmaxf(wrapW - x0, 1.f));
                 if (se <= sb) { const char* n = sb + utf8_len(sb); se = n > hl ? hl : n; }   // always progress
-                if (fuse && sb == b && se < fuse) se = fuse;   // marker + first word stay together
+                if (firstSeg && pin && se < fw) {
+                    // marker + first word overflow: hard-cut the word at the
+                    // box edge (no ellipsis) instead of stranding the marker
+                    se = f->CalcWordWrapPosition(px, mkEnd, hl, fmaxf(wrapW - indentX, 1.f));
+                    if (se <= mkEnd) { const char* n = mkEnd + utf8_len(mkEnd); se = n > hl ? hl : n; }
+                }
                 wrapped = se < hl;
             }
             const char* we = se;
@@ -559,23 +585,25 @@ static void layout_text(const std::string& text, ImFont* f, float px, int align,
             ln.b = (int)(sb - base); ln.we = (int)(we - base);
             ln.e = (int)((wrapped ? ns : hl) - base);
             ln.w = we > sb ? ImGui::CalcTextSize(sb, we).x : 0.f;
-            ln.x = 0.f;
+            ln.x = x0;
             ln.pin = pin;
             out.lines.push_back(ln);
             if (!wrapped) break;
-            sb = ns;
+            sb = ns; firstSeg = false;
         }
         if (hl >= end) break;
         b = hl + 1;
     }
-    float maxW = 0.f;
-    for (auto& ln : out.lines) maxW = fmaxf(maxW, ln.w);
+    float maxW = 0.f;   // pinned lines carry their hanging indent in x already
+    for (auto& ln : out.lines) maxW = fmaxf(maxW, ln.x + ln.w);
     out.blockW = wrapW > 0.f ? wrapW : maxW;
     if (text.empty()) out.blockW = ImGui::CalcTextSize(" ").x;   // stay hittable
     if (align)
         for (auto& ln : out.lines)
             if (!ln.pin)
                 ln.x = align == 1 ? (out.blockW - ln.w) * 0.5f : (out.blockW - ln.w);
+    out.minX = 0.f;
+    for (auto& ln : out.lines) out.minX = fminf(out.minX, ln.x);
     out.ext = ImVec2(out.blockW, px * (float)out.lines.size());
     ImGui::PopFont();
 }
@@ -594,20 +622,26 @@ static int layout_line_of(const TextLayout& lay, int idx) {
 // marquee and snapping all funnel through text_extent. Cache per shape id,
 // validated against every input that shapes the metric (deterministic for a
 // given font+px+wrap+text, so no time-based invalidation needed).
-struct TextExt { int family = -1; float px = 0, wrapW = -1; std::string text; ImVec2 ext; };
+struct TextExt { int family = -1; float px = 0, wrapW = -1; std::string text; ImVec2 ext; float minX = 0; };
 static std::unordered_map<uint64_t, TextExt> g_extCache;
-static ImVec2 text_extent(const Shape& s) {
+static const TextExt& text_metrics(const Shape& s) {
     float px = text_px(s);
     auto it = g_extCache.find(s.id);
     if (it != g_extCache.end()) {
         TextExt& c = it->second;
-        if (c.family == s.family && c.px == px && c.wrapW == s.wrapW && c.text == s.text) return c.ext;
+        if (c.family == s.family && c.px == px && c.wrapW == s.wrapW && c.text == s.text) return c;
     }
     static TextLayout lay;
     layout_text(s.text, g_fonts[s.family], px, s.align, s.wrapW, lay);
-    g_extCache[s.id] = { s.family, px, s.wrapW, s.text, lay.ext };
-    return lay.ext;
+    TextExt& c = g_extCache[s.id];
+    c = { s.family, px, s.wrapW, s.text, lay.ext, lay.minX };
+    return c;
 }
+static ImVec2 text_extent(const Shape& s) { return text_metrics(s).ext; }
+// ≤ 0: how far numbered-list markers stick out LEFT of the local rect — part
+// of the drawn ink (render bounds, culling, export) but NOT of the box
+// (handles, wrap drag, arrow binding)
+static float text_left_overhang(const Shape& s) { return text_metrics(s).minX; }
 
 // Text/image shapes live in a LOCAL axis-aligned rect (pos..pos+size/extent)
 // rotated by `rot` about the rect's center. Everything geometric goes through
@@ -644,10 +678,13 @@ static WRect shape_bounds(const Shape& s) {
     WRect r;
     switch (s.type) {
     case SH_TEXT: case SH_IMAGE: {
-        if (!has_rot(s)) return shape_local_rect(s);
-        ImVec2 c[4]; shape_obb(s, c);
-        r.mn = r.mx = c[0];
-        for (int i = 1; i < 4; i++) r.include(c[i]);
+        WRect lr = shape_local_rect(s);
+        ImVec2 piv = lr.center();   // rotation pivot = the BOX center, always
+        if (s.type == SH_TEXT) lr.mn.x += text_left_overhang(s);   // poking "10." markers are ink too
+        if (!has_rot(s)) return lr;
+        ImVec2 k[4] = { lr.mn, ImVec2(lr.mx.x, lr.mn.y), lr.mx, ImVec2(lr.mn.x, lr.mx.y) };
+        r.mn = r.mx = rot_about(k[0], piv, s.rot);
+        for (int i = 1; i < 4; i++) r.include(rot_about(k[i], piv, s.rot));
     } break;
     case SH_ARROW: {
         ImVec2 pa = arrow_end_pos(s.a), pb = arrow_end_pos(s.b);
@@ -2179,6 +2216,12 @@ static void draw_text_shape(ImDrawList* dl, const Shape& s) {
     // vertex range into place
     static TextLayout lay;   // reused across calls (single-threaded)
     layout_text(s.text, f, pxW, s.align, s.wrapW, lay);
+    // Lines are composed near the ORIGIN in raster space and only then moved
+    // into place by the vertex transform below — but AddText culls glyphs
+    // against the clip rect at ADD time, which would eat anything at negative
+    // raster x (numbered markers poking left of the box) or past the display.
+    // Shape-level culling already decides visibility, so clip wide open here.
+    dl->PushClipRect(ImVec2(-1e7f, -1e7f), ImVec2(1e7f, 1e7f));
     ImGui::PushFont(f, rp);
     const char* base = s.text.c_str();
     for (int i = 0; i < (int)lay.lines.size(); i++) {
@@ -2187,6 +2230,7 @@ static void draw_text_shape(ImDrawList* dl, const Shape& s) {
             add_text_bold(dl, f, rp, ImVec2(ln.x * lk, i * rp), col, base + ln.b, base + ln.we);
     }
     ImGui::PopFont();
+    dl->PopClipRect();
     for (int i = vtx0; i < dl->VtxBuffer.Size; i++) {
         ImDrawVert& v = dl->VtxBuffer[i];
         v.pos.x = v.pos.x * k + sp.x; v.pos.y = v.pos.y * k + sp.y;

@@ -100,10 +100,17 @@ cannot diverge between draw and hit-testing. `Shape.wrapW` (world units,
 `wrap` in board.json, 0 = auto-size): on a single selected text the whole
 LEFT/RIGHT edge drags the wrap box and the whole TOP/BOTTOM edge scales
 (square midpoint gizmos mark all four; corners + rotate ring keep priority;
-quick second press on a side edge = auto-size); a list line's marker and
-first word wrap as ONE unit (no stranded "•"); rotation-safe via the crop
-trick (mouse in the snapshot's local frame, new rect's center placed through
-the old frame). Corner resize scales wrapW with the glyphs. **DrawTextEditor replaced imgui's InputTextMultiline entirely**:
+quick second press on a side edge = auto-size); list items HANG: wrapped
+continuations indent to the text column after the marker, numbered markers
+right-align their dots to a shared single-digit column ("10." pokes out the
+LEFT of the box, tldraw-style — text_left_overhang() widens render/cull/
+export bounds for it, the BOX stays put), the marker fuses with its first
+word and a too-wide word hard-cuts at the box edge (no ellipsis, never a
+stranded "•"); rotation-safe via the crop trick (mouse in the snapshot's
+local frame, new rect's center placed through the old frame). Corner resize
+scales wrapW with the glyphs. draw_text_shape composes lines at the origin
+before its vertex transform, so it draws under a wide-open clip rect —
+AddText would otherwise cull negative-x glyphs at ADD time. **DrawTextEditor replaced imgui's InputTextMultiline entirely**:
 caret/selection/undo live in `g_ted`, mouse maps into the shape's local frame
 (rotation inverse, layout lines, nearest-boundary x), text mutations go
 through `ed_mutate` (arrow anchors pinned to world points, rotated texts keep
