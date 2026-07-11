@@ -82,15 +82,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: apt deps (SDL backends need headers; the .so's are dlopened at runtime)
+        # the full SDL3 linux build-dep list (README-linux) — X11 subfeatures
+        # like XTEST hard-error at configure when their headers are missing
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config nasm zip \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libxfixes-dev libxss-dev libxkbcommon-dev \
-            libwayland-dev wayland-protocols libdecor-0-dev libegl1-mesa-dev \
-            libgl1-mesa-dev libdbus-1-dev libudev-dev \
-            libasound2-dev libpulse-dev libpipewire-0.3-dev
+            libxfixes-dev libxss-dev libxtst-dev libxinerama-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev \
+            libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev libegl1-mesa-dev \
+            libdbus-1-dev libibus-1.0-dev libudev-dev liburing-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libjack-dev libsndio-dev
       - name: cache static SDL3 + ffmpeg
         id: deps
         uses: actions/cache@v4
