@@ -29,6 +29,8 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -395,9 +397,19 @@ static Doc g_doc;
 static std::string g_projDir;    // project dir (board.json + assets/ + undo.jsonl)
 
 static void delete_shapes(const std::vector<uint64_t>& ids);   // fwd (load-time sanitize)
+// id → doc index, memoized: arrows resolve their bind target every frame, so
+// a linear scan is O(arrows·shapes). Each hit is validated against the live
+// vector (inserts/erases/reorders just fall back to a rescan) — never stale.
+static std::unordered_map<uint64_t, int> g_idIndex;
 static Shape* find_shape(uint64_t id) {
     if (!id) return nullptr;
-    for (auto& s : g_doc.shapes) if (s.id == id) return &s;
+    auto it = g_idIndex.find(id);
+    if (it != g_idIndex.end()) {
+        int i = it->second;
+        if (i < (int)g_doc.shapes.size() && g_doc.shapes[i].id == id) return &g_doc.shapes[i];
+    }
+    for (int i = 0; i < (int)g_doc.shapes.size(); i++)
+        if (g_doc.shapes[i].id == id) { g_idIndex[id] = i; return &g_doc.shapes[i]; }
     return nullptr;
 }
 static int find_index(uint64_t id) {
@@ -429,12 +441,25 @@ static bool members_common_rot(uint64_t gid, float* out) {
 // ── shape geometry ──
 static float text_px(const Shape& s) { return kTextSizes[s.tsize] * s.scale; }
 
+// CalcTextSize is the hot path at 1000s of shapes — bounds, hit tests, draw,
+// marquee and snapping all funnel through text_extent. Cache per shape id,
+// validated against every input that shapes the metric (deterministic for a
+// given font+px+text, so no time-based invalidation needed).
+struct TextExt { int family = -1; float px = 0; std::string text; ImVec2 ext; };
+static std::unordered_map<uint64_t, TextExt> g_extCache;
 static ImVec2 text_extent(const Shape& s) {
+    float px = text_px(s);
+    auto it = g_extCache.find(s.id);
+    if (it != g_extCache.end()) {
+        TextExt& c = it->second;
+        if (c.family == s.family && c.px == px && c.text == s.text) return c.ext;
+    }
     ImFont* f = g_fonts[s.family];
     const char* txt = s.text.empty() ? " " : s.text.c_str();
-    ImGui::PushFont(f, text_px(s));
+    ImGui::PushFont(f, px);
     ImVec2 sz = ImGui::CalcTextSize(txt);
     ImGui::PopFont();
+    g_extCache[s.id] = { s.family, px, s.text, sz };
     return sz;
 }
 
@@ -1137,10 +1162,15 @@ static ID3D11ShaderResourceView* video_srv(const Shape& s, MediaKind mk) {
 }
 #endif
 
-// drop playback state (and its GPU texture) for shapes that no longer exist
+// drop playback state (and its GPU texture) + cached text extents for shapes
+// that no longer exist
 static void sweep_play_states() {
     for (auto it = g_play.begin(); it != g_play.end();) {
         if (!find_shape(it->first)) { it->second.release(); it = g_play.erase(it); }
+        else ++it;
+    }
+    for (auto it = g_extCache.begin(); it != g_extCache.end();) {
+        if (!find_shape(it->first)) it = g_extCache.erase(it);
         else ++it;
     }
 }
@@ -1502,6 +1532,8 @@ static void switch_board(const std::string& dirIn) {
     g_texCache.clear();
     for (auto& [id, ps] : g_play) ps.release();
     g_play.clear();
+    g_extCache.clear();
+    g_idIndex.clear();
 #ifdef TEI_LIBAV
     for (auto& [rel, d] : g_decoders) { d->close(); delete d; }
     g_decoders.clear();
@@ -1543,11 +1575,12 @@ static float screen_px(float px) { return px / g_cam.zoom; }   // px → world u
 
 // topmost leaf under the point (never returns groups)
 static uint64_t hit_test(ImVec2 w) {
+    static std::vector<ImVec2> pl;   // reused across arrows (single-threaded)
     for (int i = (int)g_doc.shapes.size() - 1; i >= 0; i--) {
         Shape& s = g_doc.shapes[i];
         if (s.type == SH_GROUP) continue;
         if (s.type == SH_ARROW) {
-            std::vector<ImVec2> pl; arrow_polyline(s, pl);
+            arrow_polyline(s, pl);
             float th = screen_px(8.f);
             for (size_t k = 0; k + 1 < pl.size(); k++)
                 if (dist_point_seg(w, pl[k], pl[k + 1]) < th) return s.id;
@@ -1649,11 +1682,12 @@ static void draw_text_shape(ImDrawList* dl, const Shape& s) {
 }
 
 static void draw_arrow_shape(ImDrawList* dl, const Shape& s, bool ghostEnd = false) {
-    std::vector<ImVec2> pl; arrow_polyline(s, pl);
+    static std::vector<ImVec2> pl, sp;   // reused across calls (single-threaded)
+    arrow_polyline(s, pl);
     if (pl.size() < 2) return;
     float thick = fmaxf(3.25f * g_cam.zoom, 2.f);
     ImU32 col = shape_ink(s);
-    std::vector<ImVec2> sp(pl.size());
+    sp.resize(pl.size());
     for (size_t i = 0; i < pl.size(); i++) sp[i] = W2S(pl[i]);
     // reserve room at the tip for the head
     ImVec2 tip = sp.back();
@@ -1694,8 +1728,25 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
         for (auto i : *only) if (i == id) return true;
         return false;
     };
+    // Viewport culling: skip shapes fully outside the view. The pad covers
+    // everything drawn past a shape's bounds (arrowheads, labels, faux-bold).
+    // Offscreen gifs/videos also stop decoding here — playback resumes when
+    // they scroll back in. (Export renders set DisplaySize to the export rect,
+    // so the same test works there.)
+    WRect view{ S2W(ImVec2(0, 0)), S2W(ImGui::GetIO().DisplaySize) };
+    float pad = 64.f / g_cam.zoom;
+    view.mn = view.mn - ImVec2(pad, pad); view.mx = view.mx + ImVec2(pad, pad);
     for (auto& s : g_doc.shapes) {
-        if (s.id == skipId || !in_only(s.id)) continue;
+        if (s.id == skipId || s.type == SH_GROUP || !in_only(s.id)) continue;
+        WRect b = shape_bounds(s);
+        if (s.type == SH_ARROW && s.bend != 0.f) {
+            // a bent curve bulges past the endpoint box: include the bezier
+            // control point (the curve stays inside hull(A, C, B))
+            ImVec2 A = arrow_end_pos(s.a), B = arrow_end_pos(s.b);
+            ImVec2 ch = B - A; float cl = vlen(ch);
+            if (cl > 0.0001f) b.include((A + B) * 0.5f + ImVec2(-ch.y / cl, ch.x / cl) * (2.f * s.bend));
+        }
+        if (b.mx.x < view.mn.x || b.mn.x > view.mx.x || b.mx.y < view.mn.y || b.mn.y > view.mx.y) continue;
         switch (s.type) {
         case SH_TEXT:  draw_text_shape(dl, s); break;
         case SH_ARROW: draw_arrow_shape(dl, s); break;
@@ -3444,13 +3495,16 @@ static void CanvasFrame() {
         auto touches = [&](const WRect& b) {
             return b.mx.x >= mr.mn.x && b.mn.x <= mr.mx.x && b.mx.y >= mr.mn.y && b.mn.y <= mr.mx.y;
         };
+        // dedupe only against the shift-kept selection: the two passes below
+        // are disjoint, and an O(sel) scan per shape goes quadratic on big boards
+        std::unordered_set<uint64_t> pre(g_sel.begin(), g_sel.end());
         for (auto& s : g_doc.shapes) {
             if (s.parent || s.type == SH_GROUP) continue;
-            if (touches(shape_bounds(s)) && !is_selected(s.id)) g_sel.push_back(s.id);
+            if (touches(shape_bounds(s)) && !pre.count(s.id)) g_sel.push_back(s.id);
         }
         for (auto& s : g_doc.shapes) {
             if (s.type != SH_GROUP || s.parent) continue;
-            if (touches(shape_bounds(s)) && !is_selected(s.id)) g_sel.push_back(s.id);
+            if (touches(shape_bounds(s)) && !pre.count(s.id)) g_sel.push_back(s.id);
         }
     }
 
