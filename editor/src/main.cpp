@@ -530,13 +530,25 @@ static void layout_text(const std::string& text, ImFont* f, float px, int align,
         const char* hl = (const char*)memchr(b, '\n', end - b);
         if (!hl) hl = end;
         bool pin = is_list_line(b, hl);   // per HARD line, so a wrapped list
-        const char* sb = b;               // item's continuations stay pinned too
+        const char* fuse = nullptr;       // item's continuations stay pinned too
+        if (pin) {
+            // the marker and the first word wrap as ONE unit — never strand a
+            // bare "•" / "12." on its own line
+            const char* q = b; while (q < hl && *q == ' ') q++;
+            if (hl - q >= 3 && !memcmp(q, "\xe2\x80\xa2", 3)) q += 3;
+            else { while (q < hl && isdigit((unsigned char)*q)) q++; if (q < hl && *q == '.') q++; }
+            if (q < hl && *q == ' ') q++;
+            while (q < hl && *q != ' ') q++;
+            fuse = q;
+        }
+        const char* sb = b;
         for (;;) {   // soft-wrap the hard line (single pass when wrap is off)
             const char* se = hl;
             bool wrapped = false;
             if (wrapW > 0.f && sb < hl) {
                 se = f->CalcWordWrapPosition(px, sb, hl, wrapW);
                 if (se <= sb) { const char* n = sb + utf8_len(sb); se = n > hl ? hl : n; }   // always progress
+                if (fuse && sb == b && se < fuse) se = fuse;   // marker + first word stay together
                 wrapped = se < hl;
             }
             const char* we = se;
@@ -2855,31 +2867,49 @@ static int draw_selection_ui(ImDrawList* dl, bool handlesActive) {
     const float r = 5.f;
     for (int i = 0; i < 4; i++)
         if (vlen(m - g_selCorners[i]) < r + 3) hover = i;
-    // side handles on a single text: drag sets the wrap width (dbl-click resets)
+    // Single text: the whole LEFT/RIGHT edge drags the wrap box (8/9), the
+    // whole TOP/BOTTOM edge scales (10/11) — square midpoint gizmos mark all
+    // four so the affordance is visible. Corners + rotate ring keep priority.
     bool sides = single && single->type == SH_TEXT;
-    ImVec2 sideMid[2];
-    if (sides) {
-        sideMid[0] = (g_selCorners[0] + g_selCorners[3]) * 0.5f;   // 8 = left edge
-        sideMid[1] = (g_selCorners[1] + g_selCorners[2]) * 0.5f;   // 9 = right edge
-        if (hover < 0)
-            for (int i = 0; i < 2; i++)
-                if (vlen(m - sideMid[i]) < r + 2) hover = 8 + i;
-    }
+    // edge endpoints, indexed 8..11: left c0→c3, right c1→c2, top c0→c1, bottom c3→c2
+    ImVec2 egA[4] = { g_selCorners[0], g_selCorners[1], g_selCorners[0], g_selCorners[3] };
+    ImVec2 egB[4] = { g_selCorners[3], g_selCorners[2], g_selCorners[1], g_selCorners[2] };
+    if (sides && hover < 0)   // midpoint squares first — reachable on tiny texts
+        for (int i = 0; i < 4; i++)
+            if (vlen(m - (egA[i] + egB[i]) * 0.5f) < r + 2) hover = 8 + i;
     if (hover < 0)   // rotate ring: a band just outside each corner handle
         for (int i = 0; i < 4; i++) {
             float d = vlen(m - g_selCorners[i]);
             if (d >= r + 3 && d < r + 17) hover = 4 + i;
         }
+    if (sides && hover < 0) {   // then the full edges
+        auto seg_d = [&](ImVec2 a, ImVec2 b) {
+            ImVec2 ab = b - a; float L2 = ab.x * ab.x + ab.y * ab.y;
+            float t = L2 > 0.f ? ((m.x - a.x) * ab.x + (m.y - a.y) * ab.y) / L2 : 0.f;
+            t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
+            return vlen(m - (a + ab * t));
+        };
+        for (int i = 0; i < 4; i++)
+            if (seg_d(egA[i], egB[i]) < 6.f) { hover = 8 + i; break; }
+    }
     for (int i = 0; i < 4; i++) {
         dl->AddCircleFilled(g_selCorners[i], r, g_th.handleFill);
         dl->AddCircle(g_selCorners[i], r, g_th.selStroke, 0, 1.5f);
     }
     if (sides)
-        for (int i = 0; i < 2; i++) {
-            dl->AddCircleFilled(sideMid[i], 3.5f, g_th.handleFill);
-            dl->AddCircle(sideMid[i], 3.5f, g_th.selStroke, 0, 1.5f);
+        for (int i = 0; i < 4; i++) {   // squares oriented with the box
+            ImVec2 mid = (egA[i] + egB[i]) * 0.5f;
+            ImVec2 d = egB[i] - egA[i]; float L = vlen(d);
+            d = L > 0.f ? d * (1.f / L) : ImVec2(1, 0);
+            ImVec2 n(-d.y, d.x);
+            const float h = 3.2f;
+            ImVec2 q[4] = { mid - d * h - n * h, mid + d * h - n * h,
+                            mid + d * h + n * h, mid - d * h + n * h };
+            dl->AddQuadFilled(q[0], q[1], q[2], q[3], g_th.handleFill);
+            dl->AddQuad(q[0], q[1], q[2], q[3], g_th.selStroke, 1.5f);
         }
-    if (hover >= 8) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    if (hover >= 10) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    else if (hover >= 8) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
     else if (hover >= 4) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     return hover;
 }
@@ -4142,22 +4172,34 @@ static void CanvasFrame() {
                 }
             }
             if (hoverHandle >= 8 && g_sel.size() == 1) {
-                // side handle on a text: drag = set wrap width; a quick second
-                // press on the same handle = back to auto-size
                 Shape* s = find_shape(g_sel[0]);
                 if (s && s->type == SH_TEXT) {
-                    double now = ImGui::GetTime();
-                    bool dbl = now - g_wrapClickAt < 0.32 && g_wrapClickId == s->id && g_wrapClickIdx == hoverHandle;
-                    g_wrapClickAt = now; g_wrapClickId = s->id; g_wrapClickIdx = hoverHandle;
-                    if (dbl && s->wrapW > 0.f) {
-                        Shape snap = *s;
-                        apply_text_wrap(*s, snap, snap.pos.x, 0.f);
-                        push_undo();
-                        g_drag = DM_NONE;
-                    } else {
-                        g_drag = DM_WRAP; g_handleIdx = hoverHandle;
+                    if (hoverHandle >= 10) {
+                        // top/bottom edge: uniform scale about the opposite
+                        // edge's midpoint (same math as a corner handle)
+                        g_drag = DM_HANDLE; g_handleIdx = hoverHandle;
                         g_handleStartShapes.clear();
                         g_handleStartShapes.push_back({ s->id, *s });
+                        ImVec2 fa = hoverHandle == 10 ? g_selCorners[3] : g_selCorners[0];
+                        ImVec2 fb = hoverHandle == 10 ? g_selCorners[2] : g_selCorners[1];
+                        g_handleFixedW = S2W((fa + fb) * 0.5f);
+                        g_handleStartDist = fmaxf(vlen(mw - g_handleFixedW), 0.001f);
+                    } else {
+                        // left/right edge: drag = set wrap width; a quick
+                        // second press on the same edge = back to auto-size
+                        double now = ImGui::GetTime();
+                        bool dbl = now - g_wrapClickAt < 0.32 && g_wrapClickId == s->id && g_wrapClickIdx == hoverHandle;
+                        g_wrapClickAt = now; g_wrapClickId = s->id; g_wrapClickIdx = hoverHandle;
+                        if (dbl && s->wrapW > 0.f) {
+                            Shape snap = *s;
+                            apply_text_wrap(*s, snap, snap.pos.x, 0.f);
+                            push_undo();
+                            g_drag = DM_NONE;
+                        } else {
+                            g_drag = DM_WRAP; g_handleIdx = hoverHandle;
+                            g_handleStartShapes.clear();
+                            g_handleStartShapes.push_back({ s->id, *s });
+                        }
                     }
                 }
                 goto down_done;
@@ -4275,7 +4317,8 @@ static void CanvasFrame() {
             case SH_GROUP: break;
             }
         }
-        ImGui::SetMouseCursor(g_handleIdx % 2 == 0 ? ImGuiMouseCursor_ResizeNWSE : ImGuiMouseCursor_ResizeNESW);
+        ImGui::SetMouseCursor(g_handleIdx >= 10 ? ImGuiMouseCursor_ResizeNS
+                              : g_handleIdx % 2 == 0 ? ImGuiMouseCursor_ResizeNWSE : ImGuiMouseCursor_ResizeNESW);
     }
 
     if (g_drag == DM_ROTATE) {
@@ -4473,12 +4516,18 @@ int main(int argc, char** argv) {
     const char* shotPath = nullptr; int shotFrames = 8;
     const char* exportPng = nullptr; const char* exportTxt = nullptr;
     std::string boardArg; bool forcePicker = false;
+    uint64_t editId = 0;   // dev: open the text editor on this shape (headless editor shots)
+    uint64_t selId = 0;    // dev: select this shape (headless selection-UI shots)
+    int bsFrame = -1;      // dev: press Backspace in the editor on this frame
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
         else if (!strcmp(argv[i], "--export") && i + 1 < argc) exportPng = argv[++i];
         else if (!strcmp(argv[i], "--export-txt") && i + 1 < argc) exportTxt = argv[++i];
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) shotFrames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--picker")) forcePicker = true;   // dev: shot the picker UI
+        else if (!strcmp(argv[i], "--edit") && i + 1 < argc) editId = strtoull(argv[++i], nullptr, 10);
+        else if (!strcmp(argv[i], "--sel") && i + 1 < argc) selId = strtoull(argv[++i], nullptr, 10);
+        else if (!strcmp(argv[i], "--bs") && i + 1 < argc) bsFrame = atoi(argv[++i]);
         else if (argv[i][0] != '-') boardArg = argv[i];
     }
     bool headless = shotPath || exportPng || exportTxt;
@@ -4511,6 +4560,11 @@ int main(int argc, char** argv) {
     LoadFonts();
     ImGui::GetStyle().FontSizeBase = 15.f * g_dpi;
     if (!boardArg.empty()) switch_board(boardArg);   // empty = picker opens over a blank canvas
+    if (editId) {
+        Shape* es = find_shape(editId);
+        if (es && es->type == SH_TEXT) { g_sel.assign(1, editId); begin_text_edit(editId, (int)es->text.size()); }
+    }
+    if (selId && find_shape(selId)) g_sel.assign(1, selId);
     ApplyTheme();
     ImGui::GetStyle().ScaleAllSizes(g_dpi);
 
@@ -4537,6 +4591,10 @@ int main(int argc, char** argv) {
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
+        if (bsFrame >= 0) {   // dev: scripted keystroke for headless editor shots
+            if (framesDone == bsFrame) io.AddKeyEvent(ImGuiKey_Backspace, true);
+            if (framesDone == bsFrame + 1) io.AddKeyEvent(ImGuiKey_Backspace, false);
+        }
         ImGui::NewFrame();
 
 #ifdef TEI_LIBAV

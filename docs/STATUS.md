@@ -97,11 +97,13 @@ alignment, list pinning (decided per HARD line so a wrapped bullet's
 continuations stay pinned) — rendering, `text_extent` (cache keyed on wrap
 too), caret mapping and the editor all read the same `TextLayout`, so breaks
 cannot diverge between draw and hit-testing. `Shape.wrapW` (world units,
-`wrap` in board.json, 0 = auto-size): single-text selections grow SIDE
-handles (drag = set wrap box, quick second press = back to auto-size);
-rotation-safe via the crop trick (mouse in the snapshot's local frame, new
-rect's center placed through the old frame). Corner resize scales wrapW with
-the glyphs. **DrawTextEditor replaced imgui's InputTextMultiline entirely**:
+`wrap` in board.json, 0 = auto-size): on a single selected text the whole
+LEFT/RIGHT edge drags the wrap box and the whole TOP/BOTTOM edge scales
+(square midpoint gizmos mark all four; corners + rotate ring keep priority;
+quick second press on a side edge = auto-size); a list line's marker and
+first word wrap as ONE unit (no stranded "•"); rotation-safe via the crop
+trick (mouse in the snapshot's local frame, new rect's center placed through
+the old frame). Corner resize scales wrapW with the glyphs. **DrawTextEditor replaced imgui's InputTextMultiline entirely**:
 caret/selection/undo live in `g_ted`, mouse maps into the shape's local frame
 (rotation inverse, layout lines, nearest-boundary x), text mutations go
 through `ed_mutate` (arrow anchors pinned to world points, rotated texts keep
@@ -146,9 +148,20 @@ testing (typing feel, selection, IME, auto-lists, wrapped/rotated editing).
 - List lines ("• ", "N. ") always pin left even in centered/right text — a
   deliberate heuristic; wrapped continuations of a list item inherit the pin
   (decided per hard line in layout_text).
+- OPEN (user report, session 8): while typing, a line can look "rendered
+  twice with a slight offset / bolder" on the live canvas. NOT reproduced
+  headless: committed renders are byte-stable, per-frame layout logs are
+  stable post-edit, single-frame --edit/--bs shots look clean. Waiting on a
+  live screenshot + zoom level; suspect list: something temporal (frame
+  alternation) or dynamic-font-atlas UV churn under real session pressure.
 - Bare launch reopens recent[0] from settings.json; headless (`--shot`/
   `--export*`) never touches recents and still defaults to `./scratch`.
   `--picker` (dev flag) forces the picker open — used for headless UI shots.
+  More dev flags: `--sel <id>` selects a shape (selection-UI shots),
+  `--edit <id>` opens the text editor on it, `--bs <frame>` presses Backspace
+  on that frame. CAVEAT: headless runs still open a real focused window on
+  the host (stray keystrokes land in it) and SAVE the board on exit — never
+  point repeated scripted runs at a board whose exact content matters.
   Settings tests can point the app at a fake `%APPDATA%` via
   `WSLENV=APPDATA/p APPDATA=<dir> ./build/teidraw.exe …`.
 - Escape-while-crop-dragging commits instead of canceling.
