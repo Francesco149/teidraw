@@ -143,15 +143,24 @@ rubber-band segment onto the LAST stroke (same shape, from its endpoint), and
 toggling shift mid-drag flips straight/freehand within one gesture
 (`g_drawSegBase` marks the live segment; straight mode rewrites its tail each
 frame). One undo per gesture. Strokes use the S/M/L/XL ladder as width
-(`kDrawSizes` 2/3.5/5/10 world px, style panel size row applies, align is
+(`kDrawSizes` 2.5/4.5/7/12 world px, style panel size row applies, align is
 text-only), palette color + opacity work. Rendering (`draw_stroke_shape`):
-pressure-radius rails around each point; opaque = overlapping quads + a disc
-per point (O(n), self-intersection-proof); translucent = hand-built mesh
-(strip triangles + cap fans + 1px outward AA fringe via PrimReserve) because
-one polygon fill must NOT ear-clip — stroke outlines self-intersect at curls
-tighter than the pen radius and AddConcavePolyFilled turns those into giant
-blobs (session-9 lesson, caught by `--export` render test). Hit-testing walks
-the ink polyline (max(radius, 6px) threshold, box prefilter), not the rect.
+pressure-radius rails around each point, filled as ONE hand-built mesh at
+every opacity — strip triangles + cap fans + a single 1px outward AA fringe
+via PrimReserve. One mesh is load-bearing twice (user-reported lessons):
+overlapping-primitive fills STACK their AA fringes (a quads+discs-per-point
+first cut multi-blended every edge pixel to ~full alpha = hard aliased edges
+despite AA "on" — diagnosed by pixel-scanning exports for ramp values), and
+translucent ink must fill exactly once or joints blotch. AddConcavePolyFilled
+is also out: it ear-clips, and outlines self-intersect at curls tighter than
+the pen radius → giant filled blobs. Simulated pressure runs on SCREEN-space
+hand speed (zoom-independent), full-fat when deliberate → full-thin at a
+~4500px/s flick; the first cut normalized by stroke width in world px and
+saturated thin at real drawing speeds, which read as "pressure does nothing".
+Pen: stderr prints "pen pressure active" on first Windows Ink pointer event —
+if it never prints while inking, enable Windows Ink in the tablet driver.
+Hit-testing walks the ink polyline (max(radius, 6px) threshold, box
+prefilter), not the rect.
 `draw_recalc_bounds` re-hugs the rect to the ink after every append / width
 change, keeping ink world-stationary under rotation via the crop/wrap
 center-remap trick. Corner resize scales pts+scale in lockstep so the box

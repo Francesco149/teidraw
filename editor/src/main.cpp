@@ -454,11 +454,13 @@ static bool members_common_rot(uint64_t gid, float* out) {
 // ── shape geometry ──
 static float text_px(const Shape& s) { return kTextSizes[s.tsize] * s.scale; }
 
-// strokes share the S/M/L/XL ladder (widths in world px, tldraw's draw sizes);
-// pressure thins toward 35% of the nominal width and can fatten a touch past it
-static const float kDrawSizes[4] = { 2.f, 3.5f, 5.f, 10.f };
+// strokes share the S/M/L/XL ladder (widths in world px); pressure sweeps the
+// drawn width between 30% and 110% of nominal — a 3.7x swing, so speed/pen
+// dynamics actually READ on screen (the first cut's 0.35..1.1 on half-sized
+// widths looked constant to the user)
+static const float kDrawSizes[4] = { 2.5f, 4.5f, 7.f, 12.f };
 static float draw_width(const Shape& s) { return kDrawSizes[s.tsize] * s.scale; }
-static float draw_radius(const Shape& s, float p) { return draw_width(s) * 0.5f * (0.35f + 0.75f * p); }
+static float draw_radius(const Shape& s, float p) { return draw_width(s) * 0.5f * (0.3f + 0.8f * p); }
 
 // Reject NaN/inf AND imgui's "no mouse" sentinel (-FLT_MAX): on focus loss
 // mid-stroke (alt-tab, another window opening on the host) io.MousePos goes
@@ -2392,12 +2394,15 @@ static void draw_arrow_shape(ImDrawList* dl, const Shape& s, bool ghostEnd = fal
 }
 
 // Variable-width freehand stroke. Rails L/R offset each point along the
-// averaged segment normal by its pressure-driven radius. Two fills:
-//   opaque — overlapping segment quads + a disc at every point (round joins/
-//   caps for free, O(n), immune to self-intersection; invisible overdraw
-//   because the color is solid).
-//   translucent — one concave outline polygon (rails + cap arcs), because
-//   overdraw would double-blend into blotches at every joint.
+// averaged segment normal by its pressure-driven radius; the ribbon renders
+// as ONE hand-built mesh for every opacity (strip triangles + cap fans + a
+// 1px outward AA fringe). One mesh is load-bearing twice over:
+//   - overdraw STACKS AA fringes: the rejected quads+discs-per-point fill
+//     laid 3-5 fringes on every edge pixel, multi-blending the ramp to ~full
+//     alpha — visually hard, aliased edges despite AA being "on".
+//   - translucent ink must fill exactly once or joints double-blend.
+// Concave-poly fill is also out: it ear-clips, and outlines self-intersect
+// wherever the path curls tighter than the pen radius → giant filled blobs.
 static void draw_stroke_shape(ImDrawList* dl, const Shape& s) {
     int n = (int)s.pts.size();
     if (!n) return;
@@ -2423,22 +2428,6 @@ static void draw_stroke_shape(ImDrawList* dl, const Shape& s) {
         L[i] = sp[i] + nn * rr[i];
         R[i] = sp[i] - nn * rr[i];
     }
-    if (s.opacity >= 0.999f) {
-        for (int i = 0; i + 1 < n; i++) {
-            ImVec2 q[4] = { L[i], L[i + 1], R[i + 1], R[i] };
-            dl->AddConvexPolyFilled(q, 4, col);
-        }
-        for (int i = 0; i < n; i++) dl->AddCircleFilled(sp[i], rr[i], col);
-        return;
-    }
-    // Translucent: the ribbon must be filled exactly ONCE or every overlap
-    // double-blends. Concave-poly fill is out — it ear-clips, and a stroke
-    // outline self-intersects wherever the path curls tighter than the pen
-    // radius, which ear-clipping turns into giant filled blobs. So build the
-    // mesh by hand: strip triangles between the rails, semicircle fans for the
-    // caps, and a 1px outward fringe fading to transparent for anti-aliasing
-    // (a fold at an extreme cusp can still double-blend, but only inside the
-    // fold's own few pixels).
     struct RV { ImVec2 p, o; };            // outline ring vertex + outward unit
     static std::vector<RV> ring;
     ring.clear(); ring.reserve(2 * n + 14);
@@ -2974,7 +2963,7 @@ static void draw_begin(ImVec2 mw, bool shift) {
         Shape s; s.id = new_id(); s.type = SH_DRAW;
         s.col = g_curCol; s.opacity = g_curOpacity; s.tsize = g_curSize;
         s.pos = mw;
-        g_drawPressure = g_penPressure >= 0.f ? g_penPressure : 0.6f;
+        g_drawPressure = g_penPressure >= 0.f ? g_penPressure : 0.7f;
         s.pts.push_back(ImVec2(0, 0));
         s.press.push_back(g_drawPressure);
         g_doc.shapes.push_back(s);
@@ -3020,13 +3009,16 @@ static void draw_update(ImVec2 mw) {
         float target;
         if (g_penPressure >= 0.f) target = g_penPressure;
         else {
-            // simulated: normalize cursor speed by the stroke width so every
-            // size ladder step thins over the same *relative* speed range
-            float speed = vlen(mw - g_drawPrevMouse) / dt;   // world px/s
-            target = 1.f - speed / (draw_width(*s) * 350.f);
+            // simulated from HAND speed (screen px/s — zoom must not change
+            // the feel): full-fat when deliberate, full-thin at a ~4500px/s
+            // flick. The first cut normalized by stroke width in WORLD px and
+            // saturated thin at ~1200px/s — every real stroke pinned to the
+            // minimum, which read as "pressure does nothing".
+            float speed = vlen(mw - g_drawPrevMouse) / dt * g_cam.zoom;
+            target = 1.f - speed / 4500.f;
             target = target < 0.f ? 0.f : target;
         }
-        g_drawPressure += (target - g_drawPressure) * fminf(dt * (g_penPressure >= 0.f ? 40.f : 15.f), 1.f);
+        g_drawPressure += (target - g_drawPressure) * fminf(dt * (g_penPressure >= 0.f ? 40.f : 25.f), 1.f);
         ImVec2 lastW = draw_from_local(*s, s->pts.back());
         if (vlen(g_drawSmooth - lastW) * g_cam.zoom > 2.f) {   // min 2 screen px per point
             s->pts.push_back(draw_to_local(*s, g_drawSmooth));
@@ -5016,6 +5008,14 @@ static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             POINTER_PEN_INFO pi;
             g_penPressure = (GetPointerPenInfo(pid, &pi) && pi.pressure)
                             ? (float)pi.pressure / 1024.f : -1.f;
+            // diagnosable from the launching terminal: if this never prints
+            // while inking, the tablet driver isn't sending Windows Ink
+            // pointer events (enable "Windows Ink" in its settings)
+            static bool logged = false;
+            if (!logged && g_penPressure >= 0.f) {
+                logged = true;
+                fprintf(stderr, "teidraw: pen pressure active (%.2f)\n", g_penPressure);
+            }
         }
         break;
     }
