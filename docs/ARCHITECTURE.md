@@ -63,14 +63,24 @@ stops back) at A.
 ## Input / interaction
 One explicit drag state machine (`DragMode`): PENDING → MOVE/MARQUEE at a 4 px
 threshold; HANDLE (aspect-locked scale about the opposite corner — text scales
-a continuous font multiplier); CROP (ctrl+corner, display-rect corner clamped
-inside the fixed full-image projection, ghost at 30 % alpha); ARROW_A/B
-(rebind on release position), BEND, NEW_ARROW (tool auto-returns to select).
-Selection resolves clicks through the group chain (`resolve_target`), with a
-one-group drill level (`g_drill`). Text editing is an imgui
-`InputTextMultiline` overlay with transparent chrome pushed at the exact
-canvas font size — imgui's stb_textedit gives caret/selection for free
-(escape = commit-what-you-see via a shadow copy, countering imgui's revert).
+a continuous font multiplier, and its wrap box with it); CROP (ctrl+corner,
+display-rect corner clamped inside the fixed full-image projection, ghost at
+30 % alpha); WRAP (side handles on a single text set `wrapW`, rotation-safe
+via the crop trick; quick second press = auto-size); ARROW_A/B (rebind on
+release position), BEND, NEW_ARROW (tool auto-returns to select). Selection
+resolves clicks through the group chain (`resolve_target`), with a one-group
+drill level (`g_drill`).
+
+## Text layout + editing
+`layout_text()` is the single line-breaking engine (soft wrap, per-line
+alignment, list pinning); rendering, extents, caret mapping and the editor
+all read the same `TextLayout`, so editing cannot desync from the committed
+look. The editor (`DrawTextEditor` + `g_ted`) is in-house — no imgui widget:
+it draws through `draw_text_shape`, hit-tests the mouse in the shape's local
+(inverse-rotated) frame, owns caret/selection/blink/in-session-undo, ports
+the auto-list heuristics, pins bound arrow ends across reflows and keeps a
+rotated text's world top-left fixed while its extent changes. Escape and
+click-outside both commit; a whitespace-only commit deletes the shape.
 
 ## Fonts
 Embedded into the PE by `tools/embed.py` (single-file exe): Shantell Sans

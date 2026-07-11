@@ -462,6 +462,49 @@ static bool is_list_line(const char* b, const char* e) {
 static int utf8_len(const char* c) {
     return (*c & 0x80) == 0 ? 1 : (*c & 0xE0) == 0xC0 ? 2 : (*c & 0xF0) == 0xE0 ? 3 : 4;
 }
+static int utf8_prev(const std::string& t, int i) {
+    if (i <= 0) return 0;
+    i--;
+    while (i > 0 && ((unsigned char)t[i] & 0xC0) == 0x80) i--;
+    return i;
+}
+static int utf8_next(const std::string& t, int i) {
+    if (i >= (int)t.size()) return (int)t.size();
+    int n = i + utf8_len(t.c_str() + i);
+    return n > (int)t.size() ? (int)t.size() : n;
+}
+// word boundaries for ctrl+arrow / double-click (any multibyte char counts)
+static bool word_char(unsigned char c) { return isalnum(c) || c == '_' || c >= 0x80; }
+static int word_left(const std::string& t, int i) {
+    int p;
+    while (i > 0 && (p = utf8_prev(t, i), !word_char((unsigned char)t[p]))) i = p;
+    while (i > 0 && (p = utf8_prev(t, i), word_char((unsigned char)t[p]))) i = p;
+    return i;
+}
+static int word_right(const std::string& t, int i) {
+    int n = (int)t.size();
+    while (i < n && word_char((unsigned char)t[i])) i = utf8_next(t, i);
+    while (i < n && !word_char((unsigned char)t[i])) i = utf8_next(t, i);
+    return i;
+}
+static void word_range(const std::string& t, int i, int* a, int* b) {
+    int n = (int)t.size();
+    if (i >= n && n > 0) i = utf8_prev(t, n);
+    auto cls = [&](int k) {   // 0 word · 1 blank · 2 other (each its own run)
+        unsigned char c = (unsigned char)t[k];
+        return word_char(c) ? 0 : (c == ' ' || c == '\t') ? 1 : 2;
+    };
+    if (n == 0 || t[i] == '\n') { *a = *b = i; return; }
+    int k = cls(i);
+    *a = i; *b = utf8_next(t, i);
+    while (*a > 0) { int p = utf8_prev(t, *a); if (t[p] == '\n' || cls(p) != k) break; *a = p; }
+    while (*b < n && t[*b] != '\n' && cls(*b) == k) *b = utf8_next(t, *b);
+}
+static void hard_line_range(const std::string& t, int i, int* a, int* b) {
+    *a = i; while (*a > 0 && t[*a - 1] != '\n') (*a)--;
+    *b = i; while (*b < (int)t.size() && t[*b] != '\n') (*b)++;
+    if (*b < (int)t.size()) (*b)++;   // take the newline: dragging down eats whole lines
+}
 
 // ── text layout ──
 // THE line-breaking + alignment engine: rendering, extents, caret hit-testing
@@ -523,6 +566,16 @@ static void layout_text(const std::string& text, ImFont* f, float px, int align,
                 ln.x = align == 1 ? (out.blockW - ln.w) * 0.5f : (out.blockW - ln.w);
     out.ext = ImVec2(out.blockW, px * (float)out.lines.size());
     ImGui::PopFont();
+}
+
+// map a caret byte offset to its layout line: the first line whose range
+// still contains it — a caret on a soft-wrap boundary sits at the END of the
+// earlier line (known wart: after a mid-WORD cut, Home on the lower line
+// shows the caret on the upper one; only happens when a word exceeds the box)
+static int layout_line_of(const TextLayout& lay, int idx) {
+    for (int i = 0; i < (int)lay.lines.size(); i++)
+        if (idx <= lay.lines[i].e) return i;
+    return (int)lay.lines.size() - 1;
 }
 
 // Layout is the hot path at 1000s of shapes — bounds, hit tests, draw,
@@ -641,12 +694,7 @@ static void arrow_polyline(const Shape& s, std::vector<ImVec2>& out) {
 // ── selection / interaction state ──
 static std::vector<uint64_t> g_sel;
 static uint64_t g_drill = 0;        // group id whose CHILDREN are directly selectable
-static uint64_t g_editText = 0;     // text shape being edited
-static bool     g_editTextTakeFocus = false;
-static bool     g_editEverActive = false;   // editor item has held focus at least once
-static bool     g_editRemap = false;        // pointer is remapped into a rotated editor's local space
-static int      g_editCaretIdx = -1;        // byte offset to force the caret to on open (-1 = leave alone)
-static std::string g_editPrev;      // last-frame text (escape-revert workaround)
+static uint64_t g_editText = 0;         // text shape being edited (custom canvas editor)
 static uint64_t g_editLabelArrow = 0;   // arrow whose label is being edited
 
 static bool is_selected(uint64_t id) {
@@ -2533,34 +2581,64 @@ enum Tool { TOOL_SELECT = 0, TOOL_HAND, TOOL_TEXT, TOOL_ARROW, TOOL_COUNT };
 static Tool g_tool = TOOL_SELECT;
 static bool g_spacePan = false;
 
-static int g_editLastLen = -1;   // auto-list callback: deletion detection across calls
+// ── canvas text editor state ──
+// The in-house editor (see DrawTextEditor) owns caret/selection/undo; it
+// reads the SAME TextLayout the renderer uses and hit-tests in the shape's
+// local frame, so alignment/rotation/wrap cannot desync editing from the
+// committed look (the imgui-InputText phantom-selection saga is over).
+struct TextEditor {
+    int caret = 0, anchor = 0;        // byte offsets (anchor == caret ⇒ no selection)
+    float prefX = -1.f;               // remembered x for up/down runs (local units, -1 = unset)
+    double blinkT0 = 0;               // caret blink phase, reset on any activity
+    bool mouseSel = false;            // mouse drag-selection in progress
+    int clickN = 1;                   // 1/2/3 → char/word/line selection mode
+    int selA = 0, selB = 0;           // 2/3-click drags: the anchor word/line range
+    double lastClickT = -1e9; ImVec2 lastClickP{0, 0};
+    std::vector<std::pair<std::string, int>> undo, redo;   // in-session: text + caret
+    double lastEditT = -1e9; int lastEditKind = 0;          // typing/deleting bursts coalesce
+};
+static TextEditor g_ted;
 
-// The clicks that OPENED an editor (select shape → enter edit) must not chain
-// into imgui's double/triple-click detection inside it — otherwise the first
-// caret click counts as click #3 and select-line/select-word fire "randomly".
-static void break_click_chain() { ImGui::GetIO().MouseClickedTime[0] = -1e9; }
-
-static void begin_text_edit(uint64_t id, int caretIdx) {
-    g_editText = id; g_editTextTakeFocus = true; g_editEverActive = false;
-    g_editLastLen = -1;
-    g_editCaretIdx = caretIdx;   // fresh caret every time — no selection carried over
-    break_click_chain();
-    Shape* s = find_shape(id);
-    g_editPrev = s ? s->text : std::string();
-    g_editLabelArrow = 0;
+static void ted_reset(int caretIdx, const std::string& text) {
+    g_ted = TextEditor();
+    int n = (int)text.size();
+    g_ted.caret = g_ted.anchor = caretIdx < 0 ? 0 : (caretIdx > n ? n : caretIdx);
+    g_ted.blinkT0 = ImGui::GetTime();
 }
-static void end_text_edit(bool commit) {
+static void begin_text_edit(uint64_t id, int caretIdx) {
+    Shape* s = find_shape(id);
+    if (!s) return;
+    g_editText = id; g_editLabelArrow = 0;
+    ted_reset(caretIdx, s->text);
+}
+static void begin_label_edit(uint64_t id, int caretIdx) {
+    Shape* s = find_shape(id);
+    if (!s) return;
+    g_editLabelArrow = id; g_editText = 0;
+    ted_reset(caretIdx, s->label);
+}
+static void end_text_edit() {
     Shape* s = find_shape(g_editText);
     if (s) {
-        if (!commit) s->text = g_editPrev;
-        // strip trailing whitespace-only content
-        std::string t = s->text;
-        bool empty = true; for (char c : t) if (!isspace((unsigned char)c)) { empty = false; break; }
+        // whitespace-only text commits as a delete
+        bool empty = true;
+        for (char c : s->text) if (!isspace((unsigned char)c)) { empty = false; break; }
         if (empty) { std::vector<uint64_t> one{ s->id }; delete_shapes(one); }
         push_undo();
     }
     g_editText = 0;
 }
+static void end_label_edit() {
+    Shape* s = find_shape(g_editLabelArrow);
+    if (s) {
+        bool empty = true;
+        for (char c : s->label) if (!isspace((unsigned char)c)) { empty = false; break; }
+        if (empty) s->label.clear();
+        push_undo();
+    }
+    g_editLabelArrow = 0;
+}
+static void ed_commit() { if (g_editText) end_text_edit(); else if (g_editLabelArrow) end_label_edit(); }
 
 // the "current style": what the style panel shows with nothing selected, and
 // what new shapes are born with (tldraw behavior)
@@ -3427,114 +3505,236 @@ static void DrawVideoOverlay() {
 // strips the marker and ends the list. Markdown-editor muscle memory.
 static const char* kBullet = "\xe2\x80\xa2 ";   // "• " (4 bytes)
 
-static void text_edit_apply(ImGuiInputTextCallbackData* d, bool deleted) {
-    if (d->BufTextLen <= 0) return;
-    int cur = d->CursorPos;
-    if (cur < 1 || cur > d->BufTextLen) return;
-    auto line_start = [&](int from) { int i = from; while (i > 0 && d->Buf[i - 1] != '\n') i--; return i; };
+// ── the canvas text editor ──
+// No imgui widget: the editor lays the live string out with layout_text (the
+// exact code the renderer uses), draws through draw_text_shape, and maps the
+// mouse into the shape's local frame itself. That is the whole WYSIWYG trick —
+// there is no second layout to disagree with, and no pre-frame pointer remap
+// for imgui's InputText to misread as a drag (the old phantom-selection
+// source; the kWysiwyg* flags and remap machinery died with it).
 
-    if (deleted) {
-        // backspaced down to a bare marker ("• " lost its space): remove the
-        // marker AND the newline before it — back to the previous line
-        int ls = line_start(cur);
-        int i = ls; while (i < cur && d->Buf[i] == ' ') i++;
-        bool bareBullet = (cur - i == 3 && !memcmp(d->Buf + i, "\xe2\x80\xa2", 3));
-        int j = i; while (j < cur - 1 && isdigit((unsigned char)d->Buf[j])) j++;
-        bool bareNumber = (j > i && j == cur - 1 && d->Buf[j] == '.');
-        if (bareBullet || bareNumber) {
-            int from = ls > 0 ? ls - 1 : ls;    // include the preceding '\n' if any
-            d->DeleteChars(from, cur - from);
+struct EdTarget { Shape* s; std::string* str; bool label; };
+static bool ed_target(EdTarget& t) {
+    uint64_t id = g_editText ? g_editText : g_editLabelArrow;
+    if (!id) return false;
+    t.s = find_shape(id);
+    if (!t.s) { g_editText = g_editLabelArrow = 0; return false; }
+    t.label = g_editLabelArrow != 0;
+    t.str = t.label ? &t.s->label : &t.s->text;
+    int n = (int)t.str->size();
+    if (g_ted.caret > n) g_ted.caret = n;      // external churn (style panel, undo)
+    if (g_ted.anchor > n) g_ted.anchor = n;
+    return true;
+}
+
+// snapshot for in-session ctrl+Z; same-kind bursts within 0.75s coalesce
+static void ed_record_undo(EdTarget& t, int kind) {
+    double now = ImGui::GetTime();
+    if (kind > 0 && kind == g_ted.lastEditKind && now - g_ted.lastEditT < 0.75 &&
+        g_ted.redo.empty() && !g_ted.undo.empty()) { g_ted.lastEditT = now; return; }
+    g_ted.undo.push_back({ *t.str, g_ted.caret });
+    if ((int)g_ted.undo.size() > 256) g_ted.undo.erase(g_ted.undo.begin());
+    g_ted.redo.clear();
+    g_ted.lastEditT = now; g_ted.lastEditKind = kind;
+}
+
+// Every text mutation goes through here so reflow side-effects stay contained:
+// bound arrow ends keep their world point (anchors re-normalized), and a
+// rotated text keeps its top-left corner pinned in world space (the rect's
+// center — the rotation pivot — moves as the extent changes, which would
+// otherwise swing the glyphs under the caret on every keystroke).
+// kind: 0 = discrete edit, 1 = typing, 2 = deleting (1/2 coalesce for undo),
+// -1 = no undo record (auto-list fixups, ctrl+Z itself).
+template <typename F>
+static void ed_mutate(EdTarget& t, int kind, F fn) {
+    if (kind >= 0) ed_record_undo(t, kind);
+    std::vector<std::pair<ArrowEnd*, ImVec2>> pinned;
+    ImVec2 tl0{0, 0}; bool rotated = false;
+    if (!t.label) {
+        for (auto& a : g_doc.shapes) if (a.type == SH_ARROW) {
+            if (a.a.bind == t.s->id) pinned.push_back({ &a.a, arrow_end_pos(a.a) });
+            if (a.b.bind == t.s->id) pinned.push_back({ &a.b, arrow_end_pos(a.b) });
+        }
+        if (t.s->rot != 0.f) { rotated = true; tl0 = rot_about(t.s->pos, shape_local_rect(*t.s).center(), t.s->rot); }
+    }
+    fn(*t.str);
+    if (rotated) {
+        // pos solves rot_about(pos, pos + d, rot) == tl0  (d = new half-extent)
+        ImVec2 d = text_extent(*t.s) * 0.5f;
+        float sn = sinf(t.s->rot), cs = cosf(t.s->rot);
+        t.s->pos = tl0 - d + ImVec2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
+    }
+    if (!pinned.empty()) {
+        WRect nb = shape_local_rect(*t.s);
+        ImVec2 nsz = nb.size();
+        for (auto& [e, w] : pinned) {
+            ImVec2 p = t.s->rot != 0.f ? rot_about(w, nb.center(), -t.s->rot) : w;
+            e->anchor.x = nsz.x > 0 ? fminf(fmaxf((p.x - nb.mn.x) / nsz.x, 0.f), 1.f) : 0.5f;
+            e->anchor.y = nsz.y > 0 ? fminf(fmaxf((p.y - nb.mn.y) / nsz.y, 0.f), 1.f) : 0.5f;
+        }
+    }
+    g_ted.prefX = -1.f;
+    g_ted.blinkT0 = ImGui::GetTime();
+}
+
+static void ed_undo_redo(EdTarget& t, bool redo) {
+    auto& from = redo ? g_ted.redo : g_ted.undo;
+    auto& to   = redo ? g_ted.undo : g_ted.redo;
+    if (from.empty()) return;
+    to.push_back({ *t.str, g_ted.caret });
+    auto rev = from.back(); from.pop_back();
+    ed_mutate(t, -1, [&](std::string& s) { s = rev.first; });
+    g_ted.caret = g_ted.anchor = rev.second > (int)t.str->size() ? (int)t.str->size() : rev.second;
+    g_ted.lastEditKind = 0;
+}
+
+static void ed_del_range(EdTarget& t, int a, int b, int kind) {   // [a,b)
+    if (b <= a) return;
+    ed_mutate(t, kind, [&](std::string& s) { s.erase(a, b - a); });
+    g_ted.caret = g_ted.anchor = a;
+}
+static void ed_insert(EdTarget& t, const std::string& ins, int kind) {
+    int a = g_ted.caret < g_ted.anchor ? g_ted.caret : g_ted.anchor;
+    int b = g_ted.caret < g_ted.anchor ? g_ted.anchor : g_ted.caret;
+    ed_mutate(t, kind, [&](std::string& s) {
+        if (b > a) s.erase(a, b - a);
+        s.insert(a, ins);
+    });
+    g_ted.caret = g_ted.anchor = a + (int)ins.size();
+}
+
+// auto-list fixups, run AFTER the primary edit (same undo record: kind -1)
+static void ed_autolist_space(EdTarget& t) {   // "- "/"* " at line start → "• "
+    std::string& s = *t.str; int cur = g_ted.caret;
+    if (cur < 2 || cur > (int)s.size() || s[cur - 1] != ' ') return;
+    int ls = cur - 1; while (ls > 0 && s[ls - 1] != '\n') ls--;
+    int i = ls; while (i < cur - 2 && s[i] == ' ') i++;
+    if (i == cur - 2 && (s[i] == '-' || s[i] == '*')) {
+        ed_mutate(t, -1, [&](std::string& str) { str.replace(i, 2, kBullet); });
+        g_ted.caret = g_ted.anchor = cur + 2;   // "• " is 4 bytes for the 2 replaced
+    }
+}
+static void ed_autolist_newline(EdTarget& t) {   // Enter continues (or ends) the list
+    std::string& s = *t.str; int cur = g_ted.caret;
+    if (cur < 1 || cur > (int)s.size() || s[cur - 1] != '\n') return;
+    int pe = cur - 1;
+    int ps = pe; while (ps > 0 && s[ps - 1] != '\n') ps--;
+    int i = ps; while (i < pe && s[i] == ' ') i++;
+    std::string indent = s.substr(ps, i - ps);
+    if (pe - i >= 4 && !memcmp(s.c_str() + i, kBullet, 4)) {
+        // empty item → drop marker AND the fresh newline: stay on the same
+        // (now plain) line, list mode off
+        if (pe - i == 4) { ed_mutate(t, -1, [&](std::string& str) { str.erase(i, cur - i); }); g_ted.caret = g_ted.anchor = i; }
+        else {
+            std::string ins = indent + kBullet;
+            ed_mutate(t, -1, [&](std::string& str) { str.insert(cur, ins); });
+            g_ted.caret = g_ted.anchor = cur + (int)ins.size();
         }
         return;
     }
-
-    if (d->Buf[cur - 1] == ' ' && cur >= 2) {
-        // just typed the space of a "- " / "* " marker at line start?
-        int ls = line_start(cur - 1);
-        int i = ls; while (i < cur - 2 && d->Buf[i] == ' ') i++;
-        if (i == cur - 2 && (d->Buf[i] == '-' || d->Buf[i] == '*')) {
-            d->DeleteChars(i, 2);
-            d->InsertChars(i, kBullet);
-        }
-        return;
-    }
-    if (d->Buf[cur - 1] == '\n') {
-        // Enter: continue (or end) the previous line's list
-        int pe = cur - 1;
-        int ps = line_start(pe);
-        int i = ps; while (i < pe && d->Buf[i] == ' ') i++;
-        std::string indent(d->Buf + ps, d->Buf + i);
-        if (pe - i >= 4 && !memcmp(d->Buf + i, kBullet, 4)) {
-            // empty item → drop marker AND the fresh newline: stay on the
-            // same (now plain) line, list mode off
-            if (pe - i == 4) d->DeleteChars(i, cur - i);
-            else { std::string ins = indent + kBullet; d->InsertChars(d->CursorPos, ins.c_str()); }
-            return;
-        }
-        int j = i; while (j < pe && j - i < 9 && isdigit((unsigned char)d->Buf[j])) j++;
-        if (j > i && j < pe && d->Buf[j] == '.' && (j + 1 == pe || d->Buf[j + 1] == ' ')) {
-            if (j + 2 >= pe) d->DeleteChars(i, cur - i);       // "12." / "12. " alone → stay, end list
-            else {
-                long n = strtol(std::string(d->Buf + i, d->Buf + j).c_str(), nullptr, 10);
-                char num[32]; snprintf(num, sizeof num, "%ld. ", n + 1);
-                std::string ins = indent + num;
-                d->InsertChars(d->CursorPos, ins.c_str());
-            }
+    int j = i; while (j < pe && j - i < 9 && isdigit((unsigned char)s[j])) j++;
+    if (j > i && j < pe && s[j] == '.' && (j + 1 == pe || s[j + 1] == ' ')) {
+        if (j + 2 >= pe) {   // "12." / "12. " alone → stay, end list
+            ed_mutate(t, -1, [&](std::string& str) { str.erase(i, cur - i); });
+            g_ted.caret = g_ted.anchor = i;
+        } else {
+            long n = strtol(s.substr(i, j - i).c_str(), nullptr, 10);
+            char num[32]; snprintf(num, sizeof num, "%ld. ", n + 1);
+            std::string ins = indent + num;
+            ed_mutate(t, -1, [&](std::string& str) { str.insert(cur, ins); });
+            g_ted.caret = g_ted.anchor = cur + (int)ins.size();
         }
     }
 }
-
-static int TextEditCallback(ImGuiInputTextCallbackData* d) {
-    if (d->EventFlag != ImGuiInputTextFlags_CallbackEdit) return 0;
-    bool deleted = g_editLastLen >= 0 && d->BufTextLen < g_editLastLen;
-    text_edit_apply(d, deleted);
-    g_editLastLen = d->BufTextLen;   // after our own edits, so they don't read as user deletions
-    return 0;
+static void ed_autolist_deleted(EdTarget& t) {   // bare marker left → unwrap the line
+    std::string& s = *t.str; int cur = g_ted.caret;
+    if (cur < 1 || cur > (int)s.size()) return;
+    int ls = cur; while (ls > 0 && s[ls - 1] != '\n') ls--;
+    int i = ls; while (i < cur && s[i] == ' ') i++;
+    bool bareBullet = (cur - i == 3 && !memcmp(s.c_str() + i, "\xe2\x80\xa2", 3));
+    int j = i; while (j < cur - 1 && isdigit((unsigned char)s[j])) j++;
+    bool bareNumber = (j > i && j == cur - 1 && s[j] == '.');
+    if (bareBullet || bareNumber) {
+        int from = ls > 0 ? ls - 1 : ls;   // include the preceding '\n' if any
+        ed_mutate(t, -1, [&](std::string& str) { str.erase(from, cur - from); });
+        g_ted.caret = g_ted.anchor = from;
+    }
 }
 
-// ── WYSIWYG editing state ──
-// The live editor must look exactly like the committed shape: bold strike,
-// per-line alignment (bullets pinned left), rotation. imgui's InputText is
-// left-aligned/single-strike, so after it draws we transform its finished
-// vertices per line, and before each frame we remap the pointer inversely so
-// caret clicks land where the eye says (same pattern as rotated editing).
-static std::vector<float> g_editLineDx;        // per-line x offsets, committed layout
-static bool  g_editShiftActive = false;
-static float g_editShiftTopY = 0.f, g_editShiftPx = 1.f;
-// WYSIWYG-transform editing is OFF (both parts): any pre-frame pointer remap
-// (per-line align shift AND the rotation remap) makes imgui's InputText see
-// jittering coordinates while the button is held → phantom drag-selections
-// (user reports, confirmed rotation-only after the align revert). Rotated
-// text edits axis-aligned as a placeholder. The real fix is a custom
-// stb_textedit-based editor that owns its hit-testing — scoped for later,
-// after the M3 LLM export. The draw-side transforms below are proven and
-// stay for that future editor.
-static const bool kWysiwygAlignEdit = false;
-static const bool kWysiwygRotEdit = false;
+// per-frame geometry: everything needed to lay out / hit-test / draw the
+// edited string in its local frame. Labels get a synthetic frame centered on
+// the arrow's curve midpoint, unrotated — exactly how the renderer places them.
+static TextLayout g_edLay;
+struct EdCtx { EdTarget t; ImFont* font; float px; int align; float wrapW; float rot; ImVec2 origin, rotCw; };
+static bool ed_ctx(EdCtx& c) {
+    if (!ed_target(c.t)) return false;
+    Shape* s = c.t.s;
+    c.font = g_fonts[s->family];
+    if (c.t.label) { c.px = kTextSizes[0]; c.align = 0; c.wrapW = 0.f; c.rot = 0.f; }
+    else { c.px = text_px(*s); c.align = s->align; c.wrapW = s->wrapW; c.rot = s->rot; }
+    layout_text(*c.t.str, c.font, c.px, c.align, c.wrapW, g_edLay);
+    if (c.t.label) {
+        std::vector<ImVec2> pl; arrow_polyline(*s, pl);
+        ImVec2 mid = pl.empty() ? arrow_end_pos(s->a) : pl[pl.size() / 2];
+        c.origin = mid - g_edLay.ext * 0.5f;
+        c.rotCw = mid;
+    } else {
+        c.origin = s->pos;
+        c.rotCw = c.origin + g_edLay.ext * 0.5f;   // == shape_local_rect center
+    }
+    return true;
+}
+static ImVec2 ed_to_screen(const EdCtx& c, ImVec2 l) {
+    return W2S(c.rot != 0.f ? rot_about(l, c.rotCw, c.rot) : l);
+}
+static ImVec2 ed_from_screen(const EdCtx& c, ImVec2 sp) {
+    ImVec2 w = S2W(sp);
+    return c.rot != 0.f ? rot_about(w, c.rotCw, -c.rot) : w;
+}
+static bool ed_hit(const EdCtx& c, ImVec2 sp) {
+    ImVec2 p = ed_from_screen(c, sp);
+    float pad = 8.f / g_cam.zoom;
+    return p.x >= c.origin.x - pad && p.y >= c.origin.y - pad &&
+           p.x <= c.origin.x + g_edLay.ext.x + pad && p.y <= c.origin.y + g_edLay.ext.y + pad;
+}
+// CanvasFrame asks this before running its own mouse logic
+static bool ed_wants_mouse() {
+    EdCtx c;
+    if (!ed_ctx(c)) return false;
+    return g_ted.mouseSel || ed_hit(c, ImGui::GetIO().MousePos);
+}
 
-// map a LOCAL-frame point to a byte offset via the committed layout (wrap +
-// alignment + list-pinning aware): line by y, nearest inter-char boundary by x
-static int caret_index_at_local(const Shape& s, const TextLayout& lay, ImVec2 pl) {
-    if (lay.lines.empty()) return 0;
-    float lh = text_px(s);
-    int li = (int)floorf((pl.y - s.pos.y) / lh);
-    li = li < 0 ? 0 : (li >= (int)lay.lines.size() ? (int)lay.lines.size() - 1 : li);
-    const TextLine& ln = lay.lines[li];
-    const char* base = s.text.c_str();
+// nearest inter-character boundary on one layout line, local x (align-relative)
+static int line_x_to_index(const std::string& text, ImFont* f, float px, const TextLine& ln, float x) {
+    const char* base = text.c_str();
     const char* b = base + ln.b;
     const char* e = base + ln.we;
-    float x = (pl.x - s.pos.x) - ln.x;
-    ImGui::PushFont(g_fonts[s.family], lh);
-    const char* c = b;
-    while (c < e) {   // nearest inter-character boundary wins
-        const char* n = (c + utf8_len(c) > e) ? e : c + utf8_len(c);
-        float w0 = ImGui::CalcTextSize(b, c).x;
-        float w1 = ImGui::CalcTextSize(b, n).x;
+    ImGui::PushFont(f, px);
+    const char* cch = b;
+    while (cch < e) {
+        const char* nx = (cch + utf8_len(cch) > e) ? e : cch + utf8_len(cch);
+        float w0 = ImGui::CalcTextSize(b, cch).x;
+        float w1 = ImGui::CalcTextSize(b, nx).x;
         if (x < (w0 + w1) * 0.5f) break;
-        c = n;
+        cch = nx;
     }
     ImGui::PopFont();
-    return (int)(c - base);
+    return (int)(cch - base);
+}
+static int ed_index_at_local(const EdCtx& c, ImVec2 pl) {
+    if (g_edLay.lines.empty()) return 0;
+    int li = (int)floorf((pl.y - c.origin.y) / c.px);
+    li = li < 0 ? 0 : (li >= (int)g_edLay.lines.size() ? (int)g_edLay.lines.size() - 1 : li);
+    const TextLine& ln = g_edLay.lines[li];
+    return line_x_to_index(*c.t.str, c.font, c.px, ln, (pl.x - c.origin.x) - ln.x);
+}
+static float ed_caret_x(const EdCtx& c, int li, int idx) {   // local x incl. align offset
+    const TextLine& ln = g_edLay.lines[li];
+    int i = idx < ln.b ? ln.b : (idx > ln.we ? ln.we : idx);
+    ImGui::PushFont(c.font, c.px);
+    float w = ImGui::CalcTextSize(c.t.str->c_str() + ln.b, c.t.str->c_str() + i).x;
+    ImGui::PopFont();
+    return ln.x + w;
 }
 
 // map a canvas click to a byte offset in the shape's text (committed layout,
@@ -3543,213 +3743,235 @@ static int caret_index_from_click(const Shape& s, ImVec2 clickW) {
     if (s.text.empty()) return 0;
     WRect lr = shape_local_rect(s);
     ImVec2 p = s.rot != 0.f ? rot_about(clickW, lr.center(), -s.rot) : clickW;
+    float px = text_px(s);
     static TextLayout lay;
-    layout_text(s.text, g_fonts[s.family], text_px(s), s.align, s.wrapW, lay);
-    return caret_index_at_local(s, lay, p);
+    layout_text(s.text, g_fonts[s.family], px, s.align, s.wrapW, lay);
+    if (lay.lines.empty()) return 0;
+    int li = (int)floorf((p.y - lr.mn.y) / px);
+    li = li < 0 ? 0 : (li >= (int)lay.lines.size() ? (int)lay.lines.size() - 1 : li);
+    const TextLine& ln = lay.lines[li];
+    return line_x_to_index(s.text, g_fonts[s.family], px, ln, (p.x - lr.mn.x) - ln.x);
 }
 
-static void edit_line_offsets(const std::string& text, ImFont* f, float px, int align, std::vector<float>& out) {
-    out.clear();
-    ImGui::PushFont(f, px);
-    float totalW = ImGui::CalcTextSize(text.empty() ? " " : text.c_str()).x;
-    const char* b = text.c_str();
-    const char* end = b + text.size();
-    for (;;) {
-        const char* e = (const char*)memchr(b, '\n', end - b);
-        if (!e) e = end;
-        float dx = 0.f;
-        if (align && !is_list_line(b, e)) {
-            float w = e > b ? ImGui::CalcTextSize(b, e).x : 0.f;   // empty line: caret sits where text would
-            dx = align == 1 ? (totalW - w) * 0.5f : (totalW - w);
-        }
-        out.push_back(dx);
-        if (e >= end) break;
-        b = e + 1;
+static void DrawTextEditor() {
+    EdCtx c;
+    if (!ed_ctx(c)) return;
+    ImGuiIO& io = ImGui::GetIO();
+    double now = ImGui::GetTime();
+
+    // publish IME/WantTextInput state: gates canvas keybinds next frame and
+    // places the IME composition window at the caret
+    {
+        ImGuiContext& g = *ImGui::GetCurrentContext();
+        int li = layout_line_of(g_edLay, g_ted.caret);
+        g.PlatformImeData.WantVisible = true;
+        g.PlatformImeData.WantTextInput = true;
+        g.PlatformImeData.InputPos = ed_to_screen(c, ImVec2(c.origin.x + ed_caret_x(c, li, g_ted.caret),
+                                                            c.origin.y + li * c.px));
+        g.PlatformImeData.InputLineHeight = c.px * g_cam.zoom;
+        g.PlatformImeData.ViewportId = ImGui::GetMainViewport()->ID;
     }
-    ImGui::PopFont();
-}
 
-// in-place text editor overlay (canvas text + arrow labels share it)
-static void DrawTextEditOverlay() {
-    uint64_t id = g_editText ? g_editText : g_editLabelArrow;
-    if (!id) { g_editShiftActive = false; return; }
-    Shape* s = find_shape(id);
-    if (!s) { g_editText = g_editLabelArrow = 0; g_editShiftActive = false; return; }
-    bool isLabel = (g_editLabelArrow != 0);
-    std::string* str = isLabel ? &s->label : &s->text;
+    // ── keyboard ──
+    // committing still draws the text this frame (the shape pass already
+    // skipped it), just without caret/selection — no one-frame blink
+    bool ctrl = io.KeyCtrl, shift = io.KeyShift;
+    bool mutated = false, commit = false;
+    auto key = [&](ImGuiKey k) { return ImGui::IsKeyPressed(k, true); };
+    auto selRange = [&](int* a, int* b) {
+        *a = g_ted.caret < g_ted.anchor ? g_ted.caret : g_ted.anchor;
+        *b = g_ted.caret < g_ted.anchor ? g_ted.anchor : g_ted.caret;
+    };
+    auto place = [&](int i, bool keepAnchor) {
+        int n = (int)c.t.str->size();
+        g_ted.caret = i < 0 ? 0 : (i > n ? n : i);
+        if (!keepAnchor) g_ted.anchor = g_ted.caret;
+        g_ted.blinkT0 = now;
+    };
 
-    float px = (isLabel ? kTextSizes[0] : text_px(*s)) * g_cam.zoom;
-    px = fminf(px, kMaxGlyphPx);
-    ImFont* font = g_fonts[s->family];
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) commit = true;
 
-    ImVec2 anchor;
-    if (isLabel) {
-        std::vector<ImVec2> pl; arrow_polyline(*s, pl);
-        anchor = W2S(pl.empty() ? arrow_end_pos(s->a) : pl[pl.size() / 2]);
-    } else anchor = W2S(s->pos);
-
-    bool rotated = !isLabel && s->rot != 0.f && kWysiwygRotEdit;
-    ImVec2 rotC = W2S(shape_local_rect(*s).center());   // rotation pivot (screen)
-    float  rotA = s->rot;
-
-    ImGui::PushFont(font, px);
-    ImVec2 ext = ImGui::CalcTextSize(str->empty() ? " " : str->c_str());
-    if (!str->empty() && str->back() == '\n') ext.y += px;   // CalcTextSize drops the trailing empty line
-    float minW = ImGui::CalcTextSize("MM").x;
-    ImVec2 box(fmaxf(ext.x, minW) + px * 0.75f, ext.y + px * 0.5f);
-    ImVec2 winPos = isLabel ? anchor - box * 0.5f : anchor;
-
-    ImGui::SetNextWindowPos(winPos - ImVec2(8, 8));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(shape_ink(*s)));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, isLabel ? ImGui::ColorConvertU32ToFloat4(g_th.canvasBg) : ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 8));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 1.f);   // no scrollbar flash on growth frames
-    ImGui::Begin("##textedit", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNav);
-    if (g_editTextTakeFocus) { ImGui::SetKeyboardFocusHere(); g_editTextTakeFocus = false; }
-    // Text reflow must not swing bound arrows around: normalized anchors
-    // stretch with the rect, so remember each bound end's world point now and
-    // re-derive its anchor after the edit — an arrow bound near the left edge
-    // stays put while typing extends the right edge.
-    std::vector<std::pair<ArrowEnd*, ImVec2>> pinned;
-    if (!isLabel)
-        for (auto& a : g_doc.shapes) if (a.type == SH_ARROW) {
-            if (a.a.bind == s->id) pinned.push_back({ &a.a, arrow_end_pos(a.a) });
-            if (a.b.bind == s->id) pinned.push_back({ &a.b, arrow_end_pos(a.b) });
-        }
-    std::string before = *str;
-    ImGui::InputTextMultiline("##t", str, box,
-                              ImGuiInputTextFlags_NoHorizontalScroll | ImGuiInputTextFlags_CallbackEdit,
-                              TextEditCallback);
-    if (!pinned.empty() && *str != before) {
-        WRect nb = shape_local_rect(*s);
-        ImVec2 nsz = nb.size();
-        for (auto& [e, w] : pinned) {
-            ImVec2 p = s->rot != 0.f ? rot_about(w, nb.center(), -s->rot) : w;
-            e->anchor.x = nsz.x > 0 ? fminf(fmaxf((p.x - nb.mn.x) / nsz.x, 0.f), 1.f) : 0.5f;
-            e->anchor.y = nsz.y > 0 ? fminf(fmaxf((p.y - nb.mn.y) / nsz.y, 0.f), 1.f) : 0.5f;
+    if (!commit) {
+    if (key(ImGuiKey_LeftArrow)) {
+        int a, b; selRange(&a, &b);
+        int i = (!shift && b > a && !ctrl) ? a
+              : ctrl ? word_left(*c.t.str, g_ted.caret) : utf8_prev(*c.t.str, g_ted.caret);
+        place(i, shift); g_ted.prefX = -1.f;
+    }
+    if (key(ImGuiKey_RightArrow)) {
+        int a, b; selRange(&a, &b);
+        int i = (!shift && b > a && !ctrl) ? b
+              : ctrl ? word_right(*c.t.str, g_ted.caret) : utf8_next(*c.t.str, g_ted.caret);
+        place(i, shift); g_ted.prefX = -1.f;
+    }
+    for (int dir = -1; dir <= 1; dir += 2) {   // up/down walk VISUAL lines
+        if (!key(dir < 0 ? ImGuiKey_UpArrow : ImGuiKey_DownArrow)) continue;
+        int li = layout_line_of(g_edLay, g_ted.caret);
+        if (g_ted.prefX < 0.f) g_ted.prefX = ed_caret_x(c, li, g_ted.caret);
+        int ti = li + dir;
+        if (ti < 0) place(0, shift);
+        else if (ti >= (int)g_edLay.lines.size()) place((int)c.t.str->size(), shift);
+        else place(line_x_to_index(*c.t.str, c.font, c.px, g_edLay.lines[ti],
+                                   g_ted.prefX - g_edLay.lines[ti].x), shift);
+    }
+    if (key(ImGuiKey_Home)) {
+        place(ctrl ? 0 : g_edLay.lines[layout_line_of(g_edLay, g_ted.caret)].b, shift);
+        g_ted.prefX = -1.f;
+    }
+    if (key(ImGuiKey_End)) {
+        place(ctrl ? (int)c.t.str->size() : g_edLay.lines[layout_line_of(g_edLay, g_ted.caret)].we, shift);
+        g_ted.prefX = -1.f;
+    }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+        g_ted.anchor = 0; g_ted.caret = (int)c.t.str->size();
+    }
+    if (key(ImGuiKey_Backspace)) {
+        int a, b; selRange(&a, &b);
+        if (b > a) ed_del_range(c.t, a, b, 2);
+        else if (g_ted.caret > 0)
+            ed_del_range(c.t, ctrl ? word_left(*c.t.str, g_ted.caret) : utf8_prev(*c.t.str, g_ted.caret), g_ted.caret, 2);
+        ed_autolist_deleted(c.t);
+        mutated = true;
+    }
+    if (key(ImGuiKey_Delete)) {
+        int a, b; selRange(&a, &b);
+        if (b > a) ed_del_range(c.t, a, b, 2);
+        else if (g_ted.caret < (int)c.t.str->size())
+            ed_del_range(c.t, g_ted.caret, ctrl ? word_right(*c.t.str, g_ted.caret) : utf8_next(*c.t.str, g_ted.caret), 2);
+        ed_autolist_deleted(c.t);
+        mutated = true;
+    }
+    if (key(ImGuiKey_Enter) || key(ImGuiKey_KeypadEnter)) {
+        ed_insert(c.t, "\n", 0);
+        ed_autolist_newline(c.t);
+        mutated = true;
+    }
+    if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_Z, true)) { ed_undo_redo(c.t, false); mutated = true; }
+    if (ctrl && (ImGui::IsKeyPressed(ImGuiKey_Y, true) ||
+                 (shift && ImGui::IsKeyPressed(ImGuiKey_Z, true)))) { ed_undo_redo(c.t, true); mutated = true; }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+        int a, b; selRange(&a, &b);
+        if (b > a) ImGui::SetClipboardText(c.t.str->substr(a, b - a).c_str());
+    }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_X, false)) {
+        int a, b; selRange(&a, &b);
+        if (b > a) {
+            ImGui::SetClipboardText(c.t.str->substr(a, b - a).c_str());
+            ed_del_range(c.t, a, b, 0);
+            mutated = true;
         }
     }
-    // ── WYSIWYG pass: make the live editor match the committed rendering ──
-    // 1) faux-bold second strike  2) per-line alignment offsets applied to
-    // the editor's finished vertices (glyphs, caret, selection quads shift
-    // with their line)  3) everything rotated into place for rotated shapes.
-    // The pointer was remapped inversely before NewFrame (main loop).
-    // force the caret to the opening click (also guarantees no selection is
-    // carried over from a previous edit of any shape — same widget id)
-    if (g_editCaretIdx >= 0) {
-        if (ImGuiInputTextState* st = ImGui::GetInputTextState(ImGui::GetItemID())) {
-            // STB_TexteditState's public head (cursor/select_start/select_end
-            // are its first members); the full type isn't visible outside
-            // imgui_widgets.cpp, so poke it through a mirror of that head
-            struct StbHead { int cursor, select_start, select_end; };
-            StbHead* stb = reinterpret_cast<StbHead*>(st->Stb);
-            int ci = g_editCaretIdx > (int)str->size() ? (int)str->size() : g_editCaretIdx;
-            stb->cursor = stb->select_start = stb->select_end = ci;
-            st->CursorFollow = true;
-            st->CursorAnimReset();
-            g_editCaretIdx = -1;   // state exists ⇒ item is live; consumed
-        }
-    }
-    ImVec2 itemMin = ImGui::GetItemRectMin();
-    ImU32 ink = shape_ink(*s);
-    if (!isLabel && kWysiwygAlignEdit) edit_line_offsets(*str, font, px, s->align, g_editLineDx);
-    else g_editLineDx.clear();
-    int nLines = (int)g_editLineDx.size();
-    bool anyShift = false;
-    for (float d : g_editLineDx) if (d != 0.f) { anyShift = true; break; }
-
-    ImDrawList* pdl = ImGui::GetWindowDrawList();
-    int strikeVtx0 = pdl->VtxBuffer.Size;
-    {   // bold strike (parent drawlist; same ink so draw order is moot)
-        const char* b = str->c_str();
-        const char* end = b + str->size();
-        float bo = px * 0.03f;
-        int li = 0;
-        while (b < end) {
-            const char* e = (const char*)memchr(b, '\n', end - b);
-            if (!e) e = end;
-            if (e > b) {
-                float dx = li < nLines ? g_editLineDx[li] : 0.f;
-                pdl->AddText(font, px, ImVec2(itemMin.x + dx + bo, itemMin.y + li * px), ink, b, e);
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+        const char* clip = ImGui::GetClipboardText();
+        if (clip && *clip) {
+            std::string ins;
+            for (const char* p = clip; *p; p++) {
+                unsigned char ch = (unsigned char)*p;
+                if (ch == '\r') continue;
+                if (ch == '\t') { ins += "  "; continue; }
+                if (ch < 0x20 && ch != '\n') continue;
+                ins += (char)ch;
             }
-            li++;
-            if (e >= end) break;
-            b = e + 1;
+            if (!ins.empty()) { ed_insert(c.t, ins, 0); mutated = true; }
         }
     }
+    // typed characters (queued by the backend; skip ctrl chords, keep AltGr)
+    if (!(io.KeyCtrl && !io.KeyAlt) && !io.InputQueueCharacters.empty()) {
+        std::string ins;
+        for (int i = 0; i < io.InputQueueCharacters.Size; i++) {
+            unsigned int w = (unsigned int)io.InputQueueCharacters[i];
+            if (w < 0x20 || w == 0x7F) continue;
+            char b4[5]; ImTextCharToUtf8(b4, w); ins += b4;
+        }
+        if (!ins.empty()) {
+            ed_insert(c.t, ins, 1);
+            if (ins.back() == ' ') ed_autolist_space(c.t);
+            mutated = true;
+        }
+    }
+    }   // !commit
+    if (mutated && !ed_ctx(c)) return;   // re-layout after edits (geometry moved)
 
-    ImGuiWindow* parentWin = ImGui::GetCurrentWindow();
-    ImGuiID cid = ImGui::GetID("##t");
-    char nm[256];
-    snprintf(nm, sizeof nm, "%s/##t", parentWin->Name);
-    ImGuiWindow* child = ImGui::FindWindowByName(nm);
-    if (!child) { snprintf(nm, sizeof nm, "%s/##t_%08X", parentWin->Name, cid); child = ImGui::FindWindowByName(nm); }
-    if (child && child->DrawList) {
-        ImDrawList* cdl = child->DrawList;
-        if (anyShift) {
-            // shift per QUAD (4 consecutive verts) so no glyph shears when a
-            // descender pokes past the line box
-            for (int i = 0; i + 3 < cdl->VtxBuffer.Size; i += 4) {
-                float cy = (cdl->VtxBuffer[i].pos.y + cdl->VtxBuffer[i + 2].pos.y) * 0.5f;
-                int li = (int)floorf((cy - itemMin.y) / px);
-                li = li < 0 ? 0 : (li >= nLines ? nLines - 1 : li);
-                for (int k = 0; k < 4; k++) cdl->VtxBuffer[i + k].pos.x += g_editLineDx[li];
+    // ── mouse ──
+    bool inside = ed_hit(c, io.MousePos);
+    if (!commit && (inside || g_ted.mouseSel)) ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+    if (!commit && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (inside) {
+            int idx = ed_index_at_local(c, ed_from_screen(c, io.MousePos));
+            bool chain = now - g_ted.lastClickT < 0.32 && vlen(io.MousePos - g_ted.lastClickP) < 6.f;
+            g_ted.clickN = chain ? (g_ted.clickN % 3) + 1 : 1;   // click/word/line, cycling
+            g_ted.lastClickT = now; g_ted.lastClickP = io.MousePos;
+            if (g_ted.clickN == 1) {
+                if (!io.KeyShift) g_ted.anchor = idx;
+                g_ted.caret = idx;
+            } else {
+                if (g_ted.clickN == 2) word_range(*c.t.str, idx, &g_ted.selA, &g_ted.selB);
+                else hard_line_range(*c.t.str, idx, &g_ted.selA, &g_ted.selB);
+                g_ted.anchor = g_ted.selA; g_ted.caret = g_ted.selB;
             }
-        }
-        if (rotated) {
-            float sn = sinf(rotA), cs = cosf(rotA);
-            for (int i = 0; i < cdl->VtxBuffer.Size; i++) {
-                ImDrawVert& v = cdl->VtxBuffer[i];
-                float dx = v.pos.x - rotC.x, dy = v.pos.y - rotC.y;
-                v.pos.x = rotC.x + dx * cs - dy * sn;
-                v.pos.y = rotC.y + dx * sn + dy * cs;
-            }
-            for (int i = strikeVtx0; i < pdl->VtxBuffer.Size; i++) {
-                ImDrawVert& v = pdl->VtxBuffer[i];
-                float dx = v.pos.x - rotC.x, dy = v.pos.y - rotC.y;
-                v.pos.x = rotC.x + dx * cs - dy * sn;
-                v.pos.y = rotC.y + dx * sn + dy * cs;
-            }
-            ImVec2 ds = ImGui::GetIO().DisplaySize;
-            for (int i = 0; i < cdl->CmdBuffer.Size; i++)
-                cdl->CmdBuffer[i].ClipRect = ImVec4(0, 0, ds.x, ds.y);
-            for (int i = 0; i < pdl->CmdBuffer.Size; i++)
-                pdl->CmdBuffer[i].ClipRect = ImVec4(0, 0, ds.x, ds.y);
+            g_ted.mouseSel = true;
+            g_ted.prefX = -1.f;
+            g_ted.blinkT0 = now;
+            g_ted.lastEditKind = 0;   // a caret move ends any typing burst (undo granularity)
+        } else {
+            // click out = commit; CanvasFrame already gave this click its
+            // selection semantics earlier in the frame
+            commit = true;
         }
     }
-    // published for the pre-NewFrame pointer remap
-    g_editShiftActive = anyShift && !isLabel;
-    g_editShiftTopY = itemMin.y;
-    g_editShiftPx = px;
+    if (!commit && g_ted.mouseSel && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        int idx = ed_index_at_local(c, ed_from_screen(c, io.MousePos));
+        if (g_ted.clickN == 1) g_ted.caret = idx;
+        else {   // extend by whole words/lines from the anchor range
+            int a, b;
+            if (g_ted.clickN == 2) word_range(*c.t.str, idx, &a, &b);
+            else hard_line_range(*c.t.str, idx, &a, &b);
+            if (a < g_ted.selA) { g_ted.anchor = g_ted.selB; g_ted.caret = a; }
+            else                { g_ted.anchor = g_ted.selA; g_ted.caret = b; }
+        }
+        g_ted.blinkT0 = now;
+    }
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) g_ted.mouseSel = false;
 
-    bool active = ImGui::IsItemActive();
-    if (active) g_editEverActive = true;
-    // focus takes a frame to land: never evaluate commit conditions before the
-    // item has actually been active, or the creating click kills the editor
-    bool deactivated = g_editEverActive && ImGui::IsItemDeactivated();
-    if (!g_editEverActive) { g_editPrev = *str; ImGui::End(); ImGui::PopStyleVar(3); ImGui::PopStyleColor(4); ImGui::PopFont(); return; }
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-        // imgui's escape reverts the buffer to its value at activation; we want
-        // escape = commit-what-you-see, so restore last frame's text
-        *str = g_editPrev;
-        if (isLabel) { g_editLabelArrow = 0; push_undo(); }
-        else end_text_edit(true);
-    } else if (deactivated || (!active && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsWindowHovered())) {
-        if (isLabel) { g_editLabelArrow = 0; push_undo(); }
-        else end_text_edit(true);
-    } else {
-        g_editPrev = *str;
-        (void)before;
+    // ── draw: selection under the glyphs, committed renderer for the glyphs ──
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    Shape* s = c.t.s;
+    float zoom = g_cam.zoom;
+    if (c.t.label) {   // blank the arrow line under the box, like the renderer
+        dl->AddRectFilled(W2S(c.origin - ImVec2(6.f, 3.f)),
+                          W2S(c.origin + g_edLay.ext + ImVec2(6.f, 3.f)),
+                          g_th.canvasBg, 4.f * zoom);
     }
-    ImGui::End();
-    ImGui::PopStyleVar(3);
-    ImGui::PopStyleColor(4);
-    ImGui::PopFont();
+    int a = g_ted.caret < g_ted.anchor ? g_ted.caret : g_ted.anchor;
+    int b = g_ted.caret < g_ted.anchor ? g_ted.anchor : g_ted.caret;
+    if (b > a && !commit) {
+        ImU32 selCol = (g_th.accent & 0x00FFFFFF) | 0x55000000;
+        for (int li = 0; li < (int)g_edLay.lines.size(); li++) {
+            const TextLine& ln = g_edLay.lines[li];
+            if (ln.e < a || ln.b >= b) continue;
+            int sa = a > ln.b ? a : ln.b;
+            int sb = b < ln.we ? b : ln.we;
+            float x0 = ed_caret_x(c, li, sa);
+            float x1 = sb > sa ? ed_caret_x(c, li, sb) : x0;
+            if (b > ln.e && li + 1 < (int)g_edLay.lines.size()) x1 += c.px * 0.4f;   // newline is selected too
+            if (x1 <= x0) continue;
+            ImVec2 p0(c.origin.x + x0, c.origin.y + li * c.px);
+            ImVec2 p1(c.origin.x + x1, c.origin.y + (li + 1) * c.px);
+            dl->AddQuadFilled(ed_to_screen(c, p0), ed_to_screen(c, ImVec2(p1.x, p0.y)),
+                              ed_to_screen(c, p1), ed_to_screen(c, ImVec2(p0.x, p1.y)), selCol);
+        }
+    }
+    if (!c.t.label) draw_text_shape(dl, *s);   // the exact committed rendering
+    else add_text_bold(dl, c.font, kTextSizes[0] * zoom, W2S(c.origin), shape_ink(*s), c.t.str->c_str());
+    if (commit) { ed_commit(); return; }
+    // caret
+    if (g_ted.mouseSel || fmod(now - g_ted.blinkT0, 1.12) < 0.64) {
+        int li = layout_line_of(g_edLay, g_ted.caret);
+        float x = ed_caret_x(c, li, g_ted.caret);
+        ImVec2 p0 = ed_to_screen(c, ImVec2(c.origin.x + x, c.origin.y + ((float)li + 0.08f) * c.px));
+        ImVec2 p1 = ed_to_screen(c, ImVec2(c.origin.x + x, c.origin.y + ((float)li + 0.92f) * c.px));
+        dl->AddLine(p0, p1, shape_ink(*s), fmaxf(1.f, fminf(3.f, c.px * zoom / 24.f)));
+    }
 }
 
 // ───────────────────────────── the canvas frame ────────────────────────────
@@ -3788,8 +4010,9 @@ static void CanvasFrame() {
         else hoverHandle = draw_selection_ui(dl, true);
     }
 
-    // ── keyboard ── (all off while the board picker modal is up)
-    if (!io.WantTextInput && !ImGui::IsPopupOpen("boards")) {
+    // ── keyboard ── (all off while editing text or the board picker is up;
+    // io.WantTextInput lags the editor's open by a frame, so gate on both)
+    if (!io.WantTextInput && !editing && !ImGui::IsPopupOpen("boards")) {
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) g_pickerWant = true;
         if (ImGui::IsKeyPressed(ImGuiKey_V)) g_tool = TOOL_SELECT;
         if (ImGui::IsKeyPressed(ImGuiKey_H)) g_tool = TOOL_HAND;
@@ -3850,8 +4073,10 @@ static void CanvasFrame() {
     } else g_spacePan = false;
     if (g_nudgeUndoAt > 0 && ImGui::GetTime() >= g_nudgeUndoAt) { push_undo(); g_nudgeUndoAt = 0; }
 
-    if (g_editRemap) return;   // pointer lives in a rotated editor's space; canvas input suspended
     if (uiHot && g_drag == DM_NONE) return;
+    // the editor owns the pointer while it hovers the edited text (or a
+    // drag-selection is running) — same contract uiHot gives imgui windows
+    if (editing && g_drag == DM_NONE && ed_wants_mouse()) return;
 
     ImVec2 mw = S2W(io.MousePos);
 
@@ -4171,10 +4396,7 @@ static void CanvasFrame() {
             } else if (leafS && leafS->type == SH_ARROW && dbl) {
                 // double-click arrow → edit its label
                 g_sel.clear(); g_sel.push_back(g_downLeaf);
-                g_editLabelArrow = g_downLeaf; g_editTextTakeFocus = true; g_editEverActive = false;
-                g_editCaretIdx = (int)leafS->label.size();   // caret at end, no stale selection
-                g_editPrev = leafS->label;
-                break_click_chain();
+                begin_label_edit(g_downLeaf, (int)leafS->label.size());   // caret at end
             } else if (g_downWasSelected && g_downTarget != g_downLeaf) {
                 // click again on a selected group → drill one level toward the leaf
                 std::vector<uint64_t> chain;   // leaf … outermost
@@ -4315,29 +4537,6 @@ int main(int argc, char** argv) {
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
-        // Editing a ROTATED text: imgui runs the editor in the shape's
-        // unrotated space. Inverse-rotate the pointer here (after the backend
-        // wrote it, before NewFrame snapshots it); the overlay rotates the
-        // editor's draw output back into place.
-        g_editRemap = false;
-        if (g_editText) {
-            Shape* es = find_shape(g_editText);
-            if (es) {
-                if (es->rot != 0.f && kWysiwygRotEdit) {
-                    ImVec2 c = W2S(shape_local_rect(*es).center());
-                    io.MousePos = rot_about(io.MousePos, c, -es->rot);
-                    g_editRemap = true;
-                }
-                // per-line alignment: un-shift the pointer by the offset of
-                // the line it hovers (last frame's layout — 1 frame of lag)
-                if (g_editShiftActive && !g_editLineDx.empty()) {
-                    int li = (int)floorf((io.MousePos.y - g_editShiftTopY) / g_editShiftPx);
-                    li = li < 0 ? 0 : (li >= (int)g_editLineDx.size() ? (int)g_editLineDx.size() - 1 : li);
-                    io.MousePos.x -= g_editLineDx[li];
-                    g_editRemap = true;
-                }
-            }
-        }
         ImGui::NewFrame();
 
 #ifdef TEI_LIBAV
@@ -4346,14 +4545,15 @@ int main(int argc, char** argv) {
         CanvasFrame();
         DrawContextMenu();
         DrawVideoOverlay();
-        DrawTextEditOverlay();
+        DrawTextEditor();
         DrawToolbar();
         DrawStylePanel();
         DrawZoomPill();
         DrawBoardPicker();
         sweep_play_states();
 
-        if (!io.WantTextInput && io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_D)) {
+        if (!io.WantTextInput && !g_editText && !g_editLabelArrow &&
+            io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_D)) {
             g_darkMode = !g_darkMode; ApplyTheme(); save_settings();
         }
 

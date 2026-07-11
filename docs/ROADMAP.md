@@ -24,10 +24,14 @@ play/stop/seek/A-B pill, dynamic-texture upload. Shape clipboard.
 - **Global settings + board picker** ✅: %APPDATA%/teidraw/settings.json
   (theme, zoom anim, undo limit, boards dir, recent boards); picker overlay
   (Ctrl+O / auto on bare launch: recents, new-board, native folder dialog).
-- Drag **snapping** to other shapes' edges/centers + distance guides
-  (tldraw's alignment polish); arrow-key nudge; shift-drag axis lock.
-- Text wrap width (drag side handles to set a wrap box).
-- Multi-monitor DPI changes (WM_DPICHANGED restyle).
+- **Drag snapping** ✅ to other shapes' edges/centers + guides (ctrl opts in);
+  arrow-key nudge; shift-drag axis lock.
+- **Text wrap width** ✅ (side handles set the wrap box; layout_text is the
+  single line-breaking engine).
+- **In-house WYSIWYG text editor** ✅ (replaced InputTextMultiline; owns
+  caret/selection/undo + hit-testing, so rotated/aligned/wrapped text edits
+  exactly as rendered).
+- Multi-monitor DPI changes (WM_DPICHANGED restyle) — still open.
 
 
 ## M4 — polish & performance

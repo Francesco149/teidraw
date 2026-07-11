@@ -1,6 +1,6 @@
 # STATUS — live front
 
-*Updated: 2026-07-11 (session 7). History lives in `git log` — this file only
+*Updated: 2026-07-11 (session 8). History lives in `git log` — this file only
 describes NOW.*
 
 ## Where things stand
@@ -90,6 +90,30 @@ alongside: a video with an A-B loop now OPENS at A (poster + first play), and
 stop returns to A instead of 0 when a loop start is set (only-A-set videos
 also wrap to A at end of file).
 
+Session-8 = **text wrap + the in-house WYSIWYG editor** (the M3 finale).
+`layout_text()` is now THE text engine: line breaking (soft wrap via
+`ImFont::CalcWordWrapPosition`, blanks eaten at wrap points), per-line
+alignment, list pinning (decided per HARD line so a wrapped bullet's
+continuations stay pinned) — rendering, `text_extent` (cache keyed on wrap
+too), caret mapping and the editor all read the same `TextLayout`, so breaks
+cannot diverge between draw and hit-testing. `Shape.wrapW` (world units,
+`wrap` in board.json, 0 = auto-size): single-text selections grow SIDE
+handles (drag = set wrap box, quick second press = back to auto-size);
+rotation-safe via the crop trick (mouse in the snapshot's local frame, new
+rect's center placed through the old frame). Corner resize scales wrapW with
+the glyphs. **DrawTextEditor replaced imgui's InputTextMultiline entirely**:
+caret/selection/undo live in `g_ted`, mouse maps into the shape's local frame
+(rotation inverse, layout lines, nearest-boundary x), text mutations go
+through `ed_mutate` (arrow anchors pinned to world points, rotated texts keep
+their world top-left so glyphs don't swing per keystroke), auto-lists ported
+verbatim, in-session ctrl+Z/Y with burst coalescing, click/word/line
+double/triple-click drag selection, clipboard, IME caret positioning via
+PlatformImeData. Editing rotated/aligned/wrapped text is now exactly
+WYSIWYG — the kWysiwyg flags, pre-frame pointer remap and phantom-selection
+saga are deleted. Also: **video play state persists** (`play` in board.json;
+a video left playing resumes when the board reopens, transport clicks
+autosave without undo entries; headless still renders posters).
+
 ## Build & verify
 ```
 nix develop --command make -C editor            # build/teidraw.exe
@@ -103,36 +127,25 @@ write nextId from a script; the load-time sanitizer exists because that
 minted duplicate ids once). Use a throwaway dir under the scratchpad for
 render tests.
 
-## NEXT TASK → M3 (docs/ROADMAP.md)
-1. Text wrap width; then the custom WYSIWYG canvas editor (see below).
-   (Snapping guides + nudge + shift axis-lock landed session 5; M4 culling +
-   caches + video decode thread landed session 6; video audio landed
-   session 7 — M4 is essentially done.)
+## NEXT TASK (docs/ROADMAP.md)
+M3 is DONE (wrap + WYSIWYG editor landed session 8) except multi-monitor DPI
+(WM_DPICHANGED restyle). M4 is essentially done too. What's left before M5
+(linux port) is polish on user feedback — the new editor needs hands-on
+testing (typing feel, selection, IME, auto-lists, wrapped/rotated editing).
 
 ## Known rough edges / to keep in mind
-- **WYSIWYG-transform editing is fully OFF** (`kWysiwygAlignEdit` and
-  `kWysiwygRotEdit`, both false): ANY pre-frame pointer remap (align shift,
-  rotation) makes InputText see jittering held-button coordinates → phantom
-  drag-selections (user-confirmed rotation-only after the align revert).
-  Rotated text edits axis-aligned as a PLACEHOLDER (snaps straight while
-  typing, back on commit); the bold strike stays on. THE plan for "edit
-  exactly as it appears": a custom stb_textedit-based canvas editor that owns
-  its own hit-testing (so rotation/alignment can't desync imgui's mouse
-  mapping) — scoped for AFTER the M3 LLM export. The draw-side vertex
-  transforms are proven and kept behind the flags for that editor. Surveyed
-  2026-07: NO off-the-shelf imgui rich-text editor exists (only code
-  editors: ImGuiColorTextEdit / ImTextEdit) — in-house is the way.
-- Editor click-chain: begin_text_edit resets io.MouseClickedTime so the two
-  clicks that open an editor can't chain into double/triple-click selection
-  on the first caret click (that was the OTHER phantom-selection source).
-- Editors always open with the caret at the click (caret_index_from_click →
-  ImGuiInputTextState public-head poke) and never inherit a previous edit's
-  selection. If the caret ever lands off by a char, suspect that mapping.
-- The editor transforms reach into the InputTextMultiline child window
-  (`FindWindowByName("<win>/##t")` + per-quad vertex shifts + clip-rect
-  patch) — re-verify if the imgui pin (1.92.4) ever moves.
+- **The text editor is in-house** (`DrawTextEditor` + `g_ted`): no imgui
+  widget, no io.WantTextInput until a frame after open (CanvasFrame gates on
+  `editing` too). It draws through draw_text_shape and hit-tests via
+  layout_text — if editing ever disagrees with committed rendering, the bug
+  is NOT a desync, both read the same layout.
+- Soft-wrap caret affinity: a caret exactly on a mid-word cut boundary (word
+  wider than the box) displays at the END of the upper line; Home on the
+  lower line shows it there too. Only reachable when a single word exceeds
+  the wrap box — punted (needs an affinity bit).
 - List lines ("• ", "N. ") always pin left even in centered/right text — a
-  deliberate heuristic, shared by renderer + editor via is_list_line().
+  deliberate heuristic; wrapped continuations of a list item inherit the pin
+  (decided per hard line in layout_text).
 - Bare launch reopens recent[0] from settings.json; headless (`--shot`/
   `--export*`) never touches recents and still defaults to `./scratch`.
   `--picker` (dev flag) forces the picker open — used for headless UI shots.
