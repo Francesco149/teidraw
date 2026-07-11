@@ -154,9 +154,13 @@ despite AA "on" — diagnosed by pixel-scanning exports for ramp values), and
 translucent ink must fill exactly once or joints blotch. AddConcavePolyFilled
 is also out: it ear-clips, and outlines self-intersect at curls tighter than
 the pen radius → giant filled blobs. Simulated pressure runs on SCREEN-space
-hand speed (zoom-independent), full-fat when deliberate → full-thin at a
-~4500px/s flick; the first cut normalized by stroke width in world px and
-saturated thin at real drawing speeds, which read as "pressure does nothing".
+hand speed (zoom-independent) through an EXPONENTIAL curve (`exp(-speed/1400)`
+→ careful ~0.8, easy ~0.5, brisk ~0.24), radius sweep 0.25–1.15x of nominal;
+two earlier cuts read as "pressure does nothing" — one normalized by stroke
+width in world px and saturated thin at real speeds, one ramped linearly to a
+flick speed and parked every ordinary stroke in the top fifth of the range.
+Tuning knobs live in draw_update (curve constant, `dt*30` adaptation) and
+draw_radius (sweep).
 Pen: stderr prints "pen pressure active" on first Windows Ink pointer event —
 if it never prints while inking, enable Windows Ink in the tablet driver.
 Hit-testing walks the ink polyline (max(radius, 6px) threshold, box

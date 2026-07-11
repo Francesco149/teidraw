@@ -455,12 +455,12 @@ static bool members_common_rot(uint64_t gid, float* out) {
 static float text_px(const Shape& s) { return kTextSizes[s.tsize] * s.scale; }
 
 // strokes share the S/M/L/XL ladder (widths in world px); pressure sweeps the
-// drawn width between 30% and 110% of nominal — a 3.7x swing, so speed/pen
-// dynamics actually READ on screen (the first cut's 0.35..1.1 on half-sized
-// widths looked constant to the user)
+// drawn width between 25% and 115% of nominal — a 4.6x swing, so speed/pen
+// dynamics actually READ on screen (two earlier, narrower mappings looked
+// near-constant to the user)
 static const float kDrawSizes[4] = { 2.5f, 4.5f, 7.f, 12.f };
 static float draw_width(const Shape& s) { return kDrawSizes[s.tsize] * s.scale; }
-static float draw_radius(const Shape& s, float p) { return draw_width(s) * 0.5f * (0.3f + 0.8f * p); }
+static float draw_radius(const Shape& s, float p) { return draw_width(s) * 0.5f * (0.25f + 0.9f * p); }
 
 // Reject NaN/inf AND imgui's "no mouse" sentinel (-FLT_MAX): on focus loss
 // mid-stroke (alt-tab, another window opening on the host) io.MousePos goes
@@ -3010,15 +3010,15 @@ static void draw_update(ImVec2 mw) {
         if (g_penPressure >= 0.f) target = g_penPressure;
         else {
             // simulated from HAND speed (screen px/s — zoom must not change
-            // the feel): full-fat when deliberate, full-thin at a ~4500px/s
-            // flick. The first cut normalized by stroke width in WORLD px and
-            // saturated thin at ~1200px/s — every real stroke pinned to the
-            // minimum, which read as "pressure does nothing".
+            // the feel). Exponential, not linear: a linear ramp to a flick
+            // speed parks every ordinary stroke in the top fifth of the range
+            // and the taper never shows. Here careful ~300px/s ≈ 0.8, easy
+            // ~1000 ≈ 0.5, brisk ~2000 ≈ 0.24, flick ≈ 0 — visible contrast
+            // across speeds a hand actually uses.
             float speed = vlen(mw - g_drawPrevMouse) / dt * g_cam.zoom;
-            target = 1.f - speed / 4500.f;
-            target = target < 0.f ? 0.f : target;
+            target = expf(-speed / 1400.f);
         }
-        g_drawPressure += (target - g_drawPressure) * fminf(dt * (g_penPressure >= 0.f ? 40.f : 25.f), 1.f);
+        g_drawPressure += (target - g_drawPressure) * fminf(dt * (g_penPressure >= 0.f ? 40.f : 30.f), 1.f);
         ImVec2 lastW = draw_from_local(*s, s->pts.back());
         if (vlen(g_drawSmooth - lastW) * g_cam.zoom > 2.f) {   // min 2 screen px per point
             s->pts.push_back(draw_to_local(*s, g_drawSmooth));
