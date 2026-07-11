@@ -1,0 +1,3 @@
+// teidraw.rc — app icon baked into the PE (compiled by mingw windres).
+// Icon id 1 is also loaded as the window-class icon in main.cpp.
+1 ICON "../assets/icon.ico"

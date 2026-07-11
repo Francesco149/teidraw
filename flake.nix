@@ -1,5 +1,5 @@
 {
-  description = "teidraw — MIT-licensed infinite-canvas whiteboard with tldraw-grade feel (imgui/D3D11)";
+  description = "teidraw — MIT-licensed infinite-canvas whiteboard with tldraw-grade feel (imgui; D3D11 on Windows, SDL3 on Linux)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -48,9 +48,10 @@
 
           packages = with pkgs; [
             mingw.gcc            # x86_64-w64-mingw32-{gcc,g++} → Win64 PE
-            mingw.binutils
+            mingw.binutils       # + windres for the icon resource
             gnumake
-            python3              # tools/embed.py (fonts → C arrays)
+            pkg-config           # resolves sdl3 + libav for `make linux`
+            python3              # tools/embed.py (fonts/icon → C arrays)
 
             stb                  # stb_image / stb_image_write (image load + screenshots)
             nlohmann_json        # board.json document format
@@ -65,6 +66,11 @@
             fd
           ];
 
+          # linux-target deps, resolved through the pkg-config hook:
+          # SDL3 (window/renderer/clipboard/dialog/audio/pen) + shared libav.
+          # The release binary statically links both (see .github/workflows).
+          buildInputs = with pkgs; [ sdl3 ffmpeg ];
+
           shellHook = ''
             export TEIDRAW_ROOT=$PWD
 
@@ -77,23 +83,19 @@
             export FFMPEG_CROSS_INC=${ffmpegCross.dev}/include
             export FFMPEG_CROSS_LIB=${ffmpegCross.lib}/lib
 
-            # Bundled UI fonts (embedded into the exe by tools/embed.py).
-            # Handwriting (default) is vendored in-repo: assets/fonts/ShantellSans.ttf
-            export FONT_SANS=$(ls ${pkgs.inter}/share/fonts/truetype/InterVariable.ttf 2>/dev/null || ls ${pkgs.inter}/share/fonts/truetype/*.ttf | head -1)
-            export FONT_MONO=$(ls ${pkgs.jetbrains-mono}/share/fonts/truetype/JetBrainsMono-Regular.ttf 2>/dev/null || ls ${pkgs.jetbrains-mono}/share/fonts/truetype/*.ttf | head -1)
-            export FONT_SERIF=$(ls ${pkgs.lora}/share/fonts/truetype/*Regular*.ttf 2>/dev/null | head -1 || ls ${pkgs.lora}/share/fonts/truetype/*.ttf | head -1)
-
+            # All four UI fonts are vendored in assets/fonts/ (OFL) and baked
+            # in by tools/embed.py — no font env vars needed anymore.
             export MINGW_CC=x86_64-w64-mingw32-gcc
             export MINGW_CXX=x86_64-w64-mingw32-g++
             export MINGW_STRIP=x86_64-w64-mingw32-strip
+            export MINGW_WINDRES=x86_64-w64-mingw32-windres
 
             echo "teidraw dev shell"
             echo "  imgui:   $IMGUI_DIR"
             echo "  mingw:   $(command -v $MINGW_CXX || echo '(missing)')"
-            echo "  libav:   $FFMPEG_CROSS_LIB"
-            echo "  fonts:   sans=$FONT_SANS"
-            echo "           mono=$FONT_MONO serif=$FONT_SERIF"
-            echo "  build:   make -C editor"
+            echo "  libav:   $FFMPEG_CROSS_LIB (cross) + pkg-config (linux)"
+            echo "  build:   make -C editor        # windows (default)"
+            echo "           make -C editor linux  # native linux (SDL3)"
           '';
         };
 

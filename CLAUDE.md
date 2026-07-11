@@ -2,19 +2,23 @@
 
 MIT-licensed **infinite-canvas whiteboard** with tldraw's UX philosophy and feel:
 one purpose, complexity hidden, heuristics that guess intent, and an obsessively
-smooth/responsive canvas. Native **C++ · Dear ImGui 1.92 · D3D11 · Win32**,
-cross-compiled to a Win64 PE with **mingw-w64 from the nix flake** (the proven
-slopstudio pattern), run on the Win11 host via WSLInterop. Windows first; Linux
-port later. Primary primitives: **text, arrows, images/gifs/videos, groups,
-freehand strokes** — deliberately NOT every tldraw feature.
+smooth/responsive canvas. Native **C++ · Dear ImGui 1.92**, two backends in one
+TU behind `#ifdef _WIN32`: **D3D11 · Win32** (primary; cross-compiled to a Win64
+PE with **mingw-w64 from the nix flake** — the proven slopstudio pattern — run
+on the Win11 host via WSLInterop) and **SDL3 · SDL_Renderer** for Linux
+(`make -C editor linux`; newer, less battle-tested). Primary primitives:
+**text, arrows, images/gifs/videos, groups, freehand strokes** — deliberately
+NOT every tldraw feature.
 
 This file auto-loads every session. The repo is the source of truth.
 **Read next: `docs/STATUS.md`** — current state + what to build next.
 
 ## The feel contract (don't regress these)
-- **Swapchain:** DXGI FLIP_DISCARD, 3 buffers, frame-latency waitable object,
-  max latency 1, `Present(1,0)`. Loop: wait on waitable → pump input → build →
-  present. Lowest-latency vsync without tearing. Never add sleeps or busy loops.
+- **Swapchain (Windows):** DXGI FLIP_DISCARD, 3 buffers, frame-latency waitable
+  object, max latency 1, `Present(1,0)`. Loop: wait on waitable → pump input →
+  build → present. Lowest-latency vsync without tearing. Never add sleeps or
+  busy loops. (Linux: vsynced `SDL_RenderPresent` blocks, input pumped right
+  after — same sample-input-late order.)
 - **Text:** imgui ≥1.92 dynamic font atlas (pinned from GitHub in the flake —
   nixpkgs 1.91 is too old). Canvas text rasterizes at `size × zoom` px, so it's
   crisp at every zoom; glyphs cap at `kMaxGlyphPx` then scale geometrically.
@@ -42,26 +46,33 @@ Strokes are baked ink: move/scale/rotate/delete, never reshape.
 - `editor/src/main.cpp` — the whole app, single TU (slopstudio pattern; split
   when it hurts). Sections are banner-commented; read the table of contents grep:
   `grep -n "────" editor/src/main.cpp`.
-- `editor/Makefile` — cross-build. `flake.nix` — toolchain + pinned imgui +
-  static cross libav + fonts. `tools/embed.py` — bakes TTFs into the PE.
-- `assets/fonts/` — vendored Shantell Sans (OFL; tldraw's handwriting font).
-  Inter/JetBrains Mono/Lora come from nixpkgs via the flake.
+- `editor/Makefile` — both targets (default = Windows cross, `linux` = native
+  SDL3). `flake.nix` — toolchain + pinned imgui + static cross libav + sdl3.
+  `tools/embed.py` — bakes TTFs + icon into the binary. `tools/make-icon.sh`
+  regenerates `assets/icon-256.png` + `assets/icon.ico` (linked into the PE
+  via `editor/teidraw.rc`).
+- `assets/fonts/` — ALL four fonts vendored (OFL, license files alongside):
+  Shantell Sans (tldraw's handwriting font), Inter, JetBrains Mono, Lora.
 - A **board** is a self-contained project dir: `board.json` + `assets/` (every
   imported file is COPIED in) + `undo.jsonl` (snapshot journal; undo history
   survives sessions, cap `g_undoLimit`). Per-user prefs (theme, undo limit,
-  recent boards) live in `%APPDATA%/teidraw/settings.json`; a bare launch
-  reopens the last board, Ctrl+O = board picker.
+  recent boards) live in `%APPDATA%/teidraw/settings.json` on Windows,
+  `~/.config/teidraw/settings.json` on Linux; a bare launch reopens the last
+  board, Ctrl+O = board picker.
 
 ## Build / run / verify
 ```
-nix develop --command make -C editor          # → build/teidraw.exe
+nix develop --command make -C editor          # → build/teidraw.exe (Windows, default)
+nix develop --command make -C editor linux    # → build/teidraw (native SDL3)
 ./build/teidraw.exe [boardDir]                # opens on the Windows host (WSLInterop)
 ./build/teidraw.exe scratch --shot build/shot.png --frames 8   # headless screenshot
 ./build/teidraw.exe dir --export out.png       # render board bounds → PNG, exit
 ./build/teidraw.exe dir --export-txt out.txt   # reading-order text outline, exit
 ```
 Verify visually with `--shot` + Read the PNG. `scratch/` is the gitignored test
-board. `make -C editor shot` does the same.
+board. `make -C editor shot` does the same (`shot-linux` for the SDL build —
+truly headless via SDL's offscreen driver, no window/focus steal; prefer it
+for render-only checks).
 
 ## Conventions
 - Everything runs inside `nix develop` (`command not found` ⇒ you forgot it).

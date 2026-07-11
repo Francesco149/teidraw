@@ -1,6 +1,6 @@
 # STATUS — live front
 
-*Updated: 2026-07-11 (session 9). History lives in `git log` — this file only
+*Updated: 2026-07-11 (session 10). History lives in `git log` — this file only
 describes NOW.*
 
 ## Where things stand
@@ -194,6 +194,32 @@ pre-fix binary heals itself on open — the user's test2-remastered did (bad
 stroke lost, all other shapes intact; `.bak-corrupt-20260711` copies of the
 poisoned files left in the board dir).
 
+Session-10 = **the Linux port (M5)**. SDL3 + SDL_Renderer (imgui's
+sdlrenderer3 backend has the 1.92 dynamic-font support) behind `#ifdef _WIN32`
+seams in the same TU — the Win32/D3D11 path is byte-for-byte untouched where
+it matters. Seams: window/present (vsynced RenderPresent, input pumped right
+after = same sample-late order), texture layer (`TexH` = SRV / SDL_Texture;
+`make_rgba_tex`/`tex_destroy`/`upload_rgba`), clipboard (SDL mime clipboard:
+`application/x-teidraw-shapes` + `image/png` + `text/uri-list` + text — same
+paste priority), folder dialog (SDL portal dialog is ASYNC, callback can fire
+off-thread → mutex-stashed result polled by the board picker), audio
+(`AudioOut` keeps its thread/fifo/clock structure; WASAPI client ↔
+`SDL_AudioStream` on the default playback device, clock = written − queued),
+pen pressure (`SDL_EVENT_PEN_AXIS` → `g_penPressure`; imgui's SDL3 backend
+already feeds pen motion as mouse), file drops, XDG paths
+(`~/.config/teidraw`, boards default `~/Documents/teidraw`), POSIX fs
+helpers. Headless (`--shot`/`--export*`) prefers SDL's **offscreen video
+driver**: deterministic 1600×1000, no window opens, no focus stolen (kills
+the Linux-side instance of the session-9 focus-steal hazard; Windows headless
+still opens a window). Verified: `--shot`, `--export`, `--export-txt` against
+a copy of the user's real board — all render correctly incl. video posters
+(libav), rotated text/images, lists, palette. Interactive feel on real
+hardware is NOT yet tested — the Linux build ships in the nightly marked
+"not battle-tested, feedback welcome". Also session-10: all four fonts now
+vendored in `assets/fonts/` (OFL texts alongside; CI needs no nix fonts), the
+icon (TEI wordmark over a 3-row checkerboard, `tools/make-icon.sh`) baked
+into both binaries, `make linux` target + sdl3/pkg-config in the flake.
+
 ## Build & verify
 ```
 nix develop --command make -C editor            # build/teidraw.exe
@@ -208,12 +234,13 @@ minted duplicate ids once). Use a throwaway dir under the scratchpad for
 render tests.
 
 ## NEXT TASK (docs/ROADMAP.md)
-M3 is DONE (wrap + WYSIWYG editor landed session 8) except multi-monitor DPI
-(WM_DPICHANGED restyle). M4 is essentially done too. What's left before M5
-(linux port) is polish on user feedback — the session-8 editor and the
-session-9 draw tool both need hands-on testing (draw: stroke feel/thinning
+M5 (linux port) landed session 10; the repo is being set up for public
+release (README, nightly CI). Open threads: hands-on testing of the
+session-8 editor + session-9 draw tool on Windows (stroke feel/thinning
 constants in the `── freehand stroke capture ──` block, shift chaining, pen
-pressure on the user's Wacom CTL-480 with Windows Ink on).
+pressure on the user's Wacom CTL-480 with Windows Ink on), first real-user
+pass on the Linux build (feel, clipboard across DEs, pen), multi-monitor DPI
+(WM_DPICHANGED restyle) still open from M3.
 
 ## Known rough edges / to keep in mind
 - **The text editor is in-house** (`DrawTextEditor` + `g_ted`): no imgui

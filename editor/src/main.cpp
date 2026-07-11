@@ -1,13 +1,18 @@
 // teidraw — MIT-licensed infinite-canvas whiteboard with tldraw-grade feel.
-// Single translation unit (the slopstudio pattern): Dear ImGui + D3D11 + Win32,
-// cross-compiled to a Win64 PE with mingw-w64. Split into files when it hurts.
+// Single translation unit (the slopstudio pattern): Dear ImGui, with TWO
+// platform backends behind #ifdef _WIN32 seams:
+//   Windows (primary): D3D11 + Win32, cross-compiled to a Win64 PE with
+//   mingw-w64. Linux: SDL3 + SDL_Renderer (GPU-accelerated; SDL picks
+//   GL/Vulkan). Split into files when it hurts.
 //
 // Responsiveness contract (why the main loop looks the way it does):
-//   flip-model swapchain (FLIP_DISCARD, 3 buffers) + frame-latency waitable
-//   object with max latency 1 + Present(1,0). Loop order each frame:
+//   Windows: flip-model swapchain (FLIP_DISCARD, 3 buffers) + frame-latency
+//   waitable object with max latency 1 + Present(1,0). Loop order each frame:
 //   wait on the waitable (until DXGI can accept a frame) → THEN pump input →
 //   build UI → render → present. Input is sampled as late as possible, so
 //   pointer-to-photon latency is minimal, vsynced, and tear-free.
+//   Linux: vsynced RenderPresent blocks until the frame is consumed, then
+//   input is pumped right after — the same "sample input late" order.
 //
 // Interaction philosophy (tldraw's): hide complexity, guess intent.
 //   click child of group → selects the group; click again → drills to child.
@@ -15,6 +20,7 @@
 //   to it (exact anchor remembered) and the line is trimmed at its bounds.
 //   right-drag pans, right-click opens the context menu. scroll = zoom, always.
 
+#ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
 #include <shlwapi.h>
@@ -22,6 +28,12 @@
 #include <shobjidl.h>    // IFileOpenDialog (board folder picker)
 #include <d3d11.h>
 #include <dxgi1_3.h>
+#else
+#include <SDL3/SDL.h>
+#include <sys/stat.h>    // mkdir
+#include <unistd.h>      // access
+#include <stdlib.h>      // realpath
+#endif
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -34,6 +46,7 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <chrono>
 #include <condition_variable>
 #include <fstream>
 #include <sstream>
@@ -41,8 +54,13 @@
 
 #include "imgui.h"
 #include "imgui_internal.h"
+#ifdef _WIN32
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
+#else
+#include "imgui_impl_sdl3.h"
+#include "imgui_impl_sdlrenderer3.h"
+#endif
 #include "misc/cpp/imgui_stdlib.h"
 
 #include <nlohmann/json.hpp>
@@ -53,9 +71,11 @@ using json = nlohmann::json;
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
-#include "fonts_embedded.h"   // font_hand/font_sans/font_mono/font_serif (tools/embed.py)
+#include "fonts_embedded.h"   // font_hand/font_sans/font_mono/font_serif + icon_png (tools/embed.py)
 
+#ifdef _WIN32
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+#endif
 
 // ───────────────────────────── small math bits ─────────────────────────────
 static ImVec2 operator+(ImVec2 a, ImVec2 b) { return ImVec2(a.x + b.x, a.y + b.y); }
@@ -83,6 +103,7 @@ static float dist_point_seg(ImVec2 p, ImVec2 a, ImVec2 b) {
 }
 
 // ───────────────────────────── D3D11 / swapchain ───────────────────────────
+#ifdef _WIN32
 static ID3D11Device*           g_dev = nullptr;
 static ID3D11DeviceContext*    g_ctx = nullptr;
 static IDXGISwapChain2*        g_sc  = nullptr;
@@ -177,6 +198,39 @@ static bool SaveBackbufferPNG(const char* path) {
     bb->Release();
     return ok && stbi_write_png(path, w, h, 4, px.data(), w * 4) != 0;
 }
+
+#else // ─────────────────────── SDL3 window / renderer ───────────────────────
+// Linux backend: SDL3 window + SDL_Renderer (SDL picks GL/Vulkan; vsynced
+// present). The whole canvas layer only touches textures through the helpers
+// below, so the two backends stay drop-in equivalent.
+static SDL_Window*   g_win = nullptr;
+static SDL_Renderer* g_ren = nullptr;
+
+// Read the CURRENT render target (backbuffer or an offscreen target) back as
+// opaque RGBA8. Unlike D3D's post-Present readback, SDL must read BEFORE
+// RenderPresent — call sites order accordingly.
+static bool read_target_rgba(std::vector<unsigned char>& px, int& w, int& h) {
+    SDL_Surface* s = SDL_RenderReadPixels(g_ren, nullptr);
+    if (!s) return false;
+    SDL_Surface* c = SDL_ConvertSurface(s, SDL_PIXELFORMAT_RGBA32);
+    SDL_DestroySurface(s);
+    if (!c) return false;
+    w = c->w; h = c->h;
+    px.resize((size_t)w * h * 4);
+    for (int y = 0; y < h; y++)
+        memcpy(&px[(size_t)y * w * 4], (unsigned char*)c->pixels + (size_t)y * c->pitch, (size_t)w * 4);
+    SDL_DestroySurface(c);
+    for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;   // force opaque alpha
+    return true;
+}
+
+// --shot path: reads the drawn frame (call between RenderDrawData and Present)
+static bool SaveBackbufferPNG(const char* path) {
+    std::vector<unsigned char> px; int w = 0, h = 0;
+    return read_target_rgba(px, w, h) &&
+           stbi_write_png(path, w, h, 4, px.data(), w * 4) != 0;
+}
+#endif
 
 // ───────────────────────────────── theme ───────────────────────────────────
 struct Theme {
@@ -1010,10 +1064,21 @@ static bool doc_from_json_string(const std::string& str, bool restoreCam) {
 }
 
 static double g_saveDueAt = 0;      // autosave debounce deadline (0 = clean)
+static void ensure_dir(const std::string& path) {
+#ifdef _WIN32
+    CreateDirectoryA(path.c_str(), nullptr);
+#else
+    mkdir(path.c_str(), 0755);
+#endif
+}
 static void write_file_atomic(const std::string& path, const std::string& data) {
     std::string tmp = path + ".tmp";
     { std::ofstream f(tmp, std::ios::binary); f << data; }
+#ifdef _WIN32
     MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+#else
+    rename(tmp.c_str(), path.c_str());
+#endif
 }
 static void save_board_now() {
     if (g_projDir.empty()) return;   // picker open at boot, no board yet
@@ -1055,8 +1120,8 @@ static void apply_undo(int dir) {
     g_saveDueAt = ImGui::GetTime() + 0.4;
 }
 static void load_board() {
-    CreateDirectoryA(g_projDir.c_str(), nullptr);
-    CreateDirectoryA((g_projDir + "/assets").c_str(), nullptr);
+    ensure_dir(g_projDir);
+    ensure_dir(g_projDir + "/assets");
     std::ifstream f(g_projDir + "/board.json", std::ios::binary);
     if (f) {
         std::stringstream ss; ss << f.rdbuf();
@@ -1176,7 +1241,12 @@ static void reorder_selected(bool front) {
 }
 
 // ───────────────────────────── media / textures ────────────────────────────
+// TexH is the platform texture handle behind every image the canvas draws:
+// a D3D11 SRV on Windows, an SDL_Texture on Linux. Both are pointers, so the
+// (ImTextureID)(intptr_t) casts at the AddImage sites work unchanged.
+#ifdef _WIN32
 static HWND g_hwnd = nullptr;
+typedef ID3D11ShaderResourceView* TexH;
 
 static std::wstring to_w(const std::string& s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
@@ -1191,10 +1261,7 @@ static std::string from_w(const wchar_t* w) {
     return s;
 }
 
-struct Tex { ID3D11ShaderResourceView* srv = nullptr; int w = 0, h = 0; };
-static std::map<std::string, Tex> g_texCache;   // project-relative asset path → tex
-
-static ID3D11ShaderResourceView* make_rgba_srv(const unsigned char* px, int w, int h) {
+static TexH make_rgba_tex(const unsigned char* px, int w, int h) {
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
     td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
@@ -1207,6 +1274,23 @@ static ID3D11ShaderResourceView* make_rgba_srv(const unsigned char* px, int w, i
     tex->Release();
     return srv;
 }
+static void tex_destroy(TexH t) { if (t) t->Release(); }
+#else
+typedef SDL_Texture* TexH;
+
+static TexH make_rgba_tex(const unsigned char* px, int w, int h) {
+    SDL_Texture* t = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, w, h);
+    if (!t) return nullptr;
+    SDL_UpdateTexture(t, nullptr, px, w * 4);
+    SDL_SetTextureScaleMode(t, SDL_SCALEMODE_LINEAR);
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    return t;
+}
+static void tex_destroy(TexH t) { if (t) SDL_DestroyTexture(t); }
+#endif
+
+struct Tex { TexH srv = nullptr; int w = 0, h = 0; };
+static std::map<std::string, Tex> g_texCache;   // project-relative asset path → tex
 
 enum MediaKind { MK_STILL = 0, MK_GIF, MK_VIDEO };
 static std::string lower_ext(const std::string& p) {
@@ -1235,12 +1319,16 @@ static Tex* get_image_tex(const std::string& asset) {
     std::string path = g_projDir + "/" + asset;
     int w = 0, h = 0, n = 0;
     unsigned char* px = stbi_load(path.c_str(), &w, &h, &n, 4);
-    if (px) { t.srv = make_rgba_srv(px, w, h); t.w = w; t.h = h; stbi_image_free(px); }
+    if (px) { t.srv = make_rgba_tex(px, w, h); t.w = w; t.h = h; stbi_image_free(px); }
     g_texCache[asset] = t;    // failures cached too — no per-frame retry spam
     return &g_texCache[asset];
 }
 
+#ifdef _WIN32
 static bool file_exists(const std::string& p) { return GetFileAttributesW(to_w(p).c_str()) != INVALID_FILE_ATTRIBUTES; }
+#else
+static bool file_exists(const std::string& p) { return access(p.c_str(), F_OK) == 0; }
+#endif
 
 // ─────────────────── video / gif decode (libav, in-process) ────────────────
 // GIFs and videos decode in-process through the flake's static libav — the
@@ -1444,15 +1532,17 @@ static VideoDecoder* get_decoder(const std::string& asset) {
     return d->ok ? d : nullptr;
 }
 
-// ── audio (WASAPI render, one stream per sounding video) ──
+// ── audio (one stream per sounding video) ──
 // A playing video with sound on gets its own thread: it opens the asset's
 // audio stream through a SEPARATE AVFormatContext (the video decoder's seek
-// position stays untouched), resamples to the device mix format with
-// swresample, and feeds a shared-mode WASAPI client — Windows mixes streams,
-// so overlapping videos need no mixer here. While a stream is live its
-// HARDWARE clock drives the video (ps.t adopts audio time each frame), so
-// A/V can't drift; UI seeks / A-B wraps request an audio seek and the video
-// free-runs on DeltaTime until it's applied (pending back to 0).
+// position stays untouched), resamples to the device format with swresample,
+// and feeds the OS mixer — shared-mode WASAPI on Windows, an SDL3 audio
+// stream on Linux; both mix, so overlapping videos need no mixer here.
+// While a stream is live its device clock drives the video (ps.t adopts
+// audio time each frame), so A/V can't drift; UI seeks / A-B wraps request
+// an audio seek and the video free-runs on DeltaTime until it's applied
+// (pending back to 0).
+#ifdef _WIN32
 #include <mmreg.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
@@ -1463,6 +1553,7 @@ static const IID   kIID_IMMDeviceEnumerator  = {0xA95664D2,0x9614,0x4F35,{0xA7,0
 static const IID   kIID_IAudioClient         = {0x1CB9AD4C,0xDBFA,0x4C32,{0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2}};
 static const IID   kIID_IAudioRenderClient   = {0xF294ACFC,0x3146,0x4483,{0xA7,0xBF,0xAD,0xDC,0xA7,0xC2,0x60,0xE2}};
 static const GUID  kSubtypeIEEEFloat         = {0x00000003,0x0000,0x0010,{0x80,0x00,0x00,0xAA,0x00,0x38,0x9B,0x71}};
+#endif
 
 struct AudioOut {
     std::string asset;                // board-relative (sweep compares vs the shape)
@@ -1475,16 +1566,23 @@ struct AudioOut {
     // thread → UI
     std::atomic<int> pending{1};      // un-applied seeks (starts at 1: the initial position)
     std::atomic<double> clock{-1};    // audible position; stays -1 if the stream never opened
+#ifdef _WIN32
     HANDLE ev = nullptr;              // WASAPI buffer event (also poked to wake the thread fast)
+#endif
     std::thread th;
 
     // ── everything below is thread-private ──
     AVFormatContext* fmt = nullptr; AVCodecContext* dec = nullptr; SwrContext* swr = nullptr;
     AVFrame* frame = nullptr; AVPacket* pkt = nullptr;
     int astream = -1; AVRational atb{0, 1};
+#ifdef _WIN32
     IAudioClient* client = nullptr; IAudioRenderClient* render = nullptr;
-    UINT32 bufFrames = 0; int rate = 0, bytesPS = 0;
-    std::vector<unsigned char> fifo;  // resampled samples not yet handed to WASAPI
+    UINT32 bufFrames = 0;
+#else
+    SDL_AudioStream* stream = nullptr;   // bound to the default playback device
+#endif
+    int rate = 0, bytesPS = 0;
+    std::vector<unsigned char> fifo;  // resampled samples not yet handed to the device
     double basePts = 0;               // stream time of the first sample after the last seek
     uint64_t written = 0;             // device frames written since the last seek
     bool devOn = false, aeof = false;
@@ -1504,6 +1602,7 @@ struct AudioOut {
         frame = av_frame_alloc(); pkt = av_packet_alloc();
         return frame && pkt && dec->sample_rate > 0;
     }
+#ifdef _WIN32
     bool open_dev() {
         IMMDeviceEnumerator* en = nullptr; IMMDevice* dev = nullptr;
         WAVEFORMATEX* wfx = nullptr;
@@ -1538,6 +1637,27 @@ struct AudioOut {
         if (en) en->Release();
         return ok;
     }
+#else
+    bool open_dev() {
+        SDL_AudioSpec spec = {};   // prefer the device's own layout — SDL then converts nothing
+        SDL_AudioSpec dev = {};
+        spec.format = SDL_AUDIO_F32;
+        spec.channels = 2; spec.freq = dec->sample_rate;
+        if (SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &dev, nullptr)) {
+            if (dev.channels >= 1 && dev.channels <= 8) spec.channels = dev.channels;
+            if (dev.freq > 0) spec.freq = dev.freq;
+        }
+        stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+        if (!stream) return false;
+        rate = spec.freq; bytesPS = spec.channels * 4;
+        AVChannelLayout outLay;
+        av_channel_layout_default(&outLay, spec.channels);
+        int sr = swr_alloc_set_opts2(&swr, &outLay, AV_SAMPLE_FMT_FLT, rate,
+                                     &dec->ch_layout, dec->sample_fmt, dec->sample_rate, 0, nullptr);
+        av_channel_layout_uninit(&outLay);
+        return sr >= 0 && swr_init(swr) >= 0;
+    }
+#endif
     bool next_frame() {   // decode the next audio frame into `frame`; false at stream end
         for (;;) {
             int rr = avcodec_receive_frame(dec, frame);
@@ -1562,8 +1682,13 @@ struct AudioOut {
         fifo.resize(at + (size_t)(n > 0 ? n : 0) * bytesPS);
     }
     void do_seek(double t) {
+#ifdef _WIN32
         if (devOn) { client->Stop(); devOn = false; }
         client->Reset();                       // drop anything still buffered on the device
+#else
+        if (devOn) { SDL_PauseAudioStreamDevice(stream); devOn = false; }
+        SDL_ClearAudioStream(stream);          // drop anything still queued
+#endif
         fifo.clear(); written = 0; aeof = false;
         basePts = t;
         avcodec_flush_buffers(dec);
@@ -1582,6 +1707,7 @@ struct AudioOut {
         }
         clock = basePts;
     }
+#ifdef _WIN32
     void fill() {
         UINT32 pad = 0;
         if (FAILED(client->GetCurrentPadding(&pad)) || pad >= bufFrames) return;
@@ -1601,8 +1727,33 @@ struct AudioOut {
         written += free;
         clock = basePts + ((double)written - (double)(pad + free)) / rate;
     }
+#else
+    void fill() {   // keep ~100ms queued on the SDL stream (its own thread drains it)
+        int queued = (int)(SDL_GetAudioStreamQueued(stream) / bytesPS);
+        int free = rate / 10 - queued;
+        if (free > 0) {
+            size_t need = (size_t)free * bytesPS;
+            while (fifo.size() < need && !aeof) {
+                if (next_frame()) fifo_push(frame);
+                else { fifo_push(nullptr); aeof = true; }
+            }
+            size_t have = fifo.size() < need ? fifo.size() : need;
+            if (aeof && have < need) {   // past stream end: silence, clock keeps running
+                fifo.resize(need, 0);
+                have = need;
+            }
+            if (have) SDL_PutAudioStreamData(stream, fifo.data(), (int)have);
+            fifo.erase(fifo.begin(), fifo.begin() + have);
+            written += have / bytesPS;
+            queued = (int)(SDL_GetAudioStreamQueued(stream) / bytesPS);
+        }
+        clock = basePts + ((double)written - (double)queued) / rate;
+    }
+#endif
     void run() {
+#ifdef _WIN32
         HRESULT ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+#endif
         bool ok = open_av() && open_dev();
         for (;;) {
             bool w; double sk;
@@ -1621,19 +1772,39 @@ struct AudioOut {
                 cv.wait(lk, [&] { return quit || seekTo >= 0; });
                 continue;
             }
+#ifdef _WIN32
             if (w && !devOn) { fill(); client->Start(); devOn = true; }
             else if (!w && devOn) { client->Stop(); devOn = false; continue; }
             if (devOn && WaitForSingleObject(ev, 100) == WAIT_OBJECT_0) fill();
+#else
+            if (w && !devOn) { fill(); SDL_ResumeAudioStreamDevice(stream); devOn = true; }
+            else if (!w && devOn) { SDL_PauseAudioStreamDevice(stream); devOn = false; continue; }
+            if (devOn) {
+                // no buffer event on SDL: top the queue up every ~20ms, but let
+                // seeks / stop / quit interrupt the nap so they stay snappy
+                std::unique_lock<std::mutex> lk(mx);
+                cv.wait_for(lk, std::chrono::milliseconds(20),
+                            [&] { return quit || seekTo >= 0 || want != w; });
+                lk.unlock();
+                fill();
+            }
+#endif
         }
+#ifdef _WIN32
         if (client && devOn) client->Stop();
         if (render) render->Release();
         if (client) client->Release();
+#else
+        if (stream) SDL_DestroyAudioStream(stream);   // also closes its device binding
+#endif
         if (swr) swr_free(&swr);
         if (frame) av_frame_free(&frame);
         if (pkt) av_packet_free(&pkt);
         if (dec) avcodec_free_context(&dec);
         if (fmt) avformat_close_input(&fmt);
+#ifdef _WIN32
         if (ci == S_OK || ci == S_FALSE) CoUninitialize();
+#endif
     }
 };
 static std::map<uint64_t, AudioOut*> g_audio;   // shape id → live audio stream (UI thread only)
@@ -1641,9 +1812,13 @@ static std::map<uint64_t, AudioOut*> g_audio;   // shape id → live audio strea
 static void audio_destroy(AudioOut* a) {
     { std::lock_guard<std::mutex> lk(a->mx); a->quit = true; }
     a->cv.notify_all();
+#ifdef _WIN32
     if (a->ev) SetEvent(a->ev);
+#endif
     if (a->th.joinable()) a->th.join();
+#ifdef _WIN32
     if (a->ev) CloseHandle(a->ev);
+#endif
     delete a;
 }
 static void audio_destroy_all() {
@@ -1653,7 +1828,12 @@ static void audio_destroy_all() {
 static void audio_play(AudioOut* a, bool on) {
     bool changed;
     { std::lock_guard<std::mutex> lk(a->mx); changed = a->want != on; a->want = on; }
-    if (changed) { a->cv.notify_all(); if (a->ev) SetEvent(a->ev); }
+    if (changed) {
+        a->cv.notify_all();
+#ifdef _WIN32
+        if (a->ev) SetEvent(a->ev);
+#endif
+    }
 }
 static void audio_seek(AudioOut* a, double t) {
     {
@@ -1662,7 +1842,9 @@ static void audio_seek(AudioOut* a, double t) {
         a->seekTo = t;
     }
     a->cv.notify_all();
+#ifdef _WIN32
     if (a->ev) SetEvent(a->ev);
+#endif
 }
 static AudioOut* audio_ensure(uint64_t id, const std::string& asset, double t) {
     auto it = g_audio.find(id);
@@ -1674,7 +1856,9 @@ static AudioOut* audio_ensure(uint64_t id, const std::string& asset, double t) {
     a->asset = asset;
     a->path = g_projDir + "/" + asset;
     a->seekTo = t;   // consumed as the initial position (pending starts at 1)
+#ifdef _WIN32
     a->ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+#endif
     a->th = std::thread([a] { a->run(); });
     g_audio[id] = a;
     return a;
@@ -1703,9 +1887,14 @@ struct PlayState {
     int shownIdx = -1;
     int reqIdx = -1;    // frame index requested from the decode worker, not yet delivered
     int w = 0, h = 0;
+#ifdef _WIN32
     ID3D11Texture2D* tex = nullptr;
-    ID3D11ShaderResourceView* srv = nullptr;
+    TexH srv = nullptr;
     void release() { if (srv) srv->Release(); if (tex) tex->Release(); srv = nullptr; tex = nullptr; shownIdx = -1; reqIdx = -1; }
+#else
+    TexH srv = nullptr;   // one streaming texture (named like the D3D field: draw sites stay shared)
+    void release() { if (srv) SDL_DestroyTexture(srv); srv = nullptr; shownIdx = -1; reqIdx = -1; }
+#endif
 };
 static std::map<uint64_t, PlayState> g_play;
 
@@ -1724,6 +1913,7 @@ static PlayState& play_state(const Shape& s) {
 }
 
 #ifdef TEI_LIBAV
+#ifdef _WIN32
 static bool upload_rgba(PlayState& ps, const unsigned char* rgba, int w, int h) {
     if (!ps.tex || ps.w != w || ps.h != h) {
         ps.release();
@@ -1743,10 +1933,24 @@ static bool upload_rgba(PlayState& ps, const unsigned char* rgba, int w, int h) 
     g_ctx->Unmap(ps.tex, 0);
     return true;
 }
+#else
+static bool upload_rgba(PlayState& ps, const unsigned char* rgba, int w, int h) {
+    if (!ps.srv || ps.w != w || ps.h != h) {
+        ps.release();
+        ps.srv = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, w, h);
+        if (!ps.srv) return false;
+        SDL_SetTextureScaleMode(ps.srv, SDL_SCALEMODE_LINEAR);
+        SDL_SetTextureBlendMode(ps.srv, SDL_BLENDMODE_BLEND);
+        ps.w = w; ps.h = h;
+    }
+    return SDL_UpdateTexture(ps.srv, nullptr, rgba, w * 4);
+}
+#endif
 
-// Advance playback + return the SRV for this video/gif shape (poster frame 0
-// when idle). Called from the draw pass every frame the shape is visible.
-static ID3D11ShaderResourceView* video_srv(const Shape& s, MediaKind mk) {
+// Advance playback + return the texture for this video/gif shape (poster
+// frame 0 when idle). Called from the draw pass every frame the shape is
+// visible.
+static TexH video_srv(const Shape& s, MediaKind mk) {
     VideoDecoder* d = get_decoder(s.asset);
     if (!d) return nullptr;
     PlayState& ps = play_state(s);
@@ -1838,8 +2042,17 @@ static std::string import_asset_file(const std::string& srcPathUtf8) {
     std::string rel = "assets/" + clean + ext;
     for (int i = 2; file_exists(g_projDir + "/" + rel); i++)
         rel = "assets/" + clean + "-" + std::to_string(i) + ext;
+#ifdef _WIN32
     if (!CopyFileW(to_w(srcPathUtf8).c_str(), to_w(g_projDir + "/" + rel).c_str(), TRUE))
         return "";
+#else
+    std::ifstream in(srcPathUtf8, std::ios::binary);
+    std::ofstream out(g_projDir + "/" + rel, std::ios::binary);
+    if (!in || !out) return "";
+    out << in.rdbuf();
+    out.close();
+    if (!out.good()) return "";
+#endif
     return rel;
 }
 
@@ -1935,8 +2148,22 @@ static std::vector<std::string> g_dropFiles;
 static ImVec2 g_dropPoint;
 
 // ── clipboard ──
+#ifdef _WIN32
 static UINT fmt_shapes() { static UINT f = RegisterClipboardFormatA("teidraw_shapes"); return f; }
 static UINT fmt_png()    { static UINT f = RegisterClipboardFormatA("PNG"); return f; }
+#else
+// SDL3's mime-typed clipboard carries our shapes payload and PNGs on both
+// X11 and Wayland. The callback hands SDL a view into these owned buffers.
+static const char* kMimeShapes = "application/x-teidraw-shapes";
+static std::string g_clipShapes, g_clipPng;   // alive until the next SetClipboardData
+static const void* sdl_clip_cb(void* userdata, const char* mime, size_t* size) {
+    (void)mime;
+    std::string* s = (std::string*)userdata;
+    *size = s->size();
+    return s->size() ? (const void*)s->data() : nullptr;
+}
+static void sdl_clip_cleanup(void*) {}
+#endif
 
 static void copy_selection_to_clipboard(bool cut) {
     if (g_sel.empty()) return;
@@ -1947,6 +2174,7 @@ static void copy_selection_to_clipboard(bool cut) {
         for (auto id : all) if (id == s.id) { arr.push_back(shape_to_json(s)); break; }
     }
     std::string payload = arr.dump();
+#ifdef _WIN32
     if (!OpenClipboard(g_hwnd)) return;
     EmptyClipboard();
     HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, payload.size() + 1);
@@ -1956,6 +2184,10 @@ static void copy_selection_to_clipboard(bool cut) {
         SetClipboardData(fmt_shapes(), hg);
     }
     CloseClipboard();
+#else
+    g_clipShapes = std::move(payload);
+    SDL_SetClipboardData(sdl_clip_cb, sdl_clip_cleanup, &g_clipShapes, &kMimeShapes, 1);
+#endif
     if (cut) { delete_shapes(g_sel); push_undo(); }
 }
 
@@ -1996,6 +2228,32 @@ static void paste_shapes_json(const std::string& payload, ImVec2 atW) {
     push_undo();
 }
 
+// plain clipboard text → a text shape at the paste point (shared tail of both
+// platform paste paths)
+static void paste_text_as_shape(const std::string& txt, ImVec2 atW) {
+    std::string t2; for (char c : txt) if (c != '\r') t2 += c;   // normalize CRLF
+    if (t2.empty()) return;
+    Shape s; s.id = new_id(); s.type = SH_TEXT; s.text = t2;
+    ImVec2 e = text_extent(s);
+    s.pos = atW - e * 0.5f;
+    g_doc.shapes.push_back(s);
+    g_sel.clear(); g_sel.push_back(s.id);
+    push_undo();
+}
+
+// write raw PNG bytes into assets/ and land them as a new image shape
+static bool paste_png_bytes(const void* p, size_t n, ImVec2 atW) {
+    if (!p || !n) return false;
+    std::string rel = next_paste_name(".png");
+    std::ofstream f(g_projDir + "/" + rel, std::ios::binary);
+    f.write((const char*)p, (std::streamsize)n); f.close();
+    uint64_t id = create_image_shape(rel, atW);
+    g_sel.clear(); g_sel.push_back(id);
+    push_undo();
+    return true;
+}
+
+#ifdef _WIN32
 static void paste_clipboard(ImVec2 atW) {
     if (!OpenClipboard(g_hwnd)) return;
     bool done = false;
@@ -2007,15 +2265,7 @@ static void paste_clipboard(ImVec2 atW) {
     if (HANDLE h = GetClipboardData(fmt_png())) {              // 2) PNG bytes (browsers etc.)
         void* p = GlobalLock(h);
         SIZE_T n = GlobalSize(h);
-        if (p && n) {
-            std::string rel = next_paste_name(".png");
-            std::ofstream f(g_projDir + "/" + rel, std::ios::binary);
-            f.write((const char*)p, (std::streamsize)n); f.close();
-            GlobalUnlock(h);
-            uint64_t id = create_image_shape(rel, atW);
-            g_sel.clear(); g_sel.push_back(id);
-            push_undo(); done = true;
-        } else if (p) GlobalUnlock(h);
+        if (p) { done = paste_png_bytes(p, n, atW); GlobalUnlock(h); }
     }
     if (!done) if (HANDLE h = GetClipboardData(CF_DIB)) {      // 3) DIB → decode via stb (fake BMP header)
         BITMAPINFOHEADER* bi = (BITMAPINFOHEADER*)GlobalLock(h);
@@ -2060,20 +2310,71 @@ static void paste_clipboard(ImVec2 atW) {
         if (p) {
             std::string txt = from_w(p);
             GlobalUnlock(h);
-            // normalize CRLF
-            std::string t2; for (char c : txt) if (c != '\r') t2 += c;
-            if (!t2.empty()) {
-                Shape s; s.id = new_id(); s.type = SH_TEXT; s.text = t2;
-                ImVec2 e = text_extent(s);
-                s.pos = atW - e * 0.5f;
-                g_doc.shapes.push_back(s);
-                g_sel.clear(); g_sel.push_back(s.id);
-                push_undo();
-            }
+            paste_text_as_shape(txt, atW);
         }
     }
     CloseClipboard();
 }
+
+#else // SDL3 paste — same priority order: shapes > PNG > files > plain text
+
+// "file:///home/a%20b/c.png" → "/home/a b/c.png" (empty when not a local file)
+static std::string uri_to_path(const std::string& uri) {
+    if (uri.rfind("file://", 0) != 0) return "";
+    std::string p = uri.substr(7);
+    size_t sl = p.find('/');                    // strip a host part (file://host/…)
+    if (sl == std::string::npos) return "";
+    if (sl != 0) p = p.substr(sl);
+    std::string out;
+    for (size_t i = 0; i < p.size(); i++) {
+        if (p[i] == '%' && i + 2 < p.size() && isxdigit((unsigned char)p[i+1]) && isxdigit((unsigned char)p[i+2])) {
+            out += (char)strtol(p.substr(i + 1, 2).c_str(), nullptr, 16);
+            i += 2;
+        } else out += p[i];
+    }
+    return out;
+}
+
+static void paste_clipboard(ImVec2 atW) {
+    if (SDL_HasClipboardData(kMimeShapes)) {                   // 1) our own shapes
+        size_t n = 0;
+        void* p = SDL_GetClipboardData(kMimeShapes, &n);
+        if (p) {
+            std::string payload((const char*)p, n);
+            SDL_free(p);
+            if (n) { paste_shapes_json(payload, atW); return; }
+        }
+    }
+    if (SDL_HasClipboardData("image/png")) {                   // 2) PNG bytes (browsers etc.)
+        size_t n = 0;
+        void* p = SDL_GetClipboardData("image/png", &n);
+        bool ok = paste_png_bytes(p, n, atW);
+        if (p) SDL_free(p);
+        if (ok) return;
+    }
+    if (SDL_HasClipboardData("text/uri-list")) {               // 3) copied files
+        size_t n = 0;
+        void* p = SDL_GetClipboardData("text/uri-list", &n);
+        if (p) {
+            std::stringstream ss(std::string((const char*)p, n));
+            SDL_free(p);
+            std::vector<std::string> paths;
+            std::string line;
+            while (std::getline(ss, line)) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+                if (line.empty() || line[0] == '#') continue;
+                std::string path = uri_to_path(line);
+                if (!path.empty()) paths.push_back(path);
+            }
+            if (!paths.empty()) { import_files_at(paths, atW); return; }
+        }
+    }
+    if (SDL_HasClipboardText()) {                              // 4) plain text → text shape
+        char* t = SDL_GetClipboardText();
+        if (t) { paste_text_as_shape(t, atW); SDL_free(t); }
+    }
+}
+#endif
 
 // ──────────────── global settings (%APPDATA%) · board switching ────────────
 // Per-USER prefs — theme, zoom animation, undo limit, boards home and the
@@ -2084,6 +2385,7 @@ static std::string g_settingsDir;               // %APPDATA%/teidraw ("" = unava
 static std::string g_boardsDir;                 // where "new board" mints dirs
 static std::vector<std::string> g_recentBoards; // absolute dirs, most recent first
 
+#ifdef _WIN32
 static bool path_eq(const std::string& a, const std::string& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++) {
@@ -2099,6 +2401,17 @@ static std::string abs_path(const std::string& p) {
     DWORD n = GetFullPathNameW(to_w(p).c_str(), 2048, buf, nullptr);
     return (n > 0 && n < 2048) ? from_w(buf) : p;
 }
+#else
+static bool path_eq(const std::string& a, const std::string& b) { return a == b; }
+static std::string abs_path(const std::string& p) {
+    char buf[4096];
+    if (realpath(p.c_str(), buf)) return buf;   // fails for not-yet-created boards:
+    if (!p.empty() && p[0] == '/') return p;    // fall back to a plain cwd join
+    char cwd[4096];
+    if (getcwd(cwd, sizeof cwd)) return std::string(cwd) + "/" + p;
+    return p;
+}
+#endif
 static std::string board_name(const std::string& dir) {
     std::string d = dir;
     while (!d.empty() && (d.back() == '/' || d.back() == '\\')) d.pop_back();
@@ -2118,16 +2431,31 @@ static void save_settings() {
     write_file_atomic(g_settingsDir + "/settings.json", j.dump(2));
 }
 static void load_settings() {
+#ifdef _WIN32
     const char* app = getenv("APPDATA");
     if (app && *app) {
         g_settingsDir = std::string(app) + "/teidraw";
-        CreateDirectoryA(g_settingsDir.c_str(), nullptr);
+        ensure_dir(g_settingsDir);
     }
     PWSTR docs = nullptr;   // default new-board home: Documents/teidraw
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
         g_boardsDir = from_w(docs) + "\\teidraw";
         CoTaskMemFree(docs);
     } else if (!g_settingsDir.empty()) g_boardsDir = g_settingsDir + "/boards";
+#else
+    const char* home = getenv("HOME");
+    const char* xdg = getenv("XDG_CONFIG_HOME");   // settings: ~/.config/teidraw
+    std::string cfg = xdg && *xdg ? std::string(xdg)
+                    : home && *home ? std::string(home) + "/.config" : "";
+    if (!cfg.empty()) {
+        g_settingsDir = cfg + "/teidraw";
+        ensure_dir(g_settingsDir);
+    }
+    if (home && *home) {   // default new-board home: ~/Documents/teidraw (~/teidraw without a Documents)
+        std::string docs = std::string(home) + "/Documents";
+        g_boardsDir = (file_exists(docs) ? docs : std::string(home)) + "/teidraw";
+    } else if (!g_settingsDir.empty()) g_boardsDir = g_settingsDir + "/boards";
+#endif
     if (g_settingsDir.empty()) return;
     std::ifstream f(g_settingsDir + "/settings.json", std::ios::binary);
     if (!f) return;
@@ -2176,7 +2504,7 @@ static void switch_board(const std::string& dirIn) {
     clear_selection(); g_editText = 0; g_editLabelArrow = 0;
     g_cam = Camera{}; g_camAnim.active = false;
     g_saveDueAt = 0;
-    for (auto& [rel, t] : g_texCache) if (t.srv) t.srv->Release();
+    for (auto& [rel, t] : g_texCache) tex_destroy(t.srv);
     g_texCache.clear();
     for (auto& [id, ps] : g_play) ps.release();
     g_play.clear();
@@ -2203,11 +2531,16 @@ static void switch_board(const std::string& dirIn) {
     load_board();
     if (!board_exists(dir)) save_board_now();
     if (!g_headless) note_board_opened(dir);
+#ifdef _WIN32
     if (g_hwnd) SetWindowTextW(g_hwnd, to_w(board_name(dir) + " — teidraw").c_str());
+#else
+    if (g_win) SDL_SetWindowTitle(g_win, (board_name(dir) + " — teidraw").c_str());
+#endif
 }
 
 // Native folder dialog: open a board anywhere (an empty folder becomes a new
 // board there). Show() pumps its own message loop; our frame just stalls.
+#ifdef _WIN32
 static std::string pick_folder_dialog() {
     std::string out;
     HRESULT ci = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -2230,6 +2563,19 @@ static std::string pick_folder_dialog() {
     if (ci == S_OK || ci == S_FALSE) CoUninitialize();
     return out;
 }
+#else
+// SDL's folder dialog is async (xdg-desktop-portal underneath) and its
+// callback may fire on another thread: stash the pick, the board picker
+// polls it each frame.
+static std::mutex g_folderDlgMx;
+static std::string g_folderDlgResult;
+static std::atomic<bool> g_folderDlgDone{false};
+static void folder_dlg_cb(void*, const char* const* filelist, int) {
+    std::lock_guard<std::mutex> lk(g_folderDlgMx);
+    g_folderDlgResult = (filelist && filelist[0]) ? filelist[0] : "";
+    g_folderDlgDone = true;
+}
+#endif
 
 // ─────────────────────────────── hit testing ───────────────────────────────
 static float screen_px(float px) { return px / g_cam.zoom; }   // px → world units
@@ -2530,7 +2876,7 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
         case SH_ARROW: draw_arrow_shape(dl, s); break;
         case SH_IMAGE: {
             ImVec2 mn = W2S(s.pos), mx = W2S(s.pos + s.size);
-            ID3D11ShaderResourceView* srv = nullptr;
+            TexH srv = nullptr;
             MediaKind mk = media_kind(s.asset);
             if (mk == MK_STILL) srv = get_image_tex(s.asset)->srv;
 #ifdef TEI_LIBAV
@@ -2613,8 +2959,13 @@ static bool render_rect_rgba(const WRect& r, const std::vector<uint64_t>* only,
     Camera saved = g_cam;
     g_cam.zoom = scale;
     g_cam.pan = ImVec2(-r.mn.x * scale, -r.mn.y * scale);
+#ifdef _WIN32
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
+#else
+    ImGui_ImplSDLRenderer3_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+#endif
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2((float)w, (float)h);   // after the backend snapshot, before NewFrame
     ImGui::NewFrame();
@@ -2624,6 +2975,7 @@ static bool render_rect_rgba(const WRect& r, const std::vector<uint64_t>* only,
     ImGui::Render();
     g_cam = saved;
 
+#ifdef _WIN32
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = (UINT)w; td.Height = (UINT)h;
     td.MipLevels = 1; td.ArraySize = 1;
@@ -2645,10 +2997,24 @@ static bool render_rect_rgba(const WRect& r, const std::vector<uint64_t>* only,
     if (rtv) rtv->Release();
     if (tex) tex->Release();
     return ok;
+#else
+    SDL_Texture* target = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, w, h);
+    if (!target) return false;
+    SDL_SetRenderTarget(g_ren, target);
+    ImVec4 bg = ImGui::ColorConvertU32ToFloat4(g_th.canvasBg);
+    SDL_SetRenderDrawColorFloat(g_ren, bg.x, bg.y, bg.z, 1.f);
+    SDL_RenderClear(g_ren);
+    ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_ren);
+    bool ok = read_target_rgba(px, w, h);   // reads the CURRENT target
+    SDL_SetRenderTarget(g_ren, nullptr);
+    SDL_DestroyTexture(target);
+    return ok;
+#endif
 }
 
 // PNG bytes + a CF_DIB fallback, so both browsers/chat apps and legacy
 // Windows apps can paste it
+#ifdef _WIN32
 static void set_clipboard_image(const unsigned char* rgba, int w, int h) {
     int plen = 0;
     unsigned char* png = stbi_write_png_to_mem(rgba, w * 4, w, h, 4, &plen);
@@ -2682,6 +3048,17 @@ static void set_clipboard_image(const unsigned char* rgba, int w, int h) {
     }
     CloseClipboard();
 }
+#else
+static void set_clipboard_image(const unsigned char* rgba, int w, int h) {
+    int plen = 0;
+    unsigned char* png = stbi_write_png_to_mem(rgba, w * 4, w, h, 4, &plen);
+    if (!png) return;
+    g_clipPng.assign((const char*)png, (size_t)plen);
+    free(png);
+    static const char* mime = "image/png";
+    SDL_SetClipboardData(sdl_clip_cb, sdl_clip_cleanup, &g_clipPng, &mime, 1);
+}
+#endif
 
 // run the queued PNG export (call between frames); returns the job's quit flag
 static bool run_pending_export() {
@@ -2813,6 +3190,7 @@ static std::string board_outline(bool selOnly) {
 }
 
 static void copy_text_to_clipboard(const std::string& utf8) {
+#ifdef _WIN32
     std::wstring w = to_w(utf8);
     std::wstring crlf; crlf.reserve(w.size() + 64);
     for (wchar_t c : w) { if (c == L'\n') crlf += L'\r'; crlf += c; }
@@ -2824,6 +3202,9 @@ static void copy_text_to_clipboard(const std::string& utf8) {
         SetClipboardData(CF_UNICODETEXT, hg);
     }
     CloseClipboard();
+#else
+    SDL_SetClipboardText(utf8.c_str());
+#endif
 }
 
 // ─────────────────────────── canvas interaction ────────────────────────────
@@ -3459,20 +3840,36 @@ static void DrawBoardPicker() {
     create |= ImGui::Button("create", ImVec2(76, 0));
     std::string clean = sanitize_board_name(g_newBoardName);
     if (!g_boardsDir.empty()) {
-        std::string where = "in " + (clean.empty() ? g_boardsDir : g_boardsDir + "\\" + clean);
+#ifdef _WIN32
+        const char* sep = "\\";
+#else
+        const char* sep = "/";
+#endif
+        std::string where = "in " + (clean.empty() ? g_boardsDir : g_boardsDir + sep + clean);
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_th.textDim), "%s",
                            elide_left(where, ImGui::GetFont(), ImGui::GetFontSize(),
                                       ImGui::GetContentRegionAvail().x).c_str());
     }
     if (create && !clean.empty() && !g_boardsDir.empty()) {
-        CreateDirectoryA(g_boardsDir.c_str(), nullptr);
+        ensure_dir(g_boardsDir);
         switch_board(g_boardsDir + "/" + clean);
         ImGui::CloseCurrentPopup();
     }
     if (ImGui::Button("open folder…")) {
+#ifdef _WIN32
         std::string dir = pick_folder_dialog();
         if (!dir.empty()) { switch_board(dir); ImGui::CloseCurrentPopup(); }
+#else
+        SDL_ShowOpenFolderDialog(folder_dlg_cb, nullptr, g_win, nullptr, false);
+#endif
     }
+#ifndef _WIN32
+    if (g_folderDlgDone.exchange(false)) {   // async pick landed (any earlier frame)
+        std::string dir;
+        { std::lock_guard<std::mutex> lk(g_folderDlgMx); dir = std::move(g_folderDlgResult); }
+        if (!dir.empty()) { switch_board(dir); ImGui::CloseCurrentPopup(); }
+    }
+#endif
     ImGui::EndPopup();
 }
 
@@ -5008,7 +5405,8 @@ static void CanvasFrame() {
     }
 }
 
-// ───────────────────────────────── win32 ───────────────────────────────────
+// ─────────────────────────── platform shell · main ─────────────────────────
+#ifdef _WIN32
 static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (ImGui_ImplWin32_WndProcHandler(h, m, w, l)) return true;
     switch (m) {
@@ -5058,6 +5456,43 @@ static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
+#else
+// SDL event pump: imgui's SDL3 backend consumes everything mouse/keyboard/
+// IME; we siphon file drops and pen pressure off the same stream. Returns
+// false when the app should quit.
+static bool sdl_pump_events() {
+    bool quit = false;
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        ImGui_ImplSDL3_ProcessEvent(&e);
+        switch (e.type) {
+        case SDL_EVENT_QUIT: quit = true; break;
+        case SDL_EVENT_DROP_FILE:
+            if (e.drop.data) {
+                g_dropPoint = ImVec2(e.drop.x, e.drop.y);
+                g_dropFiles.push_back(e.drop.data);
+            }
+            break;
+        // Pen pressure: the backend already routes pen motion/taps as mouse
+        // input; we only read the pressure axis. Hover reports pressure 0 →
+        // treated as "no pen" until the tip touches (same as the Win32 path).
+        case SDL_EVENT_PEN_AXIS:
+            if (e.paxis.axis == SDL_PEN_AXIS_PRESSURE) {
+                g_penPressure = e.paxis.value > 0.f ? e.paxis.value : -1.f;
+                static bool logged = false;
+                if (!logged && g_penPressure >= 0.f) {
+                    logged = true;
+                    fprintf(stderr, "teidraw: pen pressure active (%.2f)\n", g_penPressure);
+                }
+            }
+            break;
+        case SDL_EVENT_PEN_UP: case SDL_EVENT_PEN_PROXIMITY_OUT: g_penPressure = -1.f; break;
+        }
+    }
+    return !quit;
+}
+#endif
+
 int main(int argc, char** argv) {
     // teidraw [projectDir] [--shot out.png | --export out.png | --export-txt out.txt] [--frames N]
     // No projectDir: reopen the last board (recent[0]); first run = the picker.
@@ -5089,9 +5524,11 @@ int main(int argc, char** argv) {
     if (boardArg.empty() && !forcePicker && !g_recentBoards.empty()) boardArg = g_recentBoards[0];
     g_pickerWant = forcePicker;
 
+#ifdef _WIN32
     ImGui_ImplWin32_EnableDpiAwareness();
     WNDCLASSEXW wc = { sizeof(wc), CS_OWNDC, WndProc, 0, 0, GetModuleHandleW(nullptr),
-                       nullptr, LoadCursorW(nullptr, IDC_ARROW), nullptr, nullptr, L"teidraw", nullptr };
+                       LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1)),   // .rc icon (null = default)
+                       LoadCursorW(nullptr, IDC_ARROW), nullptr, nullptr, L"teidraw", nullptr };
     RegisterClassExW(&wc);
     HWND hwnd = CreateWindowW(L"teidraw", L"teidraw", WS_OVERLAPPEDWINDOW,
                               CW_USEDEFAULT, CW_USEDEFAULT, 1600, 1000, nullptr, nullptr, wc.hInstance, nullptr);
@@ -5100,15 +5537,51 @@ int main(int argc, char** argv) {
     DragAcceptFiles(hwnd, TRUE);
     ShowWindow(hwnd, SW_SHOWMAXIMIZED);
     UpdateWindow(hwnd);
+#else
+    // Headless runs render on the "offscreen" video driver when it's usable:
+    // no window opens, nothing steals focus (the session-9 postmortem), and
+    // shots are a deterministic 1600×1000. Falls back to a real window.
+    if (headless) SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+    bool vidOk = SDL_Init(SDL_INIT_VIDEO);
+    if (!vidOk && headless) {   // no offscreen driver in this SDL: use a real window
+        SDL_ResetHint(SDL_HINT_VIDEO_DRIVER);
+        vidOk = SDL_Init(SDL_INIT_VIDEO);
+    }
+    if (!vidOk) { fprintf(stderr, "teidraw: SDL init failed: %s\n", SDL_GetError()); return 1; }
+    if (!headless) SDL_Init(SDL_INIT_AUDIO);   // best-effort: no device = silent videos
+    g_win = SDL_CreateWindow("teidraw", 1600, 1000,
+                             SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+                             (headless ? SDL_WINDOW_HIDDEN : SDL_WINDOW_MAXIMIZED));
+    if (!g_win) { fprintf(stderr, "teidraw: window failed: %s\n", SDL_GetError()); return 1; }
+    g_ren = SDL_CreateRenderer(g_win, nullptr);
+    if (!g_ren) { fprintf(stderr, "teidraw: renderer failed: %s\n", SDL_GetError()); return 1; }
+    SDL_SetRenderVSync(g_ren, headless ? 0 : 1);
+    {   // window icon from the embedded PNG
+        int iw = 0, ih = 0, n = 0;
+        unsigned char* ip = stbi_load_from_memory(icon_png, (int)icon_png_len, &iw, &ih, &n, 4);
+        if (ip) {
+            SDL_Surface* is = SDL_CreateSurfaceFrom(iw, ih, SDL_PIXELFORMAT_RGBA32, ip, iw * 4);
+            if (is) { SDL_SetWindowIcon(g_win, is); SDL_DestroySurface(is); }
+            stbi_image_free(ip);
+        }
+    }
+#endif
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;                       // no imgui.ini litter; layout is ours
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+#ifdef _WIN32
     g_dpi = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd);
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_dev, g_ctx);
+#else
+    g_dpi = SDL_GetWindowDisplayScale(g_win);
+    if (g_dpi <= 0.f) g_dpi = 1.f;
+    ImGui_ImplSDL3_InitForSDLRenderer(g_win, g_ren);
+    ImGui_ImplSDLRenderer3_Init(g_ren);
+#endif
     LoadFonts();
     ImGui::GetStyle().FontSizeBase = 15.f * g_dpi;
     if (!boardArg.empty()) switch_board(boardArg);   // empty = picker opens over a blank canvas
@@ -5126,6 +5599,7 @@ int main(int argc, char** argv) {
     int framesDone = 0;
     bool done = false;
     while (!done) {
+#ifdef _WIN32
         // Wait until the swapchain can accept a frame, THEN read input → lowest latency.
         if (g_frameWaitable) WaitForSingleObjectEx(g_frameWaitable, 1000, TRUE);
 
@@ -5146,6 +5620,14 @@ int main(int argc, char** argv) {
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
+#else
+        // vsynced RenderPresent below blocks until the frame is consumed, so
+        // pumping here samples input as late as possible — same contract.
+        if (!sdl_pump_events()) break;
+
+        ImGui_ImplSDLRenderer3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+#endif
         if (bsFrame >= 0) {   // dev: scripted keystrokes for headless editor shots
             if (framesDone == bsFrame) io.AddKeyEvent(ImGuiKey_Backspace, true);
             if (framesDone == bsFrame + 1) io.AddKeyEvent(ImGuiKey_Backspace, false);
@@ -5197,6 +5679,7 @@ int main(int argc, char** argv) {
         }
 
         ImGui::Render();
+#ifdef _WIN32
         float bg[4] = { 0, 0, 0, 1 };
         g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
         g_ctx->ClearRenderTargetView(g_rtv, bg);
@@ -5210,6 +5693,19 @@ int main(int argc, char** argv) {
             fprintf(stderr, "teidraw: shot %s -> %s\n", shotPath, ok ? "ok" : "FAILED");
             done = true;
         }
+#else
+        SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 255);
+        SDL_RenderClear(g_ren);
+        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_ren);
+        // SDL reads the backbuffer BEFORE present (D3D reads it after)
+        if (shotPath && framesDone + 1 >= shotFrames) {
+            bool ok = SaveBackbufferPNG(shotPath);
+            fprintf(stderr, "teidraw: shot %s -> %s\n", shotPath, ok ? "ok" : "FAILED");
+            done = true;
+        }
+        SDL_RenderPresent(g_ren);
+        framesDone++;
+#endif
         // queued copy-as-PNG / --export: render offscreen between frames
         if (g_export.active && run_pending_export()) done = true;
     }
@@ -5224,11 +5720,20 @@ int main(int argc, char** argv) {
 #endif
     save_board_now();
     save_settings();
+#ifdef _WIN32
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     DestroyDeviceD3D();
     DestroyWindow(hwnd);
     UnregisterClassW(L"teidraw", wc.hInstance);
+#else
+    ImGui_ImplSDLRenderer3_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+    ImGui::DestroyContext();
+    SDL_DestroyRenderer(g_ren);   // takes the cached SDL textures with it
+    SDL_DestroyWindow(g_win);
+    SDL_Quit();
+#endif
     return 0;
 }

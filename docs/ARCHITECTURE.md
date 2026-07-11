@@ -5,14 +5,25 @@ Goal: tldraw's polish in a native app. Every decision below serves either
 
 ## Stack
 - **C++17, single translation unit** (`editor/src/main.cpp`), Dear ImGui
-  drawlists for ALL canvas rendering, D3D11 backend, Win32 windowing.
-  Cross-compiled Win64 PE via mingw-w64 from the nix flake; runs on the
-  Windows host through WSLInterop (no WSLg compositor tax).
+  drawlists for ALL canvas rendering, with two platform backends behind
+  `#ifdef _WIN32` seams:
+  - **Windows (primary)**: D3D11 + Win32, cross-compiled Win64 PE via
+    mingw-w64 from the nix flake; runs on the Windows host through
+    WSLInterop (no WSLg compositor tax).
+  - **Linux**: SDL3 + SDL_Renderer (SDL picks GL/Vulkan). SDL3 covers
+    every platform service in one dependency: window/renderer, mime-typed
+    clipboard (the PNG/shape payloads work on X11 AND Wayland), file drops,
+    pen pressure, audio streams, the folder dialog (portal-backed, async —
+    the board picker polls the callback's result), display scale. Headless
+    runs prefer SDL's `offscreen` video driver: `--shot`/`--export` open no
+    window and steal no focus.
 - **imgui pinned ≥1.92** (flake `fetchFromGitHub`): the dynamic font atlas
   (`RendererHasTextures`) rasterizes glyphs on demand at any pixel size —
-  the load-bearing feature for crisp text at arbitrary zoom.
-- **libav (static, cross)** for gif+video decode in-process; stb_image for
-  stills; stb_image_write for `--shot`/exports. nlohmann for board JSON.
+  the load-bearing feature for crisp text at arbitrary zoom (both the DX11
+  and SDLRenderer3 backends support it).
+- **libav** for gif+video decode in-process (static cross build on Windows;
+  pkg-config on Linux — static in release CI); stb_image for stills;
+  stb_image_write for `--shot`/exports. nlohmann for board JSON.
 
 ## Presentation / latency
 Flip-model swapchain: `FLIP_DISCARD`, 3 buffers, `FRAME_LATENCY_WAITABLE_OBJECT`,
@@ -21,6 +32,12 @@ Flip-model swapchain: `FLIP_DISCARD`, 3 buffers, `FRAME_LATENCY_WAITABLE_OBJECT`
 pump Win32 messages → build imgui frame → render → present**. Waiting *before*
 input sampling is the whole trick: input is at most one refresh old, the GPU
 queue never grows, vsync prevents tearing. `--shot` presents with vsync off.
+
+Linux: vsynced `SDL_RenderPresent` blocks until the frame is consumed and
+events are pumped right after it returns — the same "sample input as late as
+possible" order, one seam lower. (A frame-latency waitable has no SDL
+equivalent; if latency ever disagrees with feel here, a GL/Vulkan backend
+with explicit fencing is the upgrade path.)
 
 ## Coordinate model
 World units = px at zoom 1. `screen = world * zoom + pan`. Zoom pivots on the
@@ -46,19 +63,20 @@ snapshots** (deliberately memory-piggy for simplicity/robustness; capped by
 (append on push, rewrite on branch), so **undo history survives sessions**.
 
 ## Media pipeline
-Stills: stb → immutable SRV, cached per asset path (failures cached too).
-Gif/video: resident `VideoDecoder` per asset (LRU cap 6) — avformat seek +
-avcodec decode + swscale→RGBA, forward-decode reuse for sequential playback —
-into one `D3D11_USAGE_DYNAMIC` texture per playing shape, mapped WRITE_DISCARD
-only when the wanted frame index changes. Gifs autoplay-loop chrome-free;
-videos get the hover pill (play/pause/stop/seek/A-B/sound). Audio is per-shape
-opt-in (speaker toggle, persisted): a playing sounding video owns an `AudioOut`
-thread — its OWN avformat context (video decoder seeks stay untouched) →
-swresample to the device mix format → shared-mode WASAPI (Windows mixes, no
-in-app mixer). While live, the audio hardware clock DRIVES `ps.t`, so A/V
-can't drift; UI seeks and A-B wraps request an audio re-seek and the video
-free-runs on DeltaTime until it lands. A video with `loopA` set opens (and
-stops back) at A.
+Stills: stb → immutable texture (`TexH`: D3D11 SRV / SDL_Texture), cached per
+asset path (failures cached too). Gif/video: resident `VideoDecoder` per
+asset (LRU cap 6) — avformat seek + avcodec decode + swscale→RGBA,
+forward-decode reuse for sequential playback — into one dynamic/streaming
+texture per playing shape, uploaded only when the wanted frame index changes.
+Gifs autoplay-loop chrome-free; videos get the hover pill
+(play/pause/stop/seek/A-B/sound). Audio is per-shape opt-in (speaker toggle,
+persisted): a playing sounding video owns an `AudioOut` thread — its OWN
+avformat context (video decoder seeks stay untouched) → swresample to the
+device format → shared-mode WASAPI on Windows / an SDL3 audio stream on
+Linux (both OS-mix, no in-app mixer). While live, the audio device clock
+DRIVES `ps.t`, so A/V can't drift; UI seeks and A-B wraps request an audio
+re-seek and the video free-runs on DeltaTime until it lands. A video with
+`loopA` set opens (and stops back) at A.
 
 ## Input / interaction
 One explicit drag state machine (`DragMode`): PENDING → MOVE/MARQUEE at a 4 px
@@ -82,12 +100,14 @@ the auto-list heuristics, pins bound arrow ends across reflows and keeps a
 rotated text's world top-left fixed while its extent changes. Escape and
 click-outside both commit; a whitespace-only commit deletes the shape.
 
-## Fonts
-Embedded into the PE by `tools/embed.py` (single-file exe): Shantell Sans
-(handwriting default — what tldraw uses; vendored, OFL), Inter (sans),
-JetBrains Mono, Lora (serif) from nixpkgs. Four canvas sizes S/M/L/XL =
-20/28/40/56 world px, default L (big text preferred), times a continuous
-resize scale.
+## Fonts & icon
+Embedded into the binary by `tools/embed.py` (single-file exe): Shantell Sans
+(handwriting default — what tldraw uses), Inter (sans), JetBrains Mono, Lora
+(serif) — all four vendored in `assets/fonts/` (OFL, license files alongside).
+Four canvas sizes S/M/L/XL = 20/28/40/56 world px, default L (big text
+preferred), times a continuous resize scale. The icon (`tools/make-icon.sh`)
+ships as an `.ico` PE resource on Windows and an embedded PNG →
+`SDL_SetWindowIcon` on Linux.
 
 ## Rejected / deferred
 - nixpkgs imgui 1.91 (no dynamic fonts) — pinned 1.92.4 instead.
