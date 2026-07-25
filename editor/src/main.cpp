@@ -860,6 +860,39 @@ static WRect selection_bounds() {
     return r;
 }
 
+// Marquees use partial overlap for ordinary shapes, but a connector only
+// joins the selection when its whole visible path is enclosed. Otherwise a
+// box around a cluster catches every arrow that merely leaves one of its
+// shapes, and the resulting selection bounds jump all the way to remote
+// endpoints.
+static bool marquee_hits(const Shape& s, const WRect& mr) {
+    if (s.type == SH_ARROW) {
+        static std::vector<ImVec2> pl;
+        arrow_polyline(s, pl);
+        if (pl.empty()) return false;
+        for (ImVec2 p : pl) if (!mr.contains(p)) return false;
+        return true;
+    }
+    WRect b = shape_bounds(s);
+    return b.mx.x >= mr.mn.x && b.mn.x <= mr.mx.x &&
+           b.mx.y >= mr.mn.y && b.mn.y <= mr.mx.y;
+}
+
+static void select_marquee(const WRect& mr, bool keep) {
+    if (!keep) g_sel.clear();
+    // Dedupe only against the shift-kept selection: the two passes are
+    // disjoint, and an O(sel) scan per shape goes quadratic on big boards.
+    std::unordered_set<uint64_t> pre(g_sel.begin(), g_sel.end());
+    for (auto& s : g_doc.shapes) {
+        if (s.parent || s.type == SH_GROUP) continue;
+        if (marquee_hits(s, mr) && !pre.count(s.id)) g_sel.push_back(s.id);
+    }
+    for (auto& s : g_doc.shapes) {
+        if (s.type != SH_GROUP || s.parent) continue;
+        if (marquee_hits(s, mr) && !pre.count(s.id)) g_sel.push_back(s.id);
+    }
+}
+
 // ── persistence ──
 static json shape_to_json(const Shape& s) {
     json j;
@@ -5383,23 +5416,8 @@ static void CanvasFrame() {
         ImVec2 mx(fmaxf(g_dragStartW.x, mw.x), fmaxf(g_dragStartW.y, mw.y));
         dl->AddRectFilled(W2S(mn), W2S(mx), g_th.selFill, 2.f);
         dl->AddRect(W2S(mn), W2S(mx), g_th.selStroke, 2.f, 0, 1.f);
-        if (!io.KeyShift) g_sel.clear();
         WRect mr{ mn, mx };
-        // partial overlap selects (hands-on feedback) — plain AABB intersection
-        auto touches = [&](const WRect& b) {
-            return b.mx.x >= mr.mn.x && b.mn.x <= mr.mx.x && b.mx.y >= mr.mn.y && b.mn.y <= mr.mx.y;
-        };
-        // dedupe only against the shift-kept selection: the two passes below
-        // are disjoint, and an O(sel) scan per shape goes quadratic on big boards
-        std::unordered_set<uint64_t> pre(g_sel.begin(), g_sel.end());
-        for (auto& s : g_doc.shapes) {
-            if (s.parent || s.type == SH_GROUP) continue;
-            if (touches(shape_bounds(s)) && !pre.count(s.id)) g_sel.push_back(s.id);
-        }
-        for (auto& s : g_doc.shapes) {
-            if (s.type != SH_GROUP || s.parent) continue;
-            if (touches(shape_bounds(s)) && !pre.count(s.id)) g_sel.push_back(s.id);
-        }
+        select_marquee(mr, io.KeyShift);
     }
 
     if (g_drag == DM_HANDLE) {
@@ -5694,6 +5712,7 @@ int main(int argc, char** argv) {
     std::string boardArg; bool forcePicker = false;
     uint64_t editId = 0;   // dev: open the text editor on this shape (headless editor shots)
     uint64_t selId = 0;    // dev: select this shape (headless selection-UI shots)
+    bool haveMarquee = false; WRect devMarquee;   // dev: replay a world-space marquee
     int bsFrame = -1;      // dev: press Backspace in the editor on this frame
     int enterFrame = -1;   // dev: press Enter on this frame
     int caretIdx = -1;     // dev: --edit caret byte offset (default: text end)
@@ -5705,6 +5724,16 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--picker")) forcePicker = true;   // dev: shot the picker UI
         else if (!strcmp(argv[i], "--edit") && i + 1 < argc) editId = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--sel") && i + 1 < argc) selId = strtoull(argv[++i], nullptr, 10);
+        else if (!strcmp(argv[i], "--marquee") && i + 4 < argc) {
+            float ax = strtof(argv[++i], nullptr);
+            float ay = strtof(argv[++i], nullptr);
+            float bx = strtof(argv[++i], nullptr);
+            float by = strtof(argv[++i], nullptr);
+            ImVec2 a(ax, ay), b(bx, by);
+            devMarquee = { ImVec2(fminf(a.x, b.x), fminf(a.y, b.y)),
+                            ImVec2(fmaxf(a.x, b.x), fmaxf(a.y, b.y)) };
+            haveMarquee = true;
+        }
         else if (!strcmp(argv[i], "--bs") && i + 1 < argc) bsFrame = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--enter") && i + 1 < argc) enterFrame = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--caret") && i + 1 < argc) caretIdx = atoi(argv[++i]);
@@ -5788,6 +5817,12 @@ int main(int argc, char** argv) {
         }
     }
     if (selId && find_shape(selId)) g_sel.assign(1, selId);
+    if (haveMarquee) {
+        select_marquee(devMarquee, false);
+        fprintf(stderr, "teidraw: marquee selected");
+        for (uint64_t id : g_sel) fprintf(stderr, " %llu", (unsigned long long)id);
+        fputc('\n', stderr);
+    }
     ApplyTheme();
     ImGui::GetStyle().ScaleAllSizes(g_dpi);
 
