@@ -1343,6 +1343,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mem.h>
 }
 
 struct VideoDecoder {
@@ -1351,6 +1352,10 @@ struct VideoDecoder {
     SwsContext*      sws = nullptr;
     AVFrame*         frame = nullptr;
     AVPacket*        pkt = nullptr;
+    // libswscale's SIMD output needs aligned rows. A tight w*4 buffer can be
+    // overrun for widths such as 426 (coded as 432), corrupting the heap.
+    uint8_t*          rgbaData[4]{};
+    int               rgbaStride[4]{};
     int        vstream = -1;
     AVRational tb{0, 1};
     double     fps = 0;
@@ -1386,11 +1391,15 @@ struct VideoDecoder {
             frames = dur > 0 ? (int)(dur * fps + 0.5) : 0;
         }
         frame = av_frame_alloc(); pkt = av_packet_alloc();
-        ok = frame && pkt && w > 0 && h > 0;
+        int rgbaBytes = w > 0 && h > 0
+                      ? av_image_alloc(rgbaData, rgbaStride, w, h, AV_PIX_FMT_RGBA, 32)
+                      : -1;
+        ok = frame && pkt && rgbaBytes >= 0;
         return ok;
     }
     void close() {
         if (sws) sws_freeContext(sws);
+        av_freep(&rgbaData[0]);
         if (frame) av_frame_free(&frame);
         if (pkt) av_packet_free(&pkt);
         if (dec) avcodec_free_context(&dec);
@@ -1403,10 +1412,13 @@ struct VideoDecoder {
         sws = sws_getCachedContext(sws, frame->width, frame->height, (AVPixelFormat)frame->format,
                                    w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
         if (!sws) return false;
-        out.resize((size_t)w * h * 4);
-        unsigned char* dst[4] = { out.data(), nullptr, nullptr, nullptr };
-        int dstStride[4] = { w * 4, 0, 0, 0 };
-        sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dst, dstStride);
+        if (sws_scale(sws, frame->data, frame->linesize, 0, frame->height,
+                      rgbaData, rgbaStride) != h) return false;
+        size_t rowBytes = (size_t)w * 4;
+        out.resize(rowBytes * h);
+        for (int y = 0; y < h; y++)
+            memcpy(out.data() + (size_t)y * rowBytes,
+                   rgbaData[0] + (size_t)y * rgbaStride[0], rowBytes);
         return true;
     }
     bool decode_index(int idx, std::vector<unsigned char>& out, bool retried = false) {

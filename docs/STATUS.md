@@ -1,7 +1,7 @@
 # STATUS — live front
 
-*Updated: 2026-07-11 (session 10). History lives in `git log` — this file only
-describes NOW.*
+*Updated: 2026-07-25 (session 10 + media crash fix). History lives in
+`git log` — this file only describes NOW.*
 
 ## Where things stand
 The app is a daily-drivable whiteboard, hands-on tested by the user ("UX is
@@ -230,6 +230,12 @@ and a PORTABLE Linux binary on ubuntu-22.04 (oldest-LTS glibc baseline;
 static SDL3 + static builtin-codec ffmpeg, cached; offscreen --shot smoke
 test), publishes both as the latest release with the Linux
 "not battle-tested" caveat in the notes, prunes to the last 7 nightlies.
+
+Post-release media fix (2026-07-25): libswscale now converts into an
+FFmpeg-allocated, row-aligned RGBA staging image before packing pixels for
+the GPU. The old tight `width * 4` destination could be overrun by SIMD for
+videos whose visible and coded widths differ (the issue #1 repro is 426 px
+visible / 432 px coded), corrupting the heap on both Windows and Linux.
 
 ## Build & verify
 ```
