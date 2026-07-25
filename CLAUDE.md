@@ -55,8 +55,10 @@ Strokes are baked ink: move/scale/rotate/delete, never reshape.
   Shantell Sans (tldraw's handwriting font), Inter, JetBrains Mono, Lora.
 - A **board** is a self-contained project dir: `board.json` + `assets/` (every
   imported file is COPIED in) + `undo.jsonl` (snapshot journal; undo history
-  survives sessions, cap `g_undoLimit`). Per-user prefs (theme, undo limit,
-  recent boards) live in `%APPDATA%/teidraw/settings.json` on Windows,
+  survives sessions, cap `g_undoLimit`) + `.teidraw.lock` (persistent file,
+  live OS lock enforces one writer; its presence alone means nothing).
+  Per-user prefs (theme, undo limit, recent boards) live in
+  `%APPDATA%/teidraw/settings.json` on Windows,
   `~/.config/teidraw/settings.json` on Linux; a bare launch reopens the last
   board, Ctrl+O = board picker.
 

@@ -1,6 +1,6 @@
 # STATUS — live front
 
-*Updated: 2026-07-25 (session 10 + media crash fix). History lives in
+*Updated: 2026-07-25 (session 10 + post-release fixes). History lives in
 `git log` — this file only describes NOW.*
 
 ## Where things stand
@@ -27,7 +27,8 @@ recents with left-elided paths, new-board under Documents/teidraw, native
 folder dialog; switch_board tears down all per-board caches). Bare `teidraw`
 reopens the last board; window title shows the board name. Board format
 **v2** (v1 tsize indices migrate at load); loads sanitize duplicate ids /
-stale nextId / empty texts. Single TU, builds warning-free.
+stale nextId / empty texts. Boards are **single-writer**: a second instance
+cannot load or write the same board. Single TU, builds warning-free.
 
 Session-5 polish + M3 move feel: arrows bound to a text stay pinned to their
 world point while the text reflows (anchors re-normalized per edit frame);
@@ -236,6 +237,17 @@ FFmpeg-allocated, row-aligned RGBA staging image before packing pixels for
 the GPU. The old tight `width * 4` destination could be overrun by SIMD for
 videos whose visible and coded widths differ (the issue #1 repro is 426 px
 visible / 432 px coded), corrupting the heap on both Windows and Linux.
+
+Post-release board-safety fix (2026-07-25): every open board now owns an
+exclusive OS lock on `.teidraw.lock` for the process lifetime. Windows layers
+a directory-identity named mutex, deny-sharing handle, and a byte-range lock
+where supported; Linux uses the interoperable POSIX byte-range lock.
+`switch_board` locks the destination before saving/releasing the current
+board, so contention leaves the current session untouched. A rejected
+interactive opener stays in the picker with a clear error; headless/export
+commands fail with exit code 2. The lock releases automatically on normal
+exit or a crash; the harmless lock file remains so no stale-file recovery or
+deletion is ever needed.
 
 ## Build & verify
 ```

@@ -93,6 +93,12 @@ imported file is *copied in* — boards are self-contained and portable), and
 boards home) live in `%APPDATA%\teidraw\settings.json` on Windows,
 `~/.config/teidraw/settings.json` on Linux.
 
+Only one teidraw instance can open a board at a time. A second opener stays
+out of the board and asks you to close the first instance, preventing two
+autosave/undo streams from racing. The small `.teidraw.lock` file may remain
+in the folder; it is the live OS lock—not the file's presence—that matters,
+so crashes do not leave a board permanently locked.
+
 Made for feeding boards to LLMs, too:
 
 ```sh

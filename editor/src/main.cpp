@@ -30,10 +30,12 @@
 #include <dxgi1_3.h>
 #else
 #include <SDL3/SDL.h>
+#include <fcntl.h>       // open, fcntl board lock
 #include <sys/stat.h>    // mkdir
 #include <unistd.h>      // access
 #include <stdlib.h>      // realpath
 #endif
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -2502,15 +2504,185 @@ static void set_undo_limit(int n) {
     save_settings();
 }
 
+// Every process that opens a board holds an OS lock on this persistent file.
+// The file itself is harmless and intentionally remains after exit; the live
+// kernel lock (not its presence) is what excludes another teidraw instance.
+// Windows combines a per-board named mutex with deny-sharing and (where the
+// filesystem supports it) a byte-range lock. Linux uses a POSIX byte-range
+// lock. The shared range-lock protocol also excludes mixed Windows/Linux
+// access when the filesystem propagates it (notably Windows drives in WSL).
+enum class BoardLockResult { ACQUIRED, CONTENDED, UNAVAILABLE };
+struct BoardLock {
+#ifdef _WIN32
+    HANDLE h = INVALID_HANDLE_VALUE;
+    HANDLE mutex = nullptr;
+    bool rangeLocked = false;
+#else
+    int fd = -1;
+#endif
+
+    BoardLock() = default;
+    BoardLock(const BoardLock&) = delete;
+    BoardLock& operator=(const BoardLock&) = delete;
+    BoardLock(BoardLock&& o) noexcept { take(o); }
+    BoardLock& operator=(BoardLock&& o) noexcept {
+        if (this != &o) { release(); take(o); }
+        return *this;
+    }
+    ~BoardLock() { release(); }
+
+    BoardLockResult acquire(const std::string& dir) {
+        release();
+        std::string path = dir + "/.teidraw.lock";
+#ifdef _WIN32
+        uint64_t hash = 1469598103934665603ULL;   // stable FNV-1a, not std::hash
+        auto mix64 = [&](uint64_t v) {
+            for (int i = 0; i < 8; i++) {
+                hash ^= (unsigned char)(v >> (i * 8));
+                hash *= 1099511628211ULL;
+            }
+        };
+        std::wstring wdir = to_w(dir);
+        HANDLE dh = CreateFileW(wdir.c_str(), FILE_READ_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        BY_HANDLE_FILE_INFORMATION fi = {};
+        bool identified = dh != INVALID_HANDLE_VALUE && GetFileInformationByHandle(dh, &fi);
+        if (identified) {
+            mix64(fi.dwVolumeSerialNumber);
+            mix64(((uint64_t)fi.nFileIndexHigh << 32) | fi.nFileIndexLow);
+        } else {
+            std::wstring mutexKey = wdir;
+            if (!mutexKey.empty()) CharLowerBuffW(mutexKey.data(), (DWORD)mutexKey.size());
+            for (wchar_t c : mutexKey) {
+                if (c == L'/') c = L'\\';
+                hash ^= (uint16_t)c; hash *= 1099511628211ULL;
+            }
+        }
+        if (dh != INVALID_HANDLE_VALUE) CloseHandle(dh);
+        char mutexName[64];
+        snprintf(mutexName, sizeof mutexName, "Local\\teidraw-board-%016llx",
+                 (unsigned long long)hash);
+        HANDLE nextMutex = CreateMutexA(nullptr, TRUE, mutexName);
+        if (!nextMutex) return BoardLockResult::UNAVAILABLE;
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            CloseHandle(nextMutex);
+            return BoardLockResult::CONTENDED;
+        }
+
+        std::wstring wpath = to_w(path);
+        HANDLE next = CreateFileW(wpath.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                                  nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+        if (next == INVALID_HANDLE_VALUE) {
+            DWORD e = GetLastError();
+            ReleaseMutex(nextMutex); CloseHandle(nextMutex);
+            return (e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION)
+                   ? BoardLockResult::CONTENDED : BoardLockResult::UNAVAILABLE;
+        }
+        OVERLAPPED ov = {};
+        if (!LockFileEx(next, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                        0, MAXDWORD, MAXDWORD, &ov)) {
+            DWORD e = GetLastError();
+            // WSL's \\wsl.localhost filesystem rejects byte-range locking.
+            // The named mutex still excludes other Windows teidraw instances.
+            if (e != ERROR_INVALID_FUNCTION && e != ERROR_NOT_SUPPORTED) {
+                CloseHandle(next);
+                ReleaseMutex(nextMutex); CloseHandle(nextMutex);
+                return (e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION)
+                       ? BoardLockResult::CONTENDED : BoardLockResult::UNAVAILABLE;
+            }
+        } else {
+            rangeLocked = true;
+        }
+        h = next;
+        mutex = nextMutex;
+#else
+        int next = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (next < 0) return BoardLockResult::UNAVAILABLE;
+        struct flock lk = {};
+        lk.l_type = F_WRLCK; lk.l_whence = SEEK_SET; lk.l_start = 0; lk.l_len = 0;
+        if (fcntl(next, F_SETLK, &lk) != 0) {
+            int e = errno; close(next);
+            return (e == EACCES || e == EAGAIN)
+                   ? BoardLockResult::CONTENDED : BoardLockResult::UNAVAILABLE;
+        }
+        fd = next;
+#endif
+        return BoardLockResult::ACQUIRED;
+    }
+
+    void release() {
+#ifdef _WIN32
+        if (h != INVALID_HANDLE_VALUE) {
+            if (rangeLocked) {
+                OVERLAPPED ov = {};
+                UnlockFileEx(h, 0, MAXDWORD, MAXDWORD, &ov);
+            }
+            CloseHandle(h);
+            h = INVALID_HANDLE_VALUE;
+            rangeLocked = false;
+        }
+        if (mutex) {
+            ReleaseMutex(mutex);
+            CloseHandle(mutex);
+            mutex = nullptr;
+        }
+#else
+        if (fd >= 0) {
+            struct flock lk = {};
+            lk.l_type = F_UNLCK; lk.l_whence = SEEK_SET; lk.l_start = 0; lk.l_len = 0;
+            fcntl(fd, F_SETLK, &lk);
+            close(fd);
+            fd = -1;
+        }
+#endif
+    }
+
+private:
+    void take(BoardLock& o) {
+#ifdef _WIN32
+        h = o.h; mutex = o.mutex; rangeLocked = o.rangeLocked;
+        o.h = INVALID_HANDLE_VALUE; o.mutex = nullptr; o.rangeLocked = false;
+#else
+        fd = o.fd; o.fd = -1;
+#endif
+    }
+};
+static BoardLock g_boardLock;
+static std::string g_boardOpenError;
+
 // Save the current board, tear down every per-board cache, load `dir`.
 // A brand-new dir gets its board.json written immediately so it's a valid
 // board (and recents entry) from second zero.
-static void switch_board(const std::string& dirIn) {
+static bool switch_board(const std::string& dirIn) {
     std::string dir = abs_path(dirIn);
     if (!g_projDir.empty()) {
-        if (path_eq(abs_path(g_projDir), dir)) return;
-        save_board_now();
+        if (path_eq(abs_path(g_projDir), dir)) {
+            g_boardOpenError.clear();
+            return true;
+        }
     }
+
+    // Lock the destination BEFORE saving or releasing the current board. A
+    // failed switch is therefore a complete no-op for the board already open.
+    ensure_dir(dir);
+    BoardLock nextLock;
+    BoardLockResult lockResult = nextLock.acquire(dir);
+    if (lockResult != BoardLockResult::ACQUIRED) {
+        if (lockResult == BoardLockResult::CONTENDED)
+            g_boardOpenError = "“" + board_name(dir) +
+                "” is already open in another teidraw instance. "
+                "Close that instance before opening this board.";
+        else
+            g_boardOpenError = "teidraw could not lock “" + board_name(dir) +
+                "”. The folder may be unavailable, read-only, or already open "
+                "through a filesystem that does not expose locks.";
+        fprintf(stderr, "teidraw: %s\n", g_boardOpenError.c_str());
+        return false;
+    }
+    g_boardOpenError.clear();
+
+    if (!g_projDir.empty()) save_board_now();
     g_doc = Doc{};
     g_undo.clear(); g_undoPos = -1;
     clear_selection(); g_editText = 0; g_editLabelArrow = 0;
@@ -2538,6 +2710,7 @@ static void switch_board(const std::string& dirIn) {
         g_decoders.clear();
     }
 #endif
+    g_boardLock = std::move(nextLock);   // releases the previous board only now
     g_projDir = dir;
     g_drawId = g_lastDrawId = 0;
     load_board();
@@ -2548,6 +2721,7 @@ static void switch_board(const std::string& dirIn) {
 #else
     if (g_win) SDL_SetWindowTitle(g_win, (board_name(dir) + " — teidraw").c_str());
 #endif
+    return true;
 }
 
 // Native folder dialog: open a board anywhere (an empty folder becomes a new
@@ -3802,6 +3976,7 @@ static std::string elide_left(const std::string& s, ImFont* f, float px, float m
 static void DrawBoardPicker() {
     bool noBoard = g_projDir.empty();
     if ((g_pickerWant || noBoard) && !ImGui::IsPopupOpen("boards")) {
+        if (g_pickerWant && !noBoard) g_boardOpenError.clear();
         g_newBoardName.clear();
         ImGui::OpenPopup("boards");   // no board open = the picker IS the app
     }
@@ -3821,6 +3996,14 @@ static void DrawBoardPicker() {
 
     ImDrawList* wdl = ImGui::GetWindowDrawList();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_th.textDim), noBoard ? "boards" : "boards · esc to close");
+    if (!g_boardOpenError.empty()) {
+        ImGui::Spacing();
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(g_darkMode ? ImVec4(1.f, 0.45f, 0.45f, 1.f)
+                                     : ImVec4(0.78f, 0.12f, 0.12f, 1.f),
+                           "%s", g_boardOpenError.c_str());
+        ImGui::PopTextWrapPos();
+    }
     ImGui::Spacing();
     std::string cur = noBoard ? std::string() : abs_path(g_projDir);
     bool anyRecent = false;
@@ -3838,8 +4021,7 @@ static void DrawBoardPicker() {
         wdl->AddText(f, 13.f, p + ImVec2(10, 24), g_th.textDim, elide_left(r, f, 13.f, w - 32.f).c_str());
         if (isCur) wdl->AddCircleFilled(p + ImVec2(w - 14.f, 21.f), 3.5f, g_th.accent);
         if (clicked) {
-            if (!isCur) switch_board(r);
-            ImGui::CloseCurrentPopup();
+            if (isCur || switch_board(r)) ImGui::CloseCurrentPopup();
         }
     }
     if (anyRecent) ImGui::Separator();
@@ -3864,13 +4046,12 @@ static void DrawBoardPicker() {
     }
     if (create && !clean.empty() && !g_boardsDir.empty()) {
         ensure_dir(g_boardsDir);
-        switch_board(g_boardsDir + "/" + clean);
-        ImGui::CloseCurrentPopup();
+        if (switch_board(g_boardsDir + "/" + clean)) ImGui::CloseCurrentPopup();
     }
     if (ImGui::Button("open folder…")) {
 #ifdef _WIN32
         std::string dir = pick_folder_dialog();
-        if (!dir.empty()) { switch_board(dir); ImGui::CloseCurrentPopup(); }
+        if (!dir.empty() && switch_board(dir)) ImGui::CloseCurrentPopup();
 #else
         SDL_ShowOpenFolderDialog(folder_dlg_cb, nullptr, g_win, nullptr, false);
 #endif
@@ -3879,7 +4060,7 @@ static void DrawBoardPicker() {
     if (g_folderDlgDone.exchange(false)) {   // async pick landed (any earlier frame)
         std::string dir;
         { std::lock_guard<std::mutex> lk(g_folderDlgMx); dir = std::move(g_folderDlgResult); }
-        if (!dir.empty()) { switch_board(dir); ImGui::CloseCurrentPopup(); }
+        if (!dir.empty() && switch_board(dir)) ImGui::CloseCurrentPopup();
     }
 #endif
     ImGui::EndPopup();
@@ -5598,7 +5779,7 @@ int main(int argc, char** argv) {
 #endif
     LoadFonts();
     ImGui::GetStyle().FontSizeBase = 15.f * g_dpi;
-    if (!boardArg.empty()) switch_board(boardArg);   // empty = picker opens over a blank canvas
+    bool startupBoardFailed = !boardArg.empty() && !switch_board(boardArg);
     if (editId) {
         Shape* es = find_shape(editId);
         if (es && es->type == SH_TEXT) {
@@ -5611,7 +5792,8 @@ int main(int argc, char** argv) {
     ImGui::GetStyle().ScaleAllSizes(g_dpi);
 
     int framesDone = 0;
-    bool done = false;
+    int exitCode = startupBoardFailed && headless ? 2 : 0;
+    bool done = exitCode != 0;
     while (!done) {
 #ifdef _WIN32
         // Wait until the swapchain can accept a frame, THEN read input → lowest latency.
@@ -5734,6 +5916,7 @@ int main(int argc, char** argv) {
 #endif
     save_board_now();
     save_settings();
+    g_boardLock.release();   // after the final save: another instance may now open it
 #ifdef _WIN32
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
@@ -5749,5 +5932,5 @@ int main(int argc, char** argv) {
     SDL_DestroyWindow(g_win);
     SDL_Quit();
 #endif
-    return 0;
+    return exitCode;
 }

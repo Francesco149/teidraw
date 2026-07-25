@@ -57,10 +57,19 @@ window + `loopA/loopB` for video A-B loops.
 ## Persistence & undo
 A board is a directory: `board.json` (atomic tmp+rename autosave, 400 ms
 debounce after each gesture) + `assets/` (imports are copied in — boards are
-self-contained and portable) + `undo.jsonl`. Undo = **full-document JSON
-snapshots** (deliberately memory-piggy for simplicity/robustness; capped by
-`g_undoLimit`, default 4096). The snapshot stack journals to `undo.jsonl`
-(append on push, rewrite on branch), so **undo history survives sessions**.
+self-contained and portable) + `undo.jsonl` + `.teidraw.lock`. Undo =
+**full-document JSON snapshots** (deliberately memory-piggy for
+simplicity/robustness; capped by `g_undoLimit`, default 4096). The snapshot
+stack journals to `undo.jsonl` (append on push, rewrite on branch), so
+**undo history survives sessions**.
+
+Boards are single-writer. `switch_board` acquires the destination's live OS
+lock before saving or releasing the current board, so a failed switch cannot
+disturb either board. Windows combines a directory-identity named mutex,
+deny-sharing handle, and a byte-range lock where supported; Linux uses the
+matching POSIX byte-range lock. The persistent `.teidraw.lock` file is only
+the lock target: kernel ownership releases automatically on clean exit or
+process death.
 
 ## Media pipeline
 Stills: stb → immutable texture (`TexH`: D3D11 SRV / SDL_Texture), cached per
