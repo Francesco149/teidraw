@@ -1533,7 +1533,12 @@ struct VideoDecoder {
 
 static std::map<std::string, VideoDecoder*> g_decoders;   // asset rel path → resident decoder
 static unsigned long long g_decoderClock = 0;
-static const size_t kMaxDecoders = 6;
+static const size_t kMaxDecoders = 16;   // resident decoder cache; must cover a view's working set
+// (was 6: the NES board's "fake 3d" region shows 9 DISTINCT videos at once,
+// so every frame evicted and re-opened ~9 ffmpeg decoders on the UI thread
+// — ~17ms/frame of pure churn, choppy even with every video stopped, since
+// video_srv touches get_decoder for paused videos too. The LRU only helps
+// when the working set fits; sizing to the view keeps opens at ~0.)
 // Many-playing-videos budget: decode demand is the bottleneck with several
 // players (each visible playing video wants its own 30 fps of libav work).
 // Two fair throttles keep it smooth instead of saturating a core:

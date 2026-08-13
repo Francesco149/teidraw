@@ -55,6 +55,26 @@ no upload, and playback pauses like the offscreen cull (deliberate).
 Headless A/B, 24 playing videos × 600 frames: grayboxed case user time
 3.29 s → 2.43 s (−26%, ≈ empty-board cost), mid-zoom 2.44 s → 2.23 s (−9%).
 
+## Session 11c — profiling infra + the NES-board decoder churn
+**Profiling infra:** `--profile [frames]` runs headless and prints a
+per-section breakdown (frame/draw/video/drain/overlay/sweep/chrome/present/
+input — mean + max), decoder activity (resident count, opens with avg/max
+open cost, evicts), and video stats (visible/playing per frame, decode
+queue depth). F3 toggles the same numbers as a live corner overlay in the
+interactive app — the tool that caught the bug below.
+**NES-board decoder churn:** the "fake 3d" region shows 9 DISTINCT videos
+at once against a 6-slot decoder cache. `video_srv` touches `get_decoder`
+even for PAUSED videos, so with the view stationary every frame evicted and
+re-opened ~9 ffmpeg decoders on the UI thread — 5400 opens / 5394 evicts
+over 600 frames at ~1.9 ms each = ~17 ms/frame of pure churn. That is the
+user's report exactly: choppy the moment the visible distinct set exceeds
+6 regardless of play state (stopped videos still churn), smooth as soon as
+2 videos are far enough off screen to drop the set to ≤6. `kMaxDecoders`
+6 → 16 (fits the view working set; LRU still drops unused ones): opens
+5400 → 9 (first-frame posters only), evicts → 0, draw 22.4 → 0.42 ms/frame,
+frame avg 34.8 → 12.5 ms (the rest is the headless present cap; interactive
+work per frame is now sub-millisecond).
+
 ## Where things stand
 The app is a daily-drivable whiteboard, hands-on tested by the user ("UX is
 solid", "feels good"): text / arrows / images / gifs / videos / groups, smart
