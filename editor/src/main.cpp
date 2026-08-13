@@ -5250,9 +5250,13 @@ static void CanvasFrame() {
     if (io.MouseWheel != 0.f && !uiHot)
         ZoomAt(io.MousePos, powf(1.16f, io.MouseWheel));
 
-    // ── middle drag / hand / space: pan ──
+    // ── middle drag / hand / space / alt: pan ──
+    // alt+left-drag = middle mouse for laptops without one; held, not a
+    // toggle, so it never fights the left-button state machine below
+    bool altPan = io.KeyAlt;
     bool handActive = (g_tool == TOOL_HAND) || g_spacePan;
     if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.f) ||
+        (altPan && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.f)) ||
         (handActive && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.f))) {
         g_camAnim.active = false;
         g_cam.pan = g_cam.pan + io.MouseDelta;

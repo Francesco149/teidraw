@@ -67,7 +67,8 @@ restarts** (journaled snapshots per board).
 ## Controls
 
 Scroll **always zooms at the cursor** — the one deliberate tldraw departure.
-Pan with middle-drag, space+drag, or right-*drag* (right-*click* = menu).
+Pan with middle-drag, space+drag, right-*drag* (right-*click* = menu), or
+**Alt+drag** (middle-mouse stand-in for laptops without one).
 
 | | |
 |---|---|
