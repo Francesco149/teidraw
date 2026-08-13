@@ -79,6 +79,41 @@ using json = nlohmann::json;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 #endif
 
+// ─────────────────────────────── profiling ────────────────────────────────
+// Lightweight per-frame section timers + decoder/queue counters for the
+// "many videos on screen gets choppy" class of bugs. Two surfaces:
+//   --profile [frames]  headless: run N frames, print a summary, exit
+//   F3                  interactive: live corner overlay (rolling window)
+// Section stats fold into a rolling window (kProfWindow frames) of mean/max
+// unless --profile is active, where they accumulate for the whole run so the
+// printed summary covers everything.
+struct ProfSection { double sum = 0, max = 0; int n = 0; };
+static const int kProfWindow = 180;
+struct ProfState {
+    ProfSection frame, draw, video, overlay, drain, sweep, chrome, present, input;
+    int decOpens = 0, decEvicts = 0;       // window/run totals (UI thread)
+    double decOpenMs = 0, decOpenMax = 0;  // ffmpeg decoder open cost (the eviction hitch)
+    int visVideos = 0, playVideos = 0;     // window sums (avg = /frames)
+    int queueDepth = 0;                    // decode queue depth at drain (window max)
+    int frames = 0;
+};
+static ProfState g_pw;
+static bool g_showProf = false;   // F3 overlay
+static bool g_profile = false;    // --profile: no window reset, summary at exit
+
+struct ProfScope {
+    ProfSection* s; std::chrono::steady_clock::time_point t0;
+    explicit ProfScope(ProfSection* sec) : s(sec), t0(std::chrono::steady_clock::now()) {}
+    ~ProfScope() {
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        s->sum += ms; if (ms > s->max) s->max = ms; s->n++;
+    }
+};
+
+static void prof_end_frame() {
+    if (++g_pw.frames >= kProfWindow && !g_profile) g_pw = ProfState{};
+}
+
 // ───────────────────────────── small math bits ─────────────────────────────
 static ImVec2 operator+(ImVec2 a, ImVec2 b) { return ImVec2(a.x + b.x, a.y + b.y); }
 static ImVec2 operator-(ImVec2 a, ImVec2 b) { return ImVec2(a.x - b.x, a.y - b.y); }
@@ -1582,15 +1617,36 @@ static VideoDecoder* get_decoder(const std::string& asset) {
         if (v != g_decoders.end()) {
             { std::lock_guard<std::mutex> dl(v->second->mx); v->second->close(); }   // wait out an in-flight decode
             delete v->second; g_decoders.erase(v);
+            g_pw.decEvicts++;
         }
     }
     static bool quieted = false;
     if (!quieted) { av_log_set_level(AV_LOG_ERROR); quieted = true; }
     VideoDecoder* d = new VideoDecoder();
     d->lru = ++g_decoderClock;
+    auto tOpen = std::chrono::steady_clock::now();
     if (!d->open(g_projDir + "/" + asset)) d->close();
+    double openMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tOpen).count();
+    g_pw.decOpens++; g_pw.decOpenMs += openMs; if (openMs > g_pw.decOpenMax) g_pw.decOpenMax = openMs;
     g_decoders[asset] = d;
     return d->ok ? d : nullptr;
+}
+
+static void prof_print_summary() {
+    auto sec = [](const char* name, const ProfSection& s) {
+        double avg = s.n ? s.sum / s.n : 0;
+        fprintf(stderr, "  %-8s avg %7.3f ms  max %7.3f ms\n", name, avg, s.max);
+    };
+    fprintf(stderr, "prof: %d frames\n", g_pw.frames);
+    sec("frame", g_pw.frame); sec("draw", g_pw.draw); sec("video", g_pw.video);
+    sec("drain", g_pw.drain); sec("overlay", g_pw.overlay); sec("sweep", g_pw.sweep);
+    sec("chrome", g_pw.chrome); sec("present", g_pw.present); sec("input", g_pw.input);
+    fprintf(stderr, "  decoders %zu resident | %d opens (avg %.2f ms, max %.1f ms) | %d evicts\n",
+            g_decoders.size(), g_pw.decOpens,
+            g_pw.decOpens ? g_pw.decOpenMs / g_pw.decOpens : 0.0, g_pw.decOpenMax, g_pw.decEvicts);
+    fprintf(stderr, "  videos %d visible, %d playing per frame | queue depth max %d\n",
+            g_pw.frames ? g_pw.visVideos / g_pw.frames : 0,
+            g_pw.frames ? g_pw.playVideos / g_pw.frames : 0, g_pw.queueDepth);
 }
 
 // ── audio (one stream per sounding video) ──
@@ -2013,29 +2069,32 @@ static bool upload_rgba(PlayState& ps, const unsigned char* rgba, int w, int h) 
 // frame 0 when idle). Called from the draw pass every frame the shape is
 // visible.
 static TexH video_srv(const Shape& s, MediaKind mk) {
+    ProfScope ps(&g_pw.video);
     VideoDecoder* d = get_decoder(s.asset);
     if (!d) return nullptr;
-    PlayState& ps = play_state(s);
-    if (mk == MK_GIF) ps.playing = true;   // gifs just loop, no controls
-    if (ps.playing) {
+    PlayState& ps2 = play_state(s);
+    g_pw.visVideos++;
+    if (ps2.playing) g_pw.playVideos++;
+    if (mk == MK_GIF) ps2.playing = true;   // gifs just loop, no controls
+    if (ps2.playing) {
         double dur = d->duration();
         AudioOut* au = nullptr;
         if (mk == MK_VIDEO && s.sound && d->hasAudio && !g_headless) {
-            au = audio_ensure(s.id, s.asset, ps.t);
+            au = audio_ensure(s.id, s.asset, ps2.t);
             au->lastTick = ImGui::GetFrameCount();
-            if (ps.audioSeek) audio_seek(au, ps.t);
+            if (ps2.audioSeek) audio_seek(au, ps2.t);
             audio_play(au, true);
             double c = au->pending.load() == 0 ? au->clock.load() : -1.0;
-            if (c >= 0) ps.t = c;                     // audio master while the stream is live
-            else ps.t += ImGui::GetIO().DeltaTime;    // seek in flight / stream still opening / no device
-        } else ps.t += ImGui::GetIO().DeltaTime;
-        ps.audioSeek = false;   // consumed above; without a stream the position seeds at creation
+            if (c >= 0) ps2.t = c;                     // audio master while the stream is live
+            else ps2.t += ImGui::GetIO().DeltaTime;    // seek in flight / stream still opening / no device
+        } else ps2.t += ImGui::GetIO().DeltaTime;
+        ps2.audioSeek = false;   // consumed above; without a stream the position seeds at creation
         bool wrapped = false;
-        if (mk == MK_VIDEO && s.loopA >= 0 && s.loopB > s.loopA && ps.t > s.loopB) { ps.t = s.loopA; wrapped = true; }
-        else if (dur > 0 && ps.t >= dur) { ps.t = (mk == MK_VIDEO && s.loopA >= 0) ? s.loopA : 0; wrapped = true; }
-        if (wrapped && au) audio_seek(au, ps.t);
+        if (mk == MK_VIDEO && s.loopA >= 0 && s.loopB > s.loopA && ps2.t > s.loopB) { ps2.t = s.loopA; wrapped = true; }
+        else if (dur > 0 && ps2.t >= dur) { ps2.t = (mk == MK_VIDEO && s.loopA >= 0) ? s.loopA : 0; wrapped = true; }
+        if (wrapped && au) audio_seek(au, ps2.t);
     }
-    int idx = (int)(ps.t * d->fps + 0.5);
+    int idx = (int)(ps2.t * d->fps + 0.5);
     // small on-screen media decodes at a reduced rate (see the budget comment)
     int rateK = 1;
     float sw = s.size.x * g_cam.zoom;
@@ -2043,31 +2102,32 @@ static TexH video_srv(const Shape& s, MediaKind mk) {
     else if (sw < kVideoRateMedW) rateK = 2;
     if (rateK > 1) idx = (idx / rateK) * rateK;
     if (d->frames > 0 && idx >= d->frames) idx = d->frames - 1;
-    if (!ps.srv) {
+    if (!ps2.srv) {
         // first frame in-line (see the worker comment); later ones are async
         std::vector<unsigned char> rgba;
         bool ok;
         { std::lock_guard<std::mutex> lk(d->mx); ok = d->decode_index(idx, rgba); }
-        if (ok && !rgba.empty() && upload_rgba(ps, rgba.data(), d->w, d->h)) ps.shownIdx = idx;
-    } else if (idx != ps.shownIdx && idx != ps.reqIdx) {
+        if (ok && !rgba.empty() && upload_rgba(ps2, rgba.data(), d->w, d->h)) ps2.shownIdx = idx;
+    } else if (idx != ps2.shownIdx && idx != ps2.reqIdx) {
         unsigned fc = ImGui::GetFrameCount();
-        if (fc - ps.lastReqFrame >= (unsigned)kVideoReqEvery) {
-            ps.lastReqFrame = fc;
+        if (fc - ps2.lastReqFrame >= (unsigned)kVideoReqEvery) {
+            ps2.lastReqFrame = fc;
             {
                 std::lock_guard<std::mutex> lk(g_vqMx);
                 g_vqWant[s.id] = { s.asset, idx, g_vqGen };
             }
             g_vqCv.notify_one();
-            ps.reqIdx = idx;
+            ps2.reqIdx = idx;
         }
     }
-    return ps.srv;
+    return ps2.srv;
 }
 
 // apply worker-decoded frames (called once per frame, before the draw pass)
 static void drain_video_results() {
+    ProfScope ps(&g_pw.drain);
     std::vector<DecodeRes> done;
-    { std::lock_guard<std::mutex> lk(g_vqMx); done.swap(g_vqDone); }
+    { std::lock_guard<std::mutex> lk(g_vqMx); done.swap(g_vqDone); if ((int)g_vqWant.size() > g_pw.queueDepth) g_pw.queueDepth = (int)g_vqWant.size(); }
     for (auto& r : done) {
         if (r.gen != g_vqGen) continue;   // board switched while this decoded
         auto pit = g_play.find(r.shape);
@@ -2085,6 +2145,7 @@ static void drain_video_results() {
 // drop playback state (and its GPU texture) + cached text extents for shapes
 // that no longer exist
 static void sweep_play_states() {
+    ProfScope ps(&g_pw.sweep);
 #ifdef TEI_LIBAV
     audio_sweep();
 #endif
@@ -3140,6 +3201,7 @@ static void draw_text_label(ImDrawList* dl, const Shape& s, float spx) {
 // the selection-export path renders just the selected shapes.
 static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
                             const std::vector<uint64_t>* only = nullptr) {
+    ProfScope ps(&g_pw.draw);
     auto in_only = [&](uint64_t id) {
         if (!only) return true;
         for (auto i : *only) if (i == id) return true;
@@ -4075,6 +4137,31 @@ static void DrawToolbar() {
     ImGui::End();
 }
 
+// ── prof overlay (F3): live per-frame cost + decoder activity ──
+static void DrawProfOverlay() {
+    if (!g_showProf) return;
+    ImGui::SetNextWindowPos(ImVec2(16.f, ImGui::GetMainViewport()->Size.y - 16.f), ImGuiCond_Always, ImVec2(0.f, 1.f));
+    ImGui::Begin("##prof", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                 ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs);
+    auto line = [](const char* name, const ProfSection& s) {
+        ImGui::Text("%-7s avg %7.3f ms  max %7.3f ms", name, s.n ? s.sum / s.n : 0.0, s.max);
+    };
+    line("frame", g_pw.frame); line("draw", g_pw.draw); line("video", g_pw.video);
+    ImGui::Text("drain %.2f  overlay %.2f  present %.2f",
+                g_pw.drain.n ? g_pw.drain.sum / g_pw.drain.n : 0.0,
+                g_pw.overlay.n ? g_pw.overlay.sum / g_pw.overlay.n : 0.0,
+                g_pw.present.n ? g_pw.present.sum / g_pw.present.n : 0.0);
+    ImGui::Text("decoders %d/%d | opens %d (avg %.1f ms) | evicts %d",
+                (int)g_decoders.size(), (int)kMaxDecoders, g_pw.decOpens,
+                g_pw.decOpens ? g_pw.decOpenMs / g_pw.decOpens : 0.0, g_pw.decEvicts);
+    ImGui::Text("videos %d vis, %d playing | queue %d",
+                g_pw.frames ? g_pw.visVideos / g_pw.frames : 0,
+                g_pw.frames ? g_pw.playVideos / g_pw.frames : 0, g_pw.queueDepth);
+    ImGui::End();
+}
+
 static void DrawZoomPill() {
     ImGui::SetNextWindowPos(ImVec2(16.f, ImGui::GetMainViewport()->Size.y - 16.f), ImGuiCond_Always, ImVec2(0.f, 1.f));
     ImGui::Begin("##zoom", nullptr,
@@ -4480,6 +4567,7 @@ static void ov_icon(ImDrawList* dl, ImVec2 c, float r, int icon, ImU32 col) {
 }
 
 static void DrawVideoOverlay() {
+    ProfScope psec(&g_pw.overlay);
 #ifdef TEI_LIBAV
     ImGuiIO& io = ImGui::GetIO();
     bool editing = g_editText || g_editLabelArrow;
@@ -5325,6 +5413,7 @@ static void CanvasFrame() {
             }
         }
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) g_pickerWant = true;
+        if (ImGui::IsKeyPressed(ImGuiKey_F3)) g_showProf = !g_showProf;   // prof overlay
         if (ImGui::IsKeyPressed(ImGuiKey_V)) g_tool = TOOL_SELECT;
         if (ImGui::IsKeyPressed(ImGuiKey_H)) g_tool = TOOL_HAND;
         if (ImGui::IsKeyPressed(ImGuiKey_D) && !io.KeyCtrl) g_tool = TOOL_DRAW;
@@ -5912,6 +6001,7 @@ int main(int argc, char** argv) {
     int bsFrame = -1;      // dev: press Backspace in the editor on this frame
     int enterFrame = -1;   // dev: press Enter on this frame
     int caretIdx = -1;     // dev: --edit caret byte offset (default: text end)
+    int profFrames = 600;  // --profile [N]: headless profiling run (default 600 frames)
     struct QkEv { int frame; ImGuiKey key; bool shift; };   // dev: injected quick-video-control key
     std::vector<QkEv> qkEvs;
     for (int i = 1; i < argc; i++) {
@@ -5935,6 +6025,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--bs") && i + 1 < argc) bsFrame = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--enter") && i + 1 < argc) enterFrame = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--caret") && i + 1 < argc) caretIdx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--profile")) {
+            g_profile = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') profFrames = atoi(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--qk") && i + 2 < argc) {
             int f = atoi(argv[++i]);
             const char* kn = argv[++i];
@@ -5953,7 +6047,7 @@ int main(int argc, char** argv) {
         }
         else if (argv[i][0] != '-') boardArg = argv[i];
     }
-    bool headless = shotPath || exportPng || exportTxt;
+    bool headless = shotPath || exportPng || exportTxt || g_profile;
     g_headless = headless;
     load_settings();
     if (boardArg.empty() && headless && !forcePicker) boardArg = "scratch";
@@ -6044,6 +6138,8 @@ int main(int argc, char** argv) {
     int exitCode = startupBoardFailed && headless ? 2 : 0;
     bool done = exitCode != 0;
     while (!done) {
+        auto tF0 = std::chrono::steady_clock::now();
+        { ProfScope psec(&g_pw.input);
 #ifdef _WIN32
         // Wait until the swapchain can accept a frame, THEN read input → lowest latency.
         if (g_frameWaitable) WaitForSingleObjectEx(g_frameWaitable, 1000, TRUE);
@@ -6073,6 +6169,7 @@ int main(int argc, char** argv) {
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
 #endif
+        }
         if (bsFrame >= 0) {   // dev: scripted keystrokes for headless editor shots
             if (framesDone == bsFrame) io.AddKeyEvent(ImGuiKey_Backspace, true);
             if (framesDone == bsFrame + 1) io.AddKeyEvent(ImGuiKey_Backspace, false);
@@ -6099,11 +6196,14 @@ int main(int argc, char** argv) {
         CanvasFrame();
         DrawContextMenu();
         DrawVideoOverlay();
+        { ProfScope psec(&g_pw.chrome);
         DrawTextEditor();
         DrawToolbar();
         DrawStylePanel();
         DrawZoomPill();
         DrawBoardPicker();
+        DrawProfOverlay();
+        }
         sweep_play_states();
 
         if (!io.WantTextInput && !g_editText && !g_editLabelArrow &&
@@ -6133,6 +6233,7 @@ int main(int argc, char** argv) {
             }
         }
 
+        { ProfScope psec(&g_pw.present);
         ImGui::Render();
 #ifdef _WIN32
         float bg[4] = { 0, 0, 0, 1 };
@@ -6161,8 +6262,15 @@ int main(int argc, char** argv) {
         SDL_RenderPresent(g_ren);
         framesDone++;
 #endif
+        }
         // queued copy-as-PNG / --export: render offscreen between frames
         if (g_export.active && run_pending_export()) done = true;
+
+        // fold the frame's wall time + advance the prof window
+        double fms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tF0).count();
+        g_pw.frame.sum += fms; if (fms > g_pw.frame.max) g_pw.frame.max = fms; g_pw.frame.n++;
+        prof_end_frame();
+        if (g_profile && framesDone >= profFrames) { prof_print_summary(); done = true; }
     }
 
 #ifdef TEI_LIBAV
