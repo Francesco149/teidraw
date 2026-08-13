@@ -4308,13 +4308,16 @@ static void DrawContextMenu() {
 // exactly on the drawn pixels. Gifs just loop with no chrome.
 enum OverlayCtl { OV_PLAY = 0, OV_STOP, OV_SEEK, OV_A, OV_B, OV_CLR, OV_SOUND, OV_COUNT };
 static uint64_t g_overlayVid = 0;       // video whose pills are showing (kept through fade-out)
-static float    g_ovAlphaFull = 0.f, g_ovAlphaMini = 0.f;   // fade envelopes
+static float    g_ovAlphaFull = 0.f, g_ovAlphaMini = 0.f, g_ovAlphaFlash = 0.f;   // fade envelopes
+static bool     g_ovFlash = false;      // a quick-control key flashed the mini pill
+static double   g_ovFlashUntil = 0;     // flash expiry (quick keys keep re-arming it)
 static bool     g_ovLive = false;       // full pill accepts clicks (read by CanvasFrame)
 static bool     g_ovMiniLive = false;   // mini pill is shown + would accept clicks
 static bool     g_ovFull = false;       // escalated to the full pill
 static double   g_ovFullLoseAt = 0;     // de-escalation deadline once the full pill isn't hovered
 static ImVec2   g_ovTL, g_ovSize;          // full pill rect (unrotated screen space)
 static ImVec2   g_ovMiniTL, g_ovMiniSize;  // mini pill rect
+static ImVec2   g_ovFlashTL, g_ovFlashSize; // flash pill rect
 static ImVec2   g_ovPivot;              // rotation pivot = video center (screen)
 static float    g_ovRot = 0.f;
 static WRect    g_ovCtl[OV_COUNT];      // full-pill control hit rects, pill-local
@@ -4404,15 +4407,21 @@ static void DrawVideoOverlay() {
         else if (now >= g_ovFullLoseAt) { g_ovFull = false; g_ovFullLoseAt = 0; }
     }
     bool wantFull = sel && !dragging && g_ovFull;
-    bool wantMini = sel && !dragging && !g_ovFull && (hoverVid || hoverMini || pressHold);
+    // the flash pill (quick-control feedback) replaces the hover mini pill
+    // while it's up, so the two never stack in the same corner
+    bool flashActive = sel && g_ovFlash && now < g_ovFlashUntil && !dragging;
+    bool wantFlash = flashActive;
+    bool wantMini = sel && !dragging && !g_ovFull && !flashActive && (hoverVid || hoverMini || pressHold);
     auto fade = [&](float a, bool want) {
         return want ? fminf(1.f, a + io.DeltaTime / 0.12f) : fmaxf(0.f, a - io.DeltaTime / 0.15f);
     };
     g_ovAlphaFull = fade(g_ovAlphaFull, wantFull);
     g_ovAlphaMini = fade(g_ovAlphaMini, wantMini);
+    g_ovAlphaFlash = fade(g_ovAlphaFlash, wantFlash);
     g_ovLive = wantFull && v != nullptr;
     g_ovMiniLive = wantMini && v != nullptr;
-    if (!v || (g_ovAlphaFull <= 0.f && g_ovAlphaMini <= 0.f)) {
+    if (!sel) { g_ovFlash = false; g_ovFlashUntil = 0; }
+    if (!v || (g_ovAlphaFull <= 0.f && g_ovAlphaMini <= 0.f && g_ovAlphaFlash <= 0.f)) {
         if (!v) g_overlayVid = 0;
         g_ovLive = g_ovMiniLive = false;
         if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) g_overlayDownCtl = -2;
@@ -4457,6 +4466,12 @@ static void DrawVideoOverlay() {
     g_ovMiniTL = W2S(lb.mx) - g_ovMiniSize - ImVec2(8.f, 8.f);
     g_ovMiniCtl[0] = { ImVec2(mpad, mpad), ImVec2(mpad + mb, mpad + mb) };
     g_ovMiniCtl[1] = { ImVec2(mpad + mb + 2.f, mpad), ImVec2(mpad + mb + 2.f + mb, mpad + mb) };
+    // flash pill (quick-control feedback): same corner, time + play/pause +
+    // mute; drawn at low opacity and only while the flash envelope is live
+    const float fp = 8.f, fh = 24.f, fgap = 8.f, fic = 13.f;
+    float flashTimeW = f->CalcTextSizeA(fs * 0.85f, FLT_MAX, 0.f, times).x;
+    g_ovFlashSize = ImVec2(fp + flashTimeW + fgap + fic + (hasAud ? fgap + fic : 0.f) + fp, fh);
+    g_ovFlashTL = W2S(lb.mx) - g_ovFlashSize - ImVec2(8.f, 8.f);
 
     // ── still-click actions. Press bookkeeping is CanvasFrame's: it targets
     // the video for drags and hands us the pressed control index. ──
@@ -4496,6 +4511,18 @@ static void DrawVideoOverlay() {
             if (hv) dl->AddRectFilled(p, p + sz, IM_COL32(255, 255, 255, mdown ? 36 : 20), 5.f);
             ov_icon(dl, p + sz * 0.5f, 5.f, i == 0 ? (ps.playing ? 1 : 0) : 2, g_th.textMain);
         }
+    }
+    int vtxFlash0 = dl->VtxBuffer.Size;
+    if (g_ovAlphaFlash > 0.f) {
+        // informational only — no hit rects, clicks fall through to the video
+        ImVec2 TL = g_ovFlashTL;
+        dl->AddRectFilled(TL, TL + g_ovFlashSize, g_th.panelBg, 7.f);
+        dl->AddRect(TL, TL + g_ovFlashSize, g_th.panelBorder, 7.f);
+        dl->AddText(f, fs * 0.85f, TL + ImVec2(fp, (fh - fs * 0.85f) * 0.5f), g_th.textDim, times);
+        float cx = fp + flashTimeW + fgap;
+        ov_icon(dl, TL + ImVec2(cx + fic * 0.5f, fh * 0.5f), fic * 0.5f, ps.playing ? 1 : 0, g_th.textMain);
+        if (hasAud)
+            ov_icon(dl, TL + ImVec2(cx + fic + fgap + fic * 0.5f, fh * 0.5f), fic * 0.5f, v->sound ? 3 : 4, g_th.textMain);
     }
     int vtxF0 = dl->VtxBuffer.Size;
     if (g_ovAlphaFull > 0.f) {
@@ -4564,7 +4591,8 @@ static void DrawVideoOverlay() {
             vx.col = (vx.col & 0x00FFFFFF) | ((ImU32)((vx.col >> 24) * alpha) << 24);
         }
     };
-    fade_range(vtxM0, vtxF0, g_ovAlphaMini);
+    fade_range(vtxM0, vtxFlash0, g_ovAlphaMini);
+    fade_range(vtxFlash0, vtxF0, g_ovAlphaFlash * 0.65f);   // flash pill: deliberately low opacity
     fade_range(vtxF0, vtxEnd, g_ovAlphaFull);
 #endif
 }
@@ -5178,13 +5206,69 @@ static void CanvasFrame() {
     // ── keyboard ── (all off while editing text or the board picker is up;
     // io.WantTextInput lags the editor's open by a frame, so gate on both)
     if (!io.WantTextInput && !editing && !ImGui::IsPopupOpen("boards")) {
+        // single selected video: quick-control keys claim space/a/b/←→/,./m,
+        // and the arrow keys stop nudging it (seeking wins)
+        Shape* qv = nullptr;
+        if (g_sel.size() == 1) {
+            Shape* c = find_shape(g_sel[0]);
+            if (c && c->type == SH_IMAGE) {
+#ifdef TEI_LIBAV
+                if (media_kind(c->asset) == MK_VIDEO) qv = c;
+#endif
+            }
+        }
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) g_pickerWant = true;
         if (ImGui::IsKeyPressed(ImGuiKey_V)) g_tool = TOOL_SELECT;
         if (ImGui::IsKeyPressed(ImGuiKey_H)) g_tool = TOOL_HAND;
         if (ImGui::IsKeyPressed(ImGuiKey_D) && !io.KeyCtrl) g_tool = TOOL_DRAW;
         if (ImGui::IsKeyPressed(ImGuiKey_T)) g_tool = TOOL_TEXT;
-        if (ImGui::IsKeyPressed(ImGuiKey_A) && !io.KeyCtrl) g_tool = TOOL_ARROW;
-        g_spacePan = ImGui::IsKeyDown(ImGuiKey_Space);
+        if (ImGui::IsKeyPressed(ImGuiKey_A) && !io.KeyCtrl && !qv) g_tool = TOOL_ARROW;
+        g_spacePan = !qv && ImGui::IsKeyDown(ImGuiKey_Space);
+        // ── quick video controls ──
+        // space play/pause · a/b loop points · ←/→ seek (shift = 5×) ·
+        // ,/. one frame · m sound. They flash the mini pill in the corner
+        // (time / total, play/pause, mute) instead of raising the hover
+        // pills; the flash dismisses itself ~1.4s after the last key.
+        if (qv && g_drag == DM_NONE && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup)) {
+#ifdef TEI_LIBAV
+            VideoDecoder* d = get_decoder(qv->asset);
+            if (d) {
+                PlayState& qps = play_state(*qv);
+                double qdur = d->duration();
+                bool qkey = false;
+                if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+                    qps.playing = !qps.playing; qv->play = qps.playing;
+                    g_saveDueAt = ImGui::GetTime() + 0.4;
+                    qkey = true;
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+                    qv->loopA = (float)qps.t;
+                    if (qv->loopB >= 0 && qv->loopB <= qv->loopA) qv->loopB = -1;
+                    push_undo(); qkey = true;
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_B, false)) {
+                    qv->loopB = (float)qps.t;
+                    if (qv->loopA >= 0 && qv->loopA >= qv->loopB) qv->loopA = -1;
+                    push_undo(); qkey = true;
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_M, false)) {
+                    if (d->hasAudio) { qv->sound = !qv->sound; push_undo(); qkey = true; }
+                }
+                float step = io.KeyShift ? 5.f : 1.f;
+                if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))  { qps.t = fmaxf(0.f, (float)(qps.t - step)); qps.audioSeek = true; qkey = true; }
+                if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) { qps.t = fminf(qdur > 0 ? (float)qdur : FLT_MAX, (float)(qps.t + step)); qps.audioSeek = true; qkey = true; }
+                float fd = d->fps > 0 ? 1.f / (float)d->fps : 0.f;
+                if (ImGui::IsKeyPressed(ImGuiKey_Comma))  { qps.t = fmaxf(0.f, (float)(qps.t - fd)); qps.audioSeek = true; qkey = true; }
+                if (ImGui::IsKeyPressed(ImGuiKey_Period)) { qps.t = fminf(qdur > 0 ? (float)qdur : FLT_MAX, (float)(qps.t + fd)); qps.audioSeek = true; qkey = true; }
+                if (qkey) {
+                    // keyboard transport feedback: flash the mini pill, never
+                    // the hover pills (those stay mouse-driven)
+                    g_ovFlash = true; g_ovFlashUntil = ImGui::GetTime() + 1.4;
+                    g_ovFull = false; g_ovFullLoseAt = 0;
+                }
+            }
+#endif
+        }
         if (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace)) {
             if (!g_sel.empty()) { delete_shapes(g_sel); push_undo(); }
         }
@@ -5227,7 +5311,8 @@ static void CanvasFrame() {
         }
         // arrow keys nudge the selection (1 canvas px, shift = 10); repeats
         // while held, and the burst coalesces into a single undo entry
-        if (!g_sel.empty() && g_drag == DM_NONE && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup)) {
+        // (a single selected video seeks instead — see quick controls above)
+        if (!g_sel.empty() && !qv && g_drag == DM_NONE && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup)) {
             float step = io.KeyShift ? 10.f : 1.f;
             ImVec2 nd(0, 0);
             if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))  nd.x -= step;
@@ -5720,6 +5805,8 @@ int main(int argc, char** argv) {
     int bsFrame = -1;      // dev: press Backspace in the editor on this frame
     int enterFrame = -1;   // dev: press Enter on this frame
     int caretIdx = -1;     // dev: --edit caret byte offset (default: text end)
+    struct QkEv { int frame; ImGuiKey key; bool shift; };   // dev: injected quick-video-control key
+    std::vector<QkEv> qkEvs;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
         else if (!strcmp(argv[i], "--export") && i + 1 < argc) exportPng = argv[++i];
@@ -5741,6 +5828,22 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--bs") && i + 1 < argc) bsFrame = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--enter") && i + 1 < argc) enterFrame = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--caret") && i + 1 < argc) caretIdx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--qk") && i + 2 < argc) {
+            int f = atoi(argv[++i]);
+            const char* kn = argv[++i];
+            bool sh = false;
+            if (i + 1 < argc && !strcmp(argv[i + 1], "shift")) { sh = true; i++; }
+            ImGuiKey k = ImGuiKey_None;
+            if (!strcmp(kn, "space")) k = ImGuiKey_Space;
+            else if (!strcmp(kn, "a")) k = ImGuiKey_A;
+            else if (!strcmp(kn, "b")) k = ImGuiKey_B;
+            else if (!strcmp(kn, "m")) k = ImGuiKey_M;
+            else if (!strcmp(kn, "left")) k = ImGuiKey_LeftArrow;
+            else if (!strcmp(kn, "right")) k = ImGuiKey_RightArrow;
+            else if (!strcmp(kn, "comma")) k = ImGuiKey_Comma;
+            else if (!strcmp(kn, "period")) k = ImGuiKey_Period;
+            if (k != ImGuiKey_None) qkEvs.push_back({ f, k, sh });
+        }
         else if (argv[i][0] != '-') boardArg = argv[i];
     }
     bool headless = shotPath || exportPng || exportTxt;
@@ -5870,6 +5973,16 @@ int main(int argc, char** argv) {
         if (enterFrame >= 0) {
             if (framesDone == enterFrame) io.AddKeyEvent(ImGuiKey_Enter, true);
             if (framesDone == enterFrame + 1) io.AddKeyEvent(ImGuiKey_Enter, false);
+        }
+        for (auto& qe : qkEvs) {   // dev: scripted quick-video-control keys
+            if (framesDone == qe.frame) {
+                if (qe.shift) io.AddKeyEvent(ImGuiKey_LeftShift, true);
+                io.AddKeyEvent(qe.key, true);
+            }
+            if (framesDone == qe.frame + 1) {
+                io.AddKeyEvent(qe.key, false);
+                if (qe.shift) io.AddKeyEvent(ImGuiKey_LeftShift, false);
+            }
         }
         ImGui::NewFrame();
 

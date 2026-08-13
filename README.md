@@ -83,6 +83,7 @@ Pan with middle-drag, space+drag, right-*drag* (right-*click* = menu), or
 | `Ctrl`+corner on an image | crop |
 | hold `Ctrl` while moving | snap to other shapes' edges/centers |
 | arrows / `Shift`+arrows | nudge 1 px / 10 px |
+| selected video: `Space` · `A`/`B` · `←`/`→` (`Shift` = 5 s) · `,`/`.` · `M` | play/pause · set loop points · seek · one frame · sound (flash pill feedback) |
 | `Ctrl+Shift+C` | copy board/selection as PNG (2×) |
 | `Ctrl+O` boards · `Ctrl+Shift+D` theme · `Esc` | picker · dark/light · pop drill/deselect |
 
