@@ -100,6 +100,7 @@ struct ProfState {
 static ProfState g_pw;
 static bool g_showProf = false;   // F3 overlay
 static bool g_profile = false;    // --profile: no window reset, summary at exit
+static bool g_forcePlay = false;  // --play: honor play flags headless too (profiling decode load)
 
 struct ProfScope {
     ProfSection* s; std::chrono::steady_clock::time_point t0;
@@ -1553,6 +1554,17 @@ static const size_t kMaxDecoders = 16;   // resident decoder cache; must cover a
 //     after the first N in doc order — frozen tiles.)
 static const float kVideoRateSmallW = 96.f, kVideoRateMedW = 220.f;
 static const int   kVideoReqEvery = 3;
+// Interactive decode budget: only the kVideoActiveBudget PLAYING media
+// nearest the cursor decode new frames; the rest freeze on their cached
+// texture (poster/last decoded frame — free, we already own it) until the
+// cursor comes near. decode demand is the hard limit with many players, so
+// instead of stuttering everything we give full speed to the few the user
+// is actually looking at. Computed once per interactive frame in
+// draw_doc_shapes; exports/shots run their own frames and skip the budget.
+static const int   kVideoActiveBudget = 6;
+static std::unordered_set<uint64_t> g_activeVideos;   // ids decoding this frame
+static int           g_activeBudgetFrame = -1;        // frame the set was built for
+static bool          g_interactiveFrame = false;      // set by CanvasFrame, cleared by exports
 static std::mutex g_decMx;   // guards g_decoders itself (lock order: g_decMx → decoder.mx)
 
 // ── async decode (M4 "keep the UI thread pure") ──
@@ -2009,6 +2021,16 @@ struct PlayState {
     int shownIdx = -1;
     int reqIdx = -1;    // frame index requested from the decode worker, not yet delivered
     unsigned lastReqFrame = 0;   // UI frame of the last decode request (per-video rate limit)
+    // cached media metadata (captured on first decoder touch, so a stopped
+    // video never needs its decoder again — the GPU texture outlives it).
+    // This kills the eviction churn on dense boards: video_srv used to call
+    // get_decoder for EVERY visible video EVERY frame, so a view with more
+    // distinct assets than the cache re-opened ~all of them per frame.
+    bool haveMeta = false;
+    float fps = 0;
+    int frames = 0;
+    double dur = 0;
+    bool hasAudio = false;
     int w = 0, h = 0;
 #ifdef _WIN32
     ID3D11Texture2D* tex = nullptr;
@@ -2030,7 +2052,7 @@ static PlayState& play_state(const Shape& s) {
     auto ins = g_play.try_emplace(s.id);
     if (ins.second) {
         if (s.loopA >= 0) ins.first->second.t = s.loopA;
-        if (s.play && !g_headless) ins.first->second.playing = true;
+        if ((s.play && !g_headless) || g_forcePlay) ins.first->second.playing = true;
     }
     return ins.first->second;
 }
@@ -2075,57 +2097,77 @@ static bool upload_rgba(PlayState& ps, const unsigned char* rgba, int w, int h) 
 // visible.
 static TexH video_srv(const Shape& s, MediaKind mk) {
     ProfScope ps(&g_pw.video);
-    VideoDecoder* d = get_decoder(s.asset);
-    if (!d) return nullptr;
-    PlayState& ps2 = play_state(s);
+    PlayState& st = play_state(s);
     g_pw.visVideos++;
-    if (ps2.playing) g_pw.playVideos++;
-    if (mk == MK_GIF) ps2.playing = true;   // gifs just loop, no controls
-    if (ps2.playing) {
-        double dur = d->duration();
+    if (mk == MK_GIF) st.playing = true;   // gifs just loop, no controls
+    if (st.playing) g_pw.playVideos++;
+    VideoDecoder* d = nullptr;
+    if (!st.haveMeta) {
+        // first touch: open the decoder ONCE for metadata + the poster.
+        // Afterwards a stopped video draws its cached texture without ever
+        // touching get_decoder again (the old code re-opened every visible
+        // video's decoder every frame — the churn that made dense views
+        // choppy).
+        d = get_decoder(s.asset);
+        if (!d) return nullptr;
+        st.fps = (float)d->fps; st.frames = d->frames; st.dur = d->duration(); st.hasAudio = d->hasAudio;
+        st.haveMeta = true;
+        if (!st.srv) {   // poster in-line (playhead frame when t>0 — loopA opens at A — else 0)
+            int pidx = st.t > 0 ? (int)(st.t * st.fps + 0.5) : 0;
+            if (st.frames > 0 && pidx >= st.frames) pidx = st.frames - 1;
+            std::vector<unsigned char> rgba;
+            bool ok;
+            { std::lock_guard<std::mutex> lk(d->mx); ok = d->decode_index(pidx, rgba); }
+            if (ok && !rgba.empty() && upload_rgba(st, rgba.data(), d->w, d->h)) st.shownIdx = pidx;
+        }
+    }
+    if (!st.playing) return st.srv;   // stopped: cached texture only; the decoder may already be evicted
+    // decode budget: only the active (cursor-nearest) playing media decode
+    // new frames; the rest freeze on their cached texture (static thumb).
+    // Exports/shots run their own frames (g_interactiveFrame false) and skip
+    // the budget — everything stays live for them.
+    if (g_interactiveFrame && ImGui::GetFrameCount() == g_activeBudgetFrame && !g_activeVideos.count(s.id))
+        return st.srv;
+    d = get_decoder(s.asset);   // keep resident while frames are wanted
+    if (!d) return nullptr;
+    {
         AudioOut* au = nullptr;
-        if (mk == MK_VIDEO && s.sound && d->hasAudio && !g_headless) {
-            au = audio_ensure(s.id, s.asset, ps2.t);
+        if (mk == MK_VIDEO && s.sound && st.hasAudio && !g_headless) {
+            au = audio_ensure(s.id, s.asset, st.t);
             au->lastTick = ImGui::GetFrameCount();
-            if (ps2.audioSeek) audio_seek(au, ps2.t);
+            if (st.audioSeek) audio_seek(au, st.t);
             audio_play(au, true);
             double c = au->pending.load() == 0 ? au->clock.load() : -1.0;
-            if (c >= 0) ps2.t = c;                     // audio master while the stream is live
-            else ps2.t += ImGui::GetIO().DeltaTime;    // seek in flight / stream still opening / no device
-        } else ps2.t += ImGui::GetIO().DeltaTime;
-        ps2.audioSeek = false;   // consumed above; without a stream the position seeds at creation
+            if (c >= 0) st.t = c;                     // audio master while the stream is live
+            else st.t += ImGui::GetIO().DeltaTime;    // seek in flight / stream still opening / no device
+        } else st.t += ImGui::GetIO().DeltaTime;
+        st.audioSeek = false;   // consumed above; without a stream the position seeds at creation
         bool wrapped = false;
-        if (mk == MK_VIDEO && s.loopA >= 0 && s.loopB > s.loopA && ps2.t > s.loopB) { ps2.t = s.loopA; wrapped = true; }
-        else if (dur > 0 && ps2.t >= dur) { ps2.t = (mk == MK_VIDEO && s.loopA >= 0) ? s.loopA : 0; wrapped = true; }
-        if (wrapped && au) audio_seek(au, ps2.t);
+        if (mk == MK_VIDEO && s.loopA >= 0 && s.loopB > s.loopA && st.t > s.loopB) { st.t = s.loopA; wrapped = true; }
+        else if (st.dur > 0 && st.t >= st.dur) { st.t = (mk == MK_VIDEO && s.loopA >= 0) ? s.loopA : 0; wrapped = true; }
+        if (wrapped && au) audio_seek(au, st.t);
     }
-    int idx = (int)(ps2.t * d->fps + 0.5);
+    int idx = (int)(st.t * st.fps + 0.5);
     // small on-screen media decodes at a reduced rate (see the budget comment)
     int rateK = 1;
     float sw = s.size.x * g_cam.zoom;
     if (sw < kVideoRateSmallW) rateK = 4;
     else if (sw < kVideoRateMedW) rateK = 2;
     if (rateK > 1) idx = (idx / rateK) * rateK;
-    if (d->frames > 0 && idx >= d->frames) idx = d->frames - 1;
-    if (!ps2.srv) {
-        // first frame in-line (see the worker comment); later ones are async
-        std::vector<unsigned char> rgba;
-        bool ok;
-        { std::lock_guard<std::mutex> lk(d->mx); ok = d->decode_index(idx, rgba); }
-        if (ok && !rgba.empty() && upload_rgba(ps2, rgba.data(), d->w, d->h)) ps2.shownIdx = idx;
-    } else if (idx != ps2.shownIdx && idx != ps2.reqIdx) {
+    if (st.frames > 0 && idx >= st.frames) idx = st.frames - 1;
+    if (idx != st.shownIdx && idx != st.reqIdx) {
         unsigned fc = ImGui::GetFrameCount();
-        if (fc - ps2.lastReqFrame >= (unsigned)kVideoReqEvery) {
-            ps2.lastReqFrame = fc;
+        if (fc - st.lastReqFrame >= (unsigned)kVideoReqEvery) {
+            st.lastReqFrame = fc;
             {
                 std::lock_guard<std::mutex> lk(g_vqMx);
                 g_vqWant[s.id] = { s.asset, idx, g_vqGen };
             }
             g_vqCv.notify_one();
-            ps2.reqIdx = idx;
+            st.reqIdx = idx;
         }
     }
-    return ps2.srv;
+    return st.srv;
 }
 
 // apply worker-decoded frames (called once per frame, before the draw pass)
@@ -3220,6 +3262,32 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
     WRect view{ S2W(ImVec2(0, 0)), S2W(ImGui::GetIO().DisplaySize) };
     float pad = 64.f / g_cam.zoom;
     view.mn = view.mn - ImVec2(pad, pad); view.mx = view.mx + ImVec2(pad, pad);
+    // interactive decode budget: the kVideoActiveBudget PLAYING media nearest
+    // the cursor decode new frames; the rest freeze on their cached texture.
+    // Rebuilt once per interactive frame; exports run their own frames with
+    // g_interactiveFrame false, so the budget never applies to them.
+    if (g_interactiveFrame && ImGui::GetFrameCount() != g_activeBudgetFrame) {
+        g_activeBudgetFrame = ImGui::GetFrameCount();
+        g_activeVideos.clear();
+        struct Cand { uint64_t id; float dist; float area; };
+        std::vector<Cand> cands;
+        for (auto& s : g_doc.shapes) {
+            if (s.type != SH_IMAGE) continue;
+            WRect b = shape_bounds(s);
+            if (b.mx.x < view.mn.x || b.mn.x > view.mx.x || b.mx.y < view.mn.y || b.mn.y > view.mx.y) continue;
+            MediaKind mk = media_kind(s.asset);
+            if (mk != MK_VIDEO && mk != MK_GIF) continue;
+            if (!play_state(s).playing) continue;
+            ImVec2 cc = W2S(b.center());
+            ImVec2 mp = ImGui::GetIO().MousePos;
+            cands.push_back({ s.id, vlen(cc - mp), (b.size().x * g_cam.zoom) * (b.size().y * g_cam.zoom) });
+        }
+        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+            return a.dist < b.dist || (a.dist == b.dist && a.area > b.area);
+        });
+        for (size_t i = 0; i < cands.size() && i < (size_t)kVideoActiveBudget; i++)
+            g_activeVideos.insert(cands[i].id);
+    }
     // zoomed-out cluster view: each group's biggest text member earns the
     // truncated label; the rest of the group grayboxes. Only needed when the
     // smallest font can actually be below the graybox threshold.
@@ -3345,6 +3413,7 @@ static void request_png_export(bool selOnly, const char* path) {
 // render a world rect into an offscreen RT via a synthetic imgui frame
 static bool render_rect_rgba(const WRect& r, const std::vector<uint64_t>* only,
                              std::vector<unsigned char>& px, int& w, int& h) {
+    g_interactiveFrame = false;   // exports draw every video live — no decode budget
     ImVec2 sz = r.size();
     if (sz.x < 1.f || sz.y < 1.f) return false;
     float scale = fminf(2.f, 8192.f / fmaxf(sz.x, sz.y));   // 2× unless the board is huge
@@ -5371,6 +5440,7 @@ static void DrawTextEditor() {
 static double g_lastClickTime = -1; static ImVec2 g_lastClickPos; static uint64_t g_lastClickLeaf = 0;
 
 static void CanvasFrame() {
+    g_interactiveFrame = true;   // decode budget applies to the live view only
     ImGuiIO& io = ImGui::GetIO();
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
@@ -6034,6 +6104,7 @@ int main(int argc, char** argv) {
             g_profile = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') profFrames = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--play")) g_forcePlay = true;   // dev: play state persists headless (profiling)
         else if (!strcmp(argv[i], "--qk") && i + 2 < argc) {
             int f = atoi(argv[++i]);
             const char* kn = argv[++i];

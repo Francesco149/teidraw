@@ -75,6 +75,28 @@ user's report exactly: choppy the moment the visible distinct set exceeds
 frame avg 34.8 → 12.5 ms (the rest is the headless present cap; interactive
 work per frame is now sub-millisecond).
 
+## Session 11d — the churn was a design flaw; cursor decode budget
+The next view (where the user left the board) showed 21 DISTINCT videos, so
+the bigger cache churned again: 11,400 opens / 11,384 evicts over 600
+frames, ~19 re-opens/frame ≈ 32 ms/frame. Root cause: `video_srv` called
+`get_decoder` for EVERY visible video EVERY frame — even stopped ones that
+only DRAW their cached texture. A decoder is only needed for DECODING; the
+GPU texture (PlayState) outlives it. PlayState now caches fps / duration /
+frame count / has-audio on first touch, and a stopped video never opens its
+decoder again: the 21-video view went 42.1 → 0.40 ms/frame draw, 56 → 14 ms
+frame; opens 11,400 → 19 (first-frame posters only). The LRU cap is now
+only a ceiling for the PLAYING set.
+**Playing-set budget (the fundamental limit):** decode demand is bounded by
+the single worker thread, so ~20 playing videos saturate it and everything
+stutters. Per the user's proposal, only the `kVideoActiveBudget` (6)
+PLAYING media NEAREST THE CURSOR decode new frames; the rest freeze on
+their cached texture (poster/last frame — a static thumbnail, free) and
+resume when the cursor comes near. The set is rebuilt per interactive frame
+in `draw_doc_shapes`; exports/shots run their own frames and bypass the
+budget. Profile, 22 playing videos: queue depth max 6 (exactly the budget),
+drain 0.54 ms, zero churn. Dev: `--play` forces play state headless so the
+decode load is profilable.
+
 ## Where things stand
 The app is a daily-drivable whiteboard, hands-on tested by the user ("UX is
 solid", "feels good"): text / arrows / images / gifs / videos / groups, smart
