@@ -1499,6 +1499,20 @@ struct VideoDecoder {
 static std::map<std::string, VideoDecoder*> g_decoders;   // asset rel path → resident decoder
 static unsigned long long g_decoderClock = 0;
 static const size_t kMaxDecoders = 6;
+// Many-playing-videos budget: decode demand is the bottleneck with several
+// players (each visible playing video wants its own 30 fps of libav work).
+// Two fair throttles keep it smooth instead of saturating a core:
+//   - rateK snaps the wanted frame to a coarser grid for SMALL on-screen
+//     media (a 100 px-wide video doesn't need 30 fps — halves/quarters the
+//     decode rate by screen width);
+//   - kVideoReqEvery rate-limits each video's requests to once per N UI
+//     frames (≈20 fps ceiling), so no single video hogs the worker and all
+//     players keep SOME motion under load — the worker drains latest-wins,
+//     so a video that misses its slot just shows its last frame and catches
+//     up. (A per-frame global budget was tried first: it starved every video
+//     after the first N in doc order — frozen tiles.)
+static const float kVideoRateSmallW = 96.f, kVideoRateMedW = 220.f;
+static const int   kVideoReqEvery = 3;
 static std::mutex g_decMx;   // guards g_decoders itself (lock order: g_decMx → decoder.mx)
 
 // ── async decode (M4 "keep the UI thread pure") ──
@@ -1933,6 +1947,7 @@ struct PlayState {
     double t = 0;
     int shownIdx = -1;
     int reqIdx = -1;    // frame index requested from the decode worker, not yet delivered
+    unsigned lastReqFrame = 0;   // UI frame of the last decode request (per-video rate limit)
     int w = 0, h = 0;
 #ifdef _WIN32
     ID3D11Texture2D* tex = nullptr;
@@ -2021,6 +2036,12 @@ static TexH video_srv(const Shape& s, MediaKind mk) {
         if (wrapped && au) audio_seek(au, ps.t);
     }
     int idx = (int)(ps.t * d->fps + 0.5);
+    // small on-screen media decodes at a reduced rate (see the budget comment)
+    int rateK = 1;
+    float sw = s.size.x * g_cam.zoom;
+    if (sw < kVideoRateSmallW) rateK = 4;
+    else if (sw < kVideoRateMedW) rateK = 2;
+    if (rateK > 1) idx = (idx / rateK) * rateK;
     if (d->frames > 0 && idx >= d->frames) idx = d->frames - 1;
     if (!ps.srv) {
         // first frame in-line (see the worker comment); later ones are async
@@ -2029,12 +2050,16 @@ static TexH video_srv(const Shape& s, MediaKind mk) {
         { std::lock_guard<std::mutex> lk(d->mx); ok = d->decode_index(idx, rgba); }
         if (ok && !rgba.empty() && upload_rgba(ps, rgba.data(), d->w, d->h)) ps.shownIdx = idx;
     } else if (idx != ps.shownIdx && idx != ps.reqIdx) {
-        {
-            std::lock_guard<std::mutex> lk(g_vqMx);
-            g_vqWant[s.id] = { s.asset, idx, g_vqGen };
+        unsigned fc = ImGui::GetFrameCount();
+        if (fc - ps.lastReqFrame >= (unsigned)kVideoReqEvery) {
+            ps.lastReqFrame = fc;
+            {
+                std::lock_guard<std::mutex> lk(g_vqMx);
+                g_vqWant[s.id] = { s.asset, idx, g_vqGen };
+            }
+            g_vqCv.notify_one();
+            ps.reqIdx = idx;
         }
-        g_vqCv.notify_one();
-        ps.reqIdx = idx;
     }
     return ps.srv;
 }
@@ -3061,6 +3086,56 @@ static void draw_stroke_shape(ImDrawList* dl, const Shape& s) {
     for (int idx : ib) dl->PrimWriteIdx((ImDrawIdx)(base + (unsigned)idx));
 }
 
+// ── zoomed-out cluster view ──
+// Below an on-screen size a shape stops paying its full render cost and
+// becomes a GRAY BOX (a handful of rects instead of thousands of glyphs or
+// a video decode). The "important" texts — the beginning of an ungrouped
+// text that is big on screen, and the biggest text member of every group —
+// additionally get a truncated label at a clamped readable size, so zooming
+// out reads as clusters, not noise.
+static const float kTextGrayPx   = 9.f;      // text font screen px below → graybox
+static const float kLabelPx      = 10.5f;    // clamped label font (screen px)
+static const float kLabelMaxW    = 150.f;    // truncated label max width (screen px)
+static const float kLabelMinW    = 28.f;     // box must be this wide (screen px) before it earns a label
+static const float kMediaGrayPx  = 24.f;     // image/video screen width below → graybox
+
+// the shape's (rotated) rect as a gray cluster box
+static void draw_gray_box(ImDrawList* dl, const Shape& s) {
+    ImVec2 c[4]; shape_obb(s, c);
+    ImVec2 sc[4]; for (int i = 0; i < 4; i++) sc[i] = W2S(c[i]);
+    dl->AddConvexPolyFilled(sc, 4, IM_COL32(140, 140, 150, 58));
+    dl->AddPolyline(sc, 4, IM_COL32(140, 140, 150, 145), ImDrawFlags_Closed, 1.f);
+}
+
+// the truncated beginning of a text shape's first line, drawn at a minimum
+// readable size just above its box
+static void draw_text_label(ImDrawList* dl, const Shape& s, float spx) {
+    float px = fmaxf(spx, kLabelPx);
+    const char* t = s.text.c_str();
+    const char* e = strchr(t, '\n');
+    if (!e) e = t + s.text.size();
+    size_t n = (size_t)(e - t);
+    ImFont* f = g_fonts[s.family];
+    ImGui::PushFont(f, px);
+    size_t i = 0;
+    for (; i < n;) {
+        size_t cw = 1;
+        while (i + cw < n && ((unsigned char)t[i + cw] & 0xC0) == 0x80) cw++;
+        if (f->CalcTextSizeA(px, FLT_MAX, 0.f, t, t + i + cw).x > kLabelMaxW) break;
+        i += cw;
+    }
+    bool cut = i < n;
+    ImVec2 tl = W2S(shape_bounds(s).mn);
+    ImVec2 pos(tl.x, tl.y - px - 5.f);
+    ImU32 col = shape_ink(s);
+    add_text_bold(dl, f, px, pos, col, t, t + i);
+    if (cut) {
+        ImVec2 ext = f->CalcTextSizeA(px, FLT_MAX, 0.f, t, t + i);
+        add_text_bold(dl, f, px, ImVec2(pos.x + ext.x, pos.y), col, "\xe2\x80\xa6");   // "…"
+    }
+    ImGui::PopFont();
+}
+
 // doc order = z order. `only` (when non-null) limits drawing to those ids —
 // the selection-export path renders just the selected shapes.
 static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
@@ -3078,6 +3153,24 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
     WRect view{ S2W(ImVec2(0, 0)), S2W(ImGui::GetIO().DisplaySize) };
     float pad = 64.f / g_cam.zoom;
     view.mn = view.mn - ImVec2(pad, pad); view.mx = view.mx + ImVec2(pad, pad);
+    // zoomed-out cluster view: each group's biggest text member earns the
+    // truncated label; the rest of the group grayboxes. Only needed when the
+    // smallest font can actually be below the graybox threshold.
+    static std::unordered_map<uint64_t, uint64_t> groupBiggest;
+    if (g_cam.zoom < kTextGrayPx / kTextSizes[0]) {
+        groupBiggest.clear();
+        for (auto& s : g_doc.shapes)
+            if (s.type == SH_TEXT && s.parent) {
+                auto it = groupBiggest.find(s.parent);
+                if (it == groupBiggest.end()) groupBiggest[s.parent] = s.id;
+                else {
+                    Shape* cur = find_shape(it->second);
+                    if (!cur) { it->second = s.id; continue; }
+                    ImVec2 a = text_extent(s), b = text_extent(*cur);
+                    if (a.x * a.y > b.x * b.y) it->second = s.id;
+                }
+            }
+    } else groupBiggest.clear();
     for (auto& s : g_doc.shapes) {
         if (s.id == skipId || s.type == SH_GROUP || !in_only(s.id)) continue;
         WRect b = shape_bounds(s);
@@ -3090,11 +3183,25 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
         }
         if (b.mx.x < view.mn.x || b.mn.x > view.mx.x || b.mx.y < view.mn.y || b.mn.y > view.mx.y) continue;
         switch (s.type) {
-        case SH_TEXT:  draw_text_shape(dl, s); break;
+        case SH_TEXT: {
+            float spx = text_px(s) * g_cam.zoom;
+            bool interactive = s.id == g_editText || s.id == g_editLabelArrow || is_selected(s.id);
+            if (spx >= kTextGrayPx || interactive) { draw_text_shape(dl, s); break; }
+            WRect gb = shape_bounds(s);
+            float gw = W2S(gb.mx).x - W2S(gb.mn).x;
+            bool label = gw >= kLabelMinW &&
+                         (s.parent ? (groupBiggest.count(s.parent) && groupBiggest[s.parent] == s.id)
+                                   : true);
+            if (label) draw_text_label(dl, s, spx);
+            draw_gray_box(dl, s);
+        } break;
         case SH_DRAW:  draw_stroke_shape(dl, s); break;
         case SH_ARROW: draw_arrow_shape(dl, s); break;
         case SH_IMAGE: {
             ImVec2 mn = W2S(s.pos), mx = W2S(s.pos + s.size);
+            // tiny media grayboxes (and stops decoding) until zoomed in —
+            // same contract as the offscreen cull: playback pauses offstage
+            if ((mx.x - mn.x) < kMediaGrayPx && !is_selected(s.id)) { draw_gray_box(dl, s); break; }
             TexH srv = nullptr;
             MediaKind mk = media_kind(s.asset);
             if (mk == MK_STILL) srv = get_image_tex(s.asset)->srv;

@@ -1,7 +1,59 @@
 # STATUS — live front
 
-*Updated: 2026-07-25 (session 10 + post-release fixes). History lives in
+*Updated: 2026-08-13 (session 11). History lives in
 `git log` — this file only describes NOW.*
+
+## Session 11 — quick video controls + middle-mouse stand-in
+**Quick video controls (issue #2):** with exactly one video selected,`Space` play/pause (persisted, no undo entry — same contract as the pill),
+`A`/`B` set the loop points at the current playhead (same ordering guard as
+the pill buttons: B ≤ A clears A and vice versa), `←`/`→` seek 1 s (`Shift`
+= 5 s), `,`/`.` step exactly one frame (1/fps), `M` toggles sound (only
+when the file has an audio stream). All transport keys flash a MINI pill in
+the video's bottom-right corner — time / total, a single play/pause icon, a
+mute icon — drawn at ~65% opacity, **instead of raising the hover
+pill/full pill** (the full pill is dismissed on a quick key; the hover mini
+is suppressed while the flash is up so the two never stack). The flash is
+informational only (no hit rects; clicks fall through to the video) and
+fades ~1.4 s after the last key. Arrow keys stop nudging while a single
+video is selected (seeking wins); the arrow-tool `A` key defers to the loop
+point, and `Space` stops panning while a video is selected (per the issue —
+hand tool / middle drag / Alt+drag still pan). Dev harness: `--qk <frame>
+<space|a|b|m|left|right|comma|period> [shift]` injects a quick key at a
+frame, mirroring the `--bs`/`--enter` editor harness. Known, pre-existing:
+any transient on-screen text (the hover full pill's time/A/B labels — and
+now the flash) re-rasterizes the dynamic font atlas, which can shift
+individual glyphs' antialiasing by 1 px in a later `--export`; cosmetic and
+deterministic per run.
+**Middle-mouse stand-in (issue #4):** `Alt`+left-drag pans exactly like
+middle-drag (held modifier, not a toggle — it never fights the left-button
+state machine; a plain Alt+click still clicks). For laptops without a
+middle button.
+
+## Session 11b — zoomed-out cluster view + many-videos budget (issue #3)
+**Zoomed-out cluster view:** below an on-screen size a shape stops paying
+its full render cost and becomes a GRAY BOX (a handful of rects instead of
+thousands of glyphs or a video decode): text whose font drops under 9
+screen px, and images/videos narrower than 24 screen px. The "important"
+texts additionally get a truncated label at a clamped readable 10.5 px just
+above their box — the beginning of each ungrouped text whose box is at
+least 28 px wide, and the biggest text member of every group (one label per
+cluster) — so zooming out reads as clusters: deep zoom = boxes only, zoom
+in = names, then real text ("until it's zoomed in enough"). Selected/edited
+shapes always render normally, so interaction and selection exports are
+untouched; normal zoom and the 2× export path never graybox.
+**Many-playing-videos budget:** decode demand is the bottleneck with several
+players (each wants its own 30 fps of libav work), and it's unfair to let
+doc order starve anyone. Two fair throttles in `video_srv`: `rateK` snaps
+the wanted frame to a coarser grid for small on-screen media (1/2 rate
+under 220 px wide, 1/4 under 96 px), and `kVideoReqEvery` rate-limits each
+video's requests to once per 3 UI frames (≈20 fps ceiling) so all players
+keep SOME motion under load — the worker drains latest-wins, so a missed
+slot just shows the last frame and catches up. (A per-frame global budget
+was tried first: it starved every video after the first N in doc order —
+frozen tiles.) Tiny grayboxed videos skip `video_srv` entirely: no decode,
+no upload, and playback pauses like the offscreen cull (deliberate).
+Headless A/B, 24 playing videos × 600 frames: grayboxed case user time
+3.29 s → 2.43 s (−26%, ≈ empty-board cost), mid-zoom 2.44 s → 2.23 s (−9%).
 
 ## Where things stand
 The app is a daily-drivable whiteboard, hands-on tested by the user ("UX is
