@@ -1547,50 +1547,50 @@ static void drain_image_results() {
             if (r.thumbPx) free(r.thumbPx);
             continue;
         }
-        g_imgPendingUpload.push_back({ r.asset, r.gen, r.w, r.h, r.tw, r.th, r.fullPx, r.thumbPx, r.ok });
+
+        Tex& t = g_texCache[r.asset];
+        t.w = r.w; t.h = r.h;
+        t.tw = r.tw; t.th = r.th;
+        t.loading = false;
+
+        if (!r.ok) {
+            t.failed = true;
+            continue;
+        }
+
+        // Always create thumbnail texture immediately! (Sub-100 microsecond upload each)
+        if (!t.thumbSrv) {
+            const unsigned char* tp = r.thumbPx ? r.thumbPx : r.fullPx;
+            t.thumbSrv = make_rgba_tex(tp, r.tw, r.th);
+        }
+        if (r.thumbPx) { free(r.thumbPx); r.thumbPx = nullptr; }
+
+        if (r.tw == r.w && r.th == r.h) {
+            t.srv = t.thumbSrv;
+            stbi_image_free(r.fullPx);
+            r.fullPx = nullptr;
+        } else {
+            g_imgPendingUpload.push_back({ r.asset, r.gen, r.w, r.h, r.tw, r.th, r.fullPx, nullptr, r.ok });
+        }
     }
 
-    int fullUploadBudget = 2;
+    // Budget full-resolution uploads: up to 4 per frame to prevent hitches while promoting smoothly
+    int fullUploadBudget = 4;
+    while (!g_imgPendingUpload.empty() && fullUploadBudget > 0) {
+        auto item = g_imgPendingUpload.front();
+        g_imgPendingUpload.pop_front();
 
-    while (!g_imgPendingUpload.empty()) {
-        auto& item = g_imgPendingUpload.front();
         if (item.gen != g_imgGen) {
             if (item.fullPx) stbi_image_free(item.fullPx);
-            if (item.thumbPx) free(item.thumbPx);
-            g_imgPendingUpload.pop_front();
             continue;
         }
 
         Tex& t = g_texCache[item.asset];
-        t.w = item.w; t.h = item.h;
-        t.tw = item.tw; t.th = item.th;
-        t.loading = false;
-
-        if (!item.ok) {
-            t.failed = true;
-            g_imgPendingUpload.pop_front();
-            continue;
-        }
-
-        if (!t.thumbSrv) {
-            const unsigned char* tp = item.thumbPx ? item.thumbPx : item.fullPx;
-            t.thumbSrv = make_rgba_tex(tp, item.tw, item.th);
-        }
-        if (item.thumbPx) { free(item.thumbPx); item.thumbPx = nullptr; }
-
-        if (fullUploadBudget > 0 && item.fullPx) {
-            if (!t.srv) {
-                t.srv = make_rgba_tex(item.fullPx, item.w, item.h);
-            }
-            stbi_image_free(item.fullPx);
-            item.fullPx = nullptr;
+        if (!t.srv && item.fullPx) {
+            t.srv = make_rgba_tex(item.fullPx, item.w, item.h);
             fullUploadBudget--;
-            g_imgPendingUpload.pop_front();
-        } else if (!item.fullPx) {
-            g_imgPendingUpload.pop_front();
-        } else {
-            break;
         }
+        if (item.fullPx) stbi_image_free(item.fullPx);
     }
 }
 
@@ -2491,6 +2491,22 @@ static void sweep_play_states() {
     }
 }
 
+// "file:///home/a%20b/c.png" → "/home/a b/c.png" (empty when not a local file)
+static std::string uri_to_path(const std::string& uri) {
+    if (uri.rfind("file://", 0) != 0) return "";
+    std::string p = uri.substr(7);
+    size_t sl = p.find('/');                    // strip a host part (file://host/…)
+    if (sl == std::string::npos) return "";
+    if (sl != 0) p = p.substr(sl);
+    std::string out;
+    for (size_t i = 0; i < p.size(); i++) {
+        if (p[i] == '%' && i + 2 < p.size() && isxdigit((unsigned char)p[i+1]) && isxdigit((unsigned char)p[i+2])) {
+            out += (char)strtol(p.substr(i + 1, 2).c_str(), nullptr, 16);
+            i += 2;
+        } else out += p[i];
+    }
+    return out;
+}
 // Copy an external file into the project's assets/ (self-contained project
 // dirs: every board carries its own media). ASCII-sanitized destination names
 // so downstream ANSI file APIs (stb) never trip on unicode.
@@ -2590,7 +2606,9 @@ static WRect image_full_rect(const Shape& s) {
 static void import_files_at(const std::vector<std::string>& paths, ImVec2 atW) {
     ImVec2 cursor = atW;
     bool any = false;
-    for (auto& p : paths) {
+    for (auto& rawPath : paths) {
+        std::string p = (rawPath.rfind("file://", 0) == 0) ? uri_to_path(rawPath) : rawPath;
+        while (!p.empty() && (p.back() == '\r' || p.back() == '\n' || p.back() == ' ')) p.pop_back();
         if (!is_media_ext(p)) continue;
         std::string rel = import_asset_file(p);
         if (rel.empty()) continue;
@@ -2783,22 +2801,6 @@ static void paste_clipboard(ImVec2 atW) {
 
 #else // SDL3 paste — same priority order: shapes > PNG > files > plain text
 
-// "file:///home/a%20b/c.png" → "/home/a b/c.png" (empty when not a local file)
-static std::string uri_to_path(const std::string& uri) {
-    if (uri.rfind("file://", 0) != 0) return "";
-    std::string p = uri.substr(7);
-    size_t sl = p.find('/');                    // strip a host part (file://host/…)
-    if (sl == std::string::npos) return "";
-    if (sl != 0) p = p.substr(sl);
-    std::string out;
-    for (size_t i = 0; i < p.size(); i++) {
-        if (p[i] == '%' && i + 2 < p.size() && isxdigit((unsigned char)p[i+1]) && isxdigit((unsigned char)p[i+2])) {
-            out += (char)strtol(p.substr(i + 1, 2).c_str(), nullptr, 16);
-            i += 2;
-        } else out += p[i];
-    }
-    return out;
-}
 
 static void paste_clipboard(ImVec2 atW) {
     if (SDL_HasClipboardData(kMimeShapes)) {                   // 1) our own shapes
@@ -3648,7 +3650,7 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
             float screenW = fabsf(mx.x - mn.x);
             float screenH = fabsf(mx.y - mn.y);
             if (mk == MK_STILL) {
-                if (!g_interactiveFrame) {
+                if (!g_interactiveFrame || g_headless) {
                     Tex* t = get_image_tex(s.asset);
                     srv = (screenW <= 512.f && screenH <= 512.f && t->thumbSrv) ? t->thumbSrv : t->srv;
                 } else {
@@ -6392,6 +6394,7 @@ int main(int argc, char** argv) {
     const char* shotPath = nullptr; int shotFrames = 8;
     const char* exportPng = nullptr; const char* exportTxt = nullptr;
     std::string boardArg; bool forcePicker = false;
+    const char* dropPath = nullptr;
     uint64_t editId = 0;   // dev: open the text editor on this shape (headless editor shots)
     uint64_t selId = 0;    // dev: select this shape (headless selection-UI shots)
     bool haveMarquee = false; WRect devMarquee;   // dev: replay a world-space marquee
@@ -6422,6 +6425,7 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--bs") && i + 1 < argc) bsFrame = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--enter") && i + 1 < argc) enterFrame = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--drop") && i + 1 < argc) dropPath = argv[++i];
         else if (!strcmp(argv[i], "--caret") && i + 1 < argc) caretIdx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--profile")) {
             g_profile = true;
@@ -6606,6 +6610,10 @@ int main(int argc, char** argv) {
             }
         }
         ImGui::NewFrame();
+        if (dropPath && framesDone == 2) {
+            import_files_at({ dropPath }, S2W(ImVec2(800, 500)));
+            dropPath = nullptr;
+        }
         if (panY != 0.f) g_cam.pan.y += panY;
 
 #ifdef TEI_LIBAV
@@ -6715,8 +6723,8 @@ int main(int argc, char** argv) {
         }
         g_imgWorkers.clear();
     }
-    save_board_now();
-    save_settings();
+    if (!headless && !g_profile) save_board_now();
+    if (!headless && !g_profile) save_settings();
     g_boardLock.release();   // after the final save: another instance may now open it
 #ifdef _WIN32
     ImGui_ImplDX11_Shutdown();
