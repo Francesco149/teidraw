@@ -8,3 +8,6 @@ result-*
 
 # local scratch boards / user data
 /scratch/
+
+# vendored / fallback libraries
+/third_party/

@@ -34,7 +34,10 @@
 #include <sys/stat.h>    // mkdir
 #include <unistd.h>      // access
 #include <stdlib.h>      // realpath
+#include <dlfcn.h>
+#include <glob.h>
 #endif
+#include <deque>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -90,7 +93,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 struct ProfSection { double sum = 0, max = 0; int n = 0; };
 static const int kProfWindow = 180;
 struct ProfState {
-    ProfSection frame, draw, video, overlay, drain, sweep, chrome, present, input;
+    ProfSection frame, draw, video, overlay, drain, sweep, chrome, render, present, input;
     int decOpens = 0, decEvicts = 0;       // window/run totals (UI thread)
     double decOpenMs = 0, decOpenMax = 0;  // ffmpeg decoder open cost (the eviction hitch)
     int visVideos = 0, playVideos = 0;     // window sums (avg = /frames)
@@ -1360,8 +1363,59 @@ static TexH make_rgba_tex(const unsigned char* px, int w, int h) {
 static void tex_destroy(TexH t) { if (t) SDL_DestroyTexture(t); }
 #endif
 
-struct Tex { TexH srv = nullptr; int w = 0, h = 0; };
+struct Tex {
+    TexH srv = nullptr;       // full-resolution GPU texture
+    TexH thumbSrv = nullptr;  // thumbnail GPU texture (LOD)
+    int w = 0, h = 0;         // source dimensions
+    int tw = 0, th = 0;       // thumbnail dimensions
+    bool loading = false;     // in-flight on background worker
+    bool failed = false;
+    uint64_t lastDrawnFrame = 0;
+};
 static std::map<std::string, Tex> g_texCache;   // project-relative asset path → tex
+
+// Fast, high-quality area box-filter downsampling for RGBA image buffers
+static void downsample_box(const unsigned char* src, int sw, int sh,
+                           unsigned char* dst, int dw, int dh) {
+    if (!src || !dst || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+    float x_ratio = (float)sw / (float)dw;
+    float y_ratio = (float)sh / (float)dh;
+
+    for (int dy = 0; dy < dh; dy++) {
+        int sy0 = (int)(dy * y_ratio);
+        int sy1 = (int)((dy + 1) * y_ratio);
+        if (sy1 > sh) sy1 = sh;
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+
+        unsigned char* dst_row = dst + dy * dw * 4;
+
+        for (int dx = 0; dx < dw; dx++) {
+            int sx0 = (int)(dx * x_ratio);
+            int sx1 = (int)((dx + 1) * x_ratio);
+            if (sx1 > sw) sx1 = sw;
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+
+            int count = (sy1 - sy0) * (sx1 - sx0);
+            int r_sum = 0, g_sum = 0, b_sum = 0, a_sum = 0;
+
+            for (int sy = sy0; sy < sy1; sy++) {
+                const unsigned char* src_pix = src + (sy * sw + sx0) * 4;
+                for (int sx = sx0; sx < sx1; sx++) {
+                    r_sum += src_pix[0];
+                    g_sum += src_pix[1];
+                    b_sum += src_pix[2];
+                    a_sum += src_pix[3];
+                    src_pix += 4;
+                }
+            }
+
+            dst_row[dx * 4 + 0] = (unsigned char)(r_sum / count);
+            dst_row[dx * 4 + 1] = (unsigned char)(g_sum / count);
+            dst_row[dx * 4 + 2] = (unsigned char)(b_sum / count);
+            dst_row[dx * 4 + 3] = (unsigned char)(a_sum / count);
+        }
+    }
+}
 
 enum MediaKind { MK_STILL = 0, MK_GIF, MK_VIDEO };
 static std::string lower_ext(const std::string& p) {
@@ -1383,16 +1437,240 @@ static bool is_media_ext(const std::string& p) {
     return false;
 }
 
+// ── async image loader worker pool ──
+struct ImgReq {
+    std::string asset;
+    std::string path;
+    unsigned gen = 0;
+};
+
+struct ImgRes {
+    std::string asset;
+    unsigned gen = 0;
+    int w = 0, h = 0;
+    int tw = 0, th = 0;
+    unsigned char* fullPx = nullptr;
+    unsigned char* thumbPx = nullptr;
+    bool ok = false;
+};
+
+static std::mutex g_imgMx;
+static std::condition_variable g_imgCv;
+static std::deque<ImgReq> g_imgWant;
+static std::unordered_set<std::string> g_imgInFlight;
+static std::vector<ImgRes> g_imgDone;
+static unsigned g_imgGen = 0;
+static bool g_imgQuit = false;
+static std::vector<std::thread> g_imgWorkers;
+
+static void img_worker() {
+    for (;;) {
+        ImgReq req;
+        {
+            std::unique_lock<std::mutex> lk(g_imgMx);
+            g_imgCv.wait(lk, [] { return g_imgQuit || !g_imgWant.empty(); });
+            if (g_imgQuit) return;
+            req = std::move(g_imgWant.front());
+            g_imgWant.pop_front();
+        }
+
+        ImgRes res;
+        res.asset = req.asset;
+        res.gen = req.gen;
+
+        int w = 0, h = 0, n = 0;
+        unsigned char* px = stbi_load(req.path.c_str(), &w, &h, &n, 4);
+        if (px) {
+            res.ok = true;
+            res.w = w; res.h = h;
+            res.fullPx = px;
+
+            const int kMaxThumb = 512;
+            int tw = w, th = h;
+            if (tw > kMaxThumb || th > kMaxThumb) {
+                if (tw >= th) {
+                    th = std::max(1, (int)roundf((float)h * kMaxThumb / (float)w));
+                    tw = kMaxThumb;
+                } else {
+                    tw = std::max(1, (int)roundf((float)w * kMaxThumb / (float)h));
+                    th = kMaxThumb;
+                }
+            }
+            res.tw = tw; res.th = th;
+            if (tw < w || th < h) {
+                unsigned char* thumb = (unsigned char*)malloc(tw * th * 4);
+                if (thumb) {
+                    downsample_box(px, w, h, thumb, tw, th);
+                    res.thumbPx = thumb;
+                }
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(g_imgMx);
+            g_imgInFlight.erase(req.asset);
+            g_imgDone.push_back(std::move(res));
+        }
+    }
+}
+
+static void ensure_img_workers() {
+    if (!g_imgWorkers.empty()) return;
+    unsigned int n = std::thread::hardware_concurrency();
+    if (n < 2) n = 2;
+    if (n > 4) n = 4;
+    for (unsigned int i = 0; i < n; i++) {
+        g_imgWorkers.emplace_back(img_worker);
+    }
+}
+
+struct PendingUpload {
+    std::string asset;
+    unsigned gen = 0;
+    int w = 0, h = 0;
+    int tw = 0, th = 0;
+    unsigned char* fullPx = nullptr;
+    unsigned char* thumbPx = nullptr;
+    bool ok = false;
+};
+static std::deque<PendingUpload> g_imgPendingUpload;
+
+static void drain_image_results() {
+    std::vector<ImgRes> done;
+    {
+        std::lock_guard<std::mutex> lk(g_imgMx);
+        done.swap(g_imgDone);
+    }
+    for (auto& r : done) {
+        if (r.gen != g_imgGen) {
+            if (r.fullPx) stbi_image_free(r.fullPx);
+            if (r.thumbPx) free(r.thumbPx);
+            continue;
+        }
+        g_imgPendingUpload.push_back({ r.asset, r.gen, r.w, r.h, r.tw, r.th, r.fullPx, r.thumbPx, r.ok });
+    }
+
+    int fullUploadBudget = 2;
+
+    while (!g_imgPendingUpload.empty()) {
+        auto& item = g_imgPendingUpload.front();
+        if (item.gen != g_imgGen) {
+            if (item.fullPx) stbi_image_free(item.fullPx);
+            if (item.thumbPx) free(item.thumbPx);
+            g_imgPendingUpload.pop_front();
+            continue;
+        }
+
+        Tex& t = g_texCache[item.asset];
+        t.w = item.w; t.h = item.h;
+        t.tw = item.tw; t.th = item.th;
+        t.loading = false;
+
+        if (!item.ok) {
+            t.failed = true;
+            g_imgPendingUpload.pop_front();
+            continue;
+        }
+
+        if (!t.thumbSrv) {
+            const unsigned char* tp = item.thumbPx ? item.thumbPx : item.fullPx;
+            t.thumbSrv = make_rgba_tex(tp, item.tw, item.th);
+        }
+        if (item.thumbPx) { free(item.thumbPx); item.thumbPx = nullptr; }
+
+        if (fullUploadBudget > 0 && item.fullPx) {
+            if (!t.srv) {
+                t.srv = make_rgba_tex(item.fullPx, item.w, item.h);
+            }
+            stbi_image_free(item.fullPx);
+            item.fullPx = nullptr;
+            fullUploadBudget--;
+            g_imgPendingUpload.pop_front();
+        } else if (!item.fullPx) {
+            g_imgPendingUpload.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+static TexH get_image_srv(const std::string& asset, float screenW, float screenH) {
+    auto it = g_texCache.find(asset);
+    if (it == g_texCache.end()) {
+        ensure_img_workers();
+        Tex& t = g_texCache[asset];
+        t.loading = true;
+        std::string path = g_projDir + "/" + asset;
+        {
+            std::lock_guard<std::mutex> lk(g_imgMx);
+            if (!g_imgInFlight.count(asset)) {
+                g_imgInFlight.insert(asset);
+                g_imgWant.push_back({ asset, path, g_imgGen });
+                g_imgCv.notify_one();
+            }
+        }
+        return nullptr;
+    }
+
+    Tex& t = it->second;
+    t.lastDrawnFrame = ImGui::GetFrameCount();
+    if (t.failed) return nullptr;
+    if (t.loading && !t.thumbSrv && !t.srv) return nullptr;
+
+    if (screenW <= 512.f && screenH <= 512.f && t.thumbSrv) {
+        return t.thumbSrv;
+    }
+
+    if (t.srv) return t.srv;
+    if (t.thumbSrv) return t.thumbSrv;
+
+    return nullptr;
+}
+
 static Tex* get_image_tex(const std::string& asset) {
     auto it = g_texCache.find(asset);
-    if (it != g_texCache.end()) return &it->second;
-    Tex t;
+    if (it != g_texCache.end() && (it->second.srv || it->second.failed)) return &it->second;
+
+    Tex& t = g_texCache[asset];
+    if (t.srv) return &t;
+
     std::string path = g_projDir + "/" + asset;
     int w = 0, h = 0, n = 0;
     unsigned char* px = stbi_load(path.c_str(), &w, &h, &n, 4);
-    if (px) { t.srv = make_rgba_tex(px, w, h); t.w = w; t.h = h; stbi_image_free(px); }
-    g_texCache[asset] = t;    // failures cached too — no per-frame retry spam
-    return &g_texCache[asset];
+    if (px) {
+        t.w = w; t.h = h;
+        t.srv = make_rgba_tex(px, w, h);
+
+        const int kMaxThumb = 512;
+        int tw = w, th = h;
+        if (tw > kMaxThumb || th > kMaxThumb) {
+            if (tw >= th) {
+                th = std::max(1, (int)roundf((float)h * kMaxThumb / (float)w));
+                tw = kMaxThumb;
+            } else {
+                tw = std::max(1, (int)roundf((float)w * kMaxThumb / (float)h));
+                th = kMaxThumb;
+            }
+        }
+        t.tw = tw; t.th = th;
+        if (tw < w || th < h) {
+            unsigned char* thumb = (unsigned char*)malloc(tw * th * 4);
+            if (thumb) {
+                downsample_box(px, w, h, thumb, tw, th);
+                t.thumbSrv = make_rgba_tex(thumb, tw, th);
+                free(thumb);
+            }
+        } else {
+            t.thumbSrv = t.srv;
+        }
+        stbi_image_free(px);
+        t.loading = false;
+        t.failed = false;
+    } else {
+        t.failed = true;
+        t.loading = false;
+    }
+    return &t;
 }
 
 #ifdef _WIN32
@@ -1657,7 +1935,7 @@ static void prof_print_summary() {
     fprintf(stderr, "prof: %d frames\n", g_pw.frames);
     sec("frame", g_pw.frame); sec("draw", g_pw.draw); sec("video", g_pw.video);
     sec("drain", g_pw.drain); sec("overlay", g_pw.overlay); sec("sweep", g_pw.sweep);
-    sec("chrome", g_pw.chrome); sec("present", g_pw.present); sec("input", g_pw.input);
+    sec("chrome", g_pw.chrome); sec("render", g_pw.render); sec("present", g_pw.present); sec("input", g_pw.input);
     fprintf(stderr, "  decoders %zu resident | %d opens (avg %.2f ms, max %.1f ms) | %d evicts\n",
             g_decoders.size(), g_pw.decOpens,
             g_pw.decOpens ? g_pw.decOpenMs / g_pw.decOpens : 0.0, g_pw.decOpenMax, g_pw.decEvicts);
@@ -2203,6 +2481,13 @@ static void sweep_play_states() {
     for (auto it = g_extCache.begin(); it != g_extCache.end();) {
         if (!find_shape(it->first)) it = g_extCache.erase(it);
         else ++it;
+    }
+    uint64_t curFrame = ImGui::GetFrameCount();
+    for (auto& [asset, t] : g_texCache) {
+        if (t.srv && t.thumbSrv && t.srv != t.thumbSrv && curFrame > t.lastDrawnFrame + 600) {
+            tex_destroy(t.srv);
+            t.srv = nullptr;
+        }
     }
 }
 
@@ -2854,8 +3139,23 @@ static bool switch_board(const std::string& dirIn) {
     clear_selection(); g_editText = 0; g_editLabelArrow = 0;
     g_cam = Camera{}; g_camAnim.active = false;
     g_saveDueAt = 0;
-    for (auto& [rel, t] : g_texCache) tex_destroy(t.srv);
+    for (auto& [rel, t] : g_texCache) {
+        if (t.srv) tex_destroy(t.srv);
+        if (t.thumbSrv && t.thumbSrv != t.srv) tex_destroy(t.thumbSrv);
+    }
     g_texCache.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_imgMx);
+        g_imgGen++;
+        g_imgWant.clear();
+        g_imgInFlight.clear();
+        g_imgDone.clear();
+    }
+    for (auto& p : g_imgPendingUpload) {
+        if (p.fullPx) stbi_image_free(p.fullPx);
+        if (p.thumbPx) free(p.thumbPx);
+    }
+    g_imgPendingUpload.clear();
     for (auto& [id, ps] : g_play) ps.release();
     g_play.clear();
     g_extCache.clear();
@@ -3308,13 +3608,19 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
     } else groupBiggest.clear();
     for (auto& s : g_doc.shapes) {
         if (s.id == skipId || s.type == SH_GROUP || !in_only(s.id)) continue;
-        WRect b = shape_bounds(s);
-        if (s.type == SH_ARROW && s.bend != 0.f) {
-            // a bent curve bulges past the endpoint box: include the bezier
-            // control point (the curve stays inside hull(A, C, B))
-            ImVec2 A = arrow_end_pos(s.a), B = arrow_end_pos(s.b);
-            ImVec2 ch = B - A; float cl = vlen(ch);
-            if (cl > 0.0001f) b.include((A + B) * 0.5f + ImVec2(-ch.y / cl, ch.x / cl) * (2.f * s.bend));
+        WRect b;
+        if (s.type == SH_IMAGE && s.rot == 0.f) {
+            b.mn = s.pos;
+            b.mx = s.pos + s.size;
+        } else {
+            b = shape_bounds(s);
+            if (s.type == SH_ARROW && s.bend != 0.f) {
+                // a bent curve bulges past the endpoint box: include the bezier
+                // control point (the curve stays inside hull(A, C, B))
+                ImVec2 A = arrow_end_pos(s.a), B = arrow_end_pos(s.b);
+                ImVec2 ch = B - A; float cl = vlen(ch);
+                if (cl > 0.0001f) b.include((A + B) * 0.5f + ImVec2(-ch.y / cl, ch.x / cl) * (2.f * s.bend));
+            }
         }
         if (b.mx.x < view.mn.x || b.mn.x > view.mx.x || b.mx.y < view.mn.y || b.mn.y > view.mx.y) continue;
         switch (s.type) {
@@ -3339,15 +3645,31 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
             if ((mx.x - mn.x) < kMediaGrayPx && !is_selected(s.id)) { draw_gray_box(dl, s); break; }
             TexH srv = nullptr;
             MediaKind mk = media_kind(s.asset);
-            if (mk == MK_STILL) srv = get_image_tex(s.asset)->srv;
+            float screenW = fabsf(mx.x - mn.x);
+            float screenH = fabsf(mx.y - mn.y);
+            if (mk == MK_STILL) {
+                if (!g_interactiveFrame) {
+                    Tex* t = get_image_tex(s.asset);
+                    srv = (screenW <= 512.f && screenH <= 512.f && t->thumbSrv) ? t->thumbSrv : t->srv;
+                } else {
+                    srv = get_image_srv(s.asset, screenW, screenH);
+                }
+            }
 #ifdef TEI_LIBAV
             else srv = video_srv(s, mk);
 #endif
             ImU32 tint = with_opacity(IM_COL32_WHITE, s.opacity);
             if (srv && s.rot == 0.f) {
-                dl->AddImageRounded((ImTextureID)(intptr_t)srv, mn, mx,
-                                    ImVec2(s.crop.x, s.crop.y), ImVec2(s.crop.z, s.crop.w),
-                                    tint, 5.f);
+                float rpx = 5.f * g_cam.zoom;
+                if (rpx >= 1.0f) {
+                    dl->AddImageRounded((ImTextureID)(intptr_t)srv, mn, mx,
+                                        ImVec2(s.crop.x, s.crop.y), ImVec2(s.crop.z, s.crop.w),
+                                        tint, 5.f);
+                } else {
+                    dl->AddImage((ImTextureID)(intptr_t)srv, mn, mx,
+                                 ImVec2(s.crop.x, s.crop.y), ImVec2(s.crop.z, s.crop.w),
+                                 tint);
+                }
             } else if (srv) {
                 ImVec2 c[4]; shape_obb(s, c);
                 ImVec2 sc[4]; for (int i = 0; i < 4; i++) sc[i] = W2S(c[i]);
@@ -6079,6 +6401,7 @@ int main(int argc, char** argv) {
     int profFrames = 600;  // --profile [N]: headless profiling run (default 600 frames)
     struct QkEv { int frame; ImGuiKey key; bool shift; };   // dev: injected quick-video-control key
     std::vector<QkEv> qkEvs;
+    float panY = 0.f;      // dev: shift camera Y per frame (profiling panning)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
         else if (!strcmp(argv[i], "--export") && i + 1 < argc) exportPng = argv[++i];
@@ -6104,6 +6427,7 @@ int main(int argc, char** argv) {
             g_profile = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') profFrames = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--pan-y") && i + 1 < argc) panY = strtof(argv[++i], nullptr);
         else if (!strcmp(argv[i], "--play")) g_forcePlay = true;   // dev: play state persists headless (profiling)
         else if (!strcmp(argv[i], "--qk") && i + 2 < argc) {
             int f = atoi(argv[++i]);
@@ -6123,7 +6447,7 @@ int main(int argc, char** argv) {
         }
         else if (argv[i][0] != '-') boardArg = argv[i];
     }
-    bool headless = shotPath || exportPng || exportTxt || g_profile;
+    bool headless = shotPath || exportPng || exportTxt;
     g_headless = headless;
     load_settings();
     if (boardArg.empty() && headless && !forcePicker) boardArg = "scratch";
@@ -6144,6 +6468,20 @@ int main(int argc, char** argv) {
     ShowWindow(hwnd, SW_SHOWMAXIMIZED);
     UpdateWindow(hwnd);
 #else
+    if (!headless && !getenv("__EGL_VENDOR_LIBRARY_FILENAMES")) {
+        void* testEgl = dlopen("libEGL_mesa.so.0", RTLD_LAZY);
+        if (testEgl) {
+            dlclose(testEgl);
+        } else {
+            glob_t gl;
+            if (glob("/nix/store/*-mesa-*/share/glvnd/egl_vendor.d/50_mesa.json", 0, nullptr, &gl) == 0) {
+                if (gl.gl_pathc > 0) {
+                    setenv("__EGL_VENDOR_LIBRARY_FILENAMES", gl.gl_pathv[0], 1);
+                }
+                globfree(&gl);
+            }
+        }
+    }
     // Headless runs render on the "offscreen" video driver when it's usable:
     // no window opens, nothing steals focus (the session-9 postmortem), and
     // shots are a deterministic 1600×1000. Falls back to a real window.
@@ -6163,6 +6501,9 @@ int main(int argc, char** argv) {
     if (!g_win) { fprintf(stderr, "teidraw: window failed: %s\n", SDL_GetError()); return 1; }
     g_ren = SDL_CreateRenderer(g_win, nullptr);
     if (!g_ren) { fprintf(stderr, "teidraw: renderer failed: %s\n", SDL_GetError()); return 1; }
+    fprintf(stderr, "teidraw: SDL video driver '%s', renderer '%s'\n",
+            SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "(null)",
+            SDL_GetRendererName(g_ren) ? SDL_GetRendererName(g_ren) : "(null)");
     SDL_SetRenderVSync(g_ren, headless ? 0 : 1);
     {   // window icon from the embedded PNG
         int iw = 0, ih = 0, n = 0;
@@ -6265,10 +6606,12 @@ int main(int argc, char** argv) {
             }
         }
         ImGui::NewFrame();
+        if (panY != 0.f) g_cam.pan.y += panY;
 
 #ifdef TEI_LIBAV
         drain_video_results();   // worker-decoded frames land before the draw pass
 #endif
+        drain_image_results();   // worker-decoded images land before the draw pass
         CanvasFrame();
         DrawContextMenu();
         DrawVideoOverlay();
@@ -6309,17 +6652,18 @@ int main(int argc, char** argv) {
             }
         }
 
-        { ProfScope psec(&g_pw.present);
         ImGui::Render();
 #ifdef _WIN32
         float bg[4] = { 0, 0, 0, 1 };
         g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
         g_ctx->ClearRenderTargetView(g_rtv, bg);
+        { ProfScope psec(&g_pw.render);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-
+        }
+        { ProfScope psec(&g_pw.present);
         g_sc->Present(headless ? 0 : 1, 0);
         framesDone++;
-
+        }
         if (shotPath && framesDone >= shotFrames) {
             bool ok = SaveBackbufferPNG(shotPath);
             fprintf(stderr, "teidraw: shot %s -> %s\n", shotPath, ok ? "ok" : "FAILED");
@@ -6328,17 +6672,20 @@ int main(int argc, char** argv) {
 #else
         SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 255);
         SDL_RenderClear(g_ren);
+        { ProfScope psec(&g_pw.render);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_ren);
+        }
         // SDL reads the backbuffer BEFORE present (D3D reads it after)
         if (shotPath && framesDone + 1 >= shotFrames) {
             bool ok = SaveBackbufferPNG(shotPath);
             fprintf(stderr, "teidraw: shot %s -> %s\n", shotPath, ok ? "ok" : "FAILED");
             done = true;
         }
+        { ProfScope psec(&g_pw.present);
         SDL_RenderPresent(g_ren);
         framesDone++;
-#endif
         }
+#endif
         // queued copy-as-PNG / --export: render offscreen between frames
         if (g_export.active && run_pending_export()) done = true;
 
@@ -6357,6 +6704,17 @@ int main(int argc, char** argv) {
         g_vqWorker.join();
     }
 #endif
+    if (!g_imgWorkers.empty()) {
+        {
+            std::lock_guard<std::mutex> lk(g_imgMx);
+            g_imgQuit = true;
+        }
+        g_imgCv.notify_all();
+        for (auto& w : g_imgWorkers) {
+            if (w.joinable()) w.join();
+        }
+        g_imgWorkers.clear();
+    }
     save_board_now();
     save_settings();
     g_boardLock.release();   // after the final save: another instance may now open it

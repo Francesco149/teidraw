@@ -7,9 +7,9 @@
 # linux target) are set. Fonts and the icon are vendored in ../assets and
 # baked in by tools/embed.py — no runtime files to ship.
 
-IMGUI    ?= $(IMGUI_DIR)
-STBI     ?= $(STB_INC)
-JSON_INC ?= $(NLOHMANN_INC)
+IMGUI    ?= $(if $(IMGUI_DIR),$(IMGUI_DIR),../third_party/imgui)
+STBI     ?= $(if $(STB_INC),$(STB_INC),/usr/include/stb)
+JSON_INC ?= $(if $(NLOHMANN_INC),$(NLOHMANN_INC),/usr/include)
 
 BUILD := ../build
 FONTS_H := $(BUILD)/fonts_embedded.h

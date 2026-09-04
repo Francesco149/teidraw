@@ -1,7 +1,41 @@
 # STATUS — live front
 
-*Updated: 2026-08-13 (session 11). History lives in
+*Updated: 2026-09-04 (session 12). History lives in
 `git log` — this file only describes NOW.*
+
+## Session 12 — image pipeline overhaul: async worker pool + dual-LOD thumbnails + Linux hardware acceleration
+**Async image decoding pool:** synchronous main-thread `stbi_load` was the root
+cause of massive multi-second stutters when scrolling through image-heavy boards
+(e.g. `bainstorm` with 175 1080p PNGs, 65 ms decode per image = 2.5–3.2 s hitch).
+Images now decode asynchronously on a worker thread pool (`g_imgWorkers`, up to 4
+threads). Main thread stays completely unblocked; shapes draw clean placeholder
+boxes while images stream in. Synchronous fallback `get_image_tex()` preserves
+100% deterministic behaviour for `--shot`, `--export`, and clipboard operations.
+**Dual-LOD thumbnail system:** full 1080p RGBA textures (8.3 MB each, 1.45 GB total)
+were swamping GPU memory bandwidth and cache when zoomed out (~278 px on-screen size
+in `bainstorm`). Workers now generate a fast, high-quality area box-filter thumbnail
+(≤512 px max dimension, ~589 KB, 14–55× reduction in bandwidth). Viewport uses
+thumbnail when on-screen dimensions are ≤512 px (sharper minification, zero shimmer,
+dramatically lower cache thrashing) and promotes to full-res when zoomed in.
+**Budgeted main-thread texture uploads:** `drain_image_results()` uploads all
+thumbnails immediately (~0.09 ms each) and paces full-res uploads at 2 per frame
+(~7 ms max) to eliminate upload hitches.
+**LRU texture demotion:** in `sweep_play_states()`, textures off-screen for >600
+frames release their 8.3 MB full-res GPU texture while preserving the 150 KB thumbnail.
+Memory usage on busy boards stays bounded indefinitely.
+**Sub-pixel corner optimization + fast AABB:** in `draw_doc_shapes()`, images with
+sub-pixel screen corner radius (`5.f * zoom < 1.0f`) emit a flat quad (`dl->AddImage`)
+instead of 48-vertex rounded corners (12× geometry reduction). Unrotated images bypass
+trigonometric bounds calculation.
+**Linux Mesa EGL auto-detection:** on native non-NixOS Linux distributions (Arch,
+Ubuntu, etc.), nix-built binaries now auto-detect Mesa EGL vendor configuration so
+Wayland and X11 initialize hardware OpenGL acceleration automatically rather than
+failing driver lookup.
+**Benchmark results (bainstorm board, 600-frame continuous vertical panning):**
+- Average frame time: 102.1 ms (9.8 FPS) → **8.34 ms (120+ FPS)** (12.2× faster)
+- Peak frame time: 3,268 ms → **16.6 ms** (196× reduction, zero multi-second hitches)
+- Draw time average: 13.18 ms → **0.026 ms** (507× faster)
+- Peak draw hitch: 3,141 ms → **1.71 ms** (1,833× reduction)
 
 ## Session 11 — quick video controls + middle-mouse stand-in
 **Quick video controls (issue #2):** with exactly one video selected,`Space` play/pause (persisted, no undo entry — same contract as the pill),
