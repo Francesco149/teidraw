@@ -474,6 +474,14 @@ nix develop --command make -C editor linux      # build/teidraw (SDL3 + OpenGL 3
 ./build/teidraw.exe dir --export out.png        # board bounds → PNG, then exit
 ./build/teidraw.exe dir --export-txt out.txt    # text outline, then exit
 ```
+**Deploys are automatic:** `tools/deploy.sh` refreshes both system-wide
+installs — Linux `/usr/local/bin/teidraw` (the `Mod+Shift+T` bind) and the
+Windows exe at `wslop:/opt/src/teidraw/build/teidraw.exe`, which the Start Menu
+shortcut runs straight out of the wslop checkout over `\\wsl.localhost`. Run it
+after anything that changes `editor/`/`assets/` (commit first — only committed
+history travels). `--check` reports drift only. Next-session optimization
+runway: **`docs/PERF-PLAN.md`**.
+
 Perf harness (session 13): `--profile N` prints the frame breakdown + decode
 stats; add `--novsync` for real frame costs, `--pan-t <px>` to pan down and
 back, `--play` to run videos headless, `--async-img` to exercise the

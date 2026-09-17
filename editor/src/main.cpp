@@ -111,6 +111,7 @@ static bool g_showProf = false;   // F3 overlay
 static bool g_profile = false;    // --profile: no window reset, summary at exit
 static bool g_forcePlay = false;  // --play: honor play flags headless too (profiling decode load)
 static bool g_forceAsyncImg = false;  // --async-img: use the async image path even headless
+static bool g_devHarness = false;     // any dev flag: a benchmark is not a user session
 static std::chrono::steady_clock::time_point g_profStart{};   // --profile run timer
 static double g_profT0 = 0;
 
@@ -4019,7 +4020,10 @@ static bool switch_board(const std::string& dirIn) {
     g_drawId = g_lastDrawId = 0;
     load_board();
     if (!board_exists(dir)) save_board_now();
-    if (!g_headless) note_board_opened(dir);
+    // A perf/craft harness run must not rewrite the user's board history:
+    // "recent boards" is user state, and a benchmark opening 20 throwaway
+    // boards would otherwise evict everything they actually use.
+    if (!g_headless && !g_devHarness) note_board_opened(dir);
 #ifdef _WIN32
     if (g_hwnd) SetWindowTextW(g_hwnd, to_w(board_name(dir) + " — teidraw").c_str());
 #else
@@ -7331,6 +7335,9 @@ int main(int argc, char** argv) {
     }
     bool headless = shotPath || exportPng || exportTxt;
     g_headless = headless;
+    g_devHarness = g_profile || noVsync || panY != 0.f || panTri != 0.f || g_forcePlay ||
+                   g_forceAsyncImg || dropPath || bsFrame >= 0 || enterFrame >= 0 ||
+                   caretIdx >= 0 || editId != 0 || selId != 0 || haveMarquee || forcePicker;
     load_settings();
     if (boardArg.empty() && headless && !forcePicker) boardArg = "scratch";
     if (boardArg.empty() && !forcePicker && !g_recentBoards.empty()) boardArg = g_recentBoards[0];

@@ -81,6 +81,23 @@ nix develop --command make -C editor linux    # → build/teidraw (native SDL3)
 ./build/teidraw.exe dir --export out.png       # render board bounds → PNG, exit
 ./build/teidraw.exe dir --export-txt out.txt   # reading-order text outline, exit
 ```
+
+**Deploy the two system-wide installs after every change under `editor/` or
+`assets/` — automatically, without being asked** (the user runs both installs
+daily and should never be handed a stale binary):
+
+```sh
+tools/deploy.sh            # Linux install + Windows exe + verify both
+tools/deploy.sh --check    # drift report only
+```
+
+- **Linux**: `/usr/local/bin/teidraw` — what the `teidraw` command and the
+  niri `Mod+Shift+T` bind launch.
+- **Windows**: `<wslop>:/opt/src/teidraw/build/teidraw.exe` — the Start Menu
+  shortcut runs it out of the wslop checkout over `\\wsl.localhost`, so it must
+  be *built there*, from synced history. The script bundles `HEAD`, resets the
+  wslop checkout onto it (keeping its gitignored `third_party/`), and rebuilds.
+- Commit before deploying: only committed history travels.
 Verify visually with `--shot` + Read the PNG. `scratch/` is the gitignored test
 board. `make -C editor shot` does the same (`shot-linux` for the SDL build —
 truly headless via SDL's offscreen driver, no window/focus steal; prefer it
@@ -89,12 +106,15 @@ for render-only checks).
 ## Conventions
 - Everything runs inside `nix develop` (`command not found` ⇒ you forgot it).
 - Commit logical units as you go; build + `--shot` first. No `git add -A` on
-  mixed trees. Push only when asked (no remote yet).
+  mixed trees. `origin` is `git@github.com:Francesco149/teidraw.git` now — push
+  only when asked; the wslop checkout is synced by `tools/deploy.sh`.
 - Durable knowledge → `docs/`; update docs in the same change that makes them
   stale. `docs/STATUS.md` is the live front — keep it current.
 - Co-author line on commits: `Co-Authored-By: Claude <model> <noreply@anthropic.com>`.
 
 ## Where to read next
 - **Current state + next task (READ FIRST): `docs/STATUS.md`**
+- **Perf frontier + how to measure: `docs/PERF-PLAN.md`** (deploy rule, the
+  in-repo harness, baselines to beat, ranked remaining work)
 - Phase plan: `docs/ROADMAP.md`
 - Design + rationale: `docs/ARCHITECTURE.md`
