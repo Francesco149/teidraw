@@ -54,6 +54,14 @@ Decoder cache residency is soft-capped (only decoders idle ≥300 frames are
 dropped, hard ceiling 40) — a 24-video view used to evict/re-open ~40 decoders
 per run, now it opens 24 and evicts 0.
 
+**Filtering choice (checked, not assumed).** Minification is box-filtered mips
++ trilinear + 8× anisotropy. Compared at an exact 2:1 framebuffer ratio against
+a Lanczos reference: the mip render is ~35 % lower in high-frequency energy but
+shows no ringing, while the Lanczos reference visibly moirés the screentone dot
+fields and over-darkens the hatch panels. Box mips are the faithful downscale;
+chasing the metric with a LOD bias or a sharper kernel would trade motion
+shimmer for acutance. Magnification always samples level 0 (unchanged).
+
 **Numbers (1600×1000, iGPU).** *Linux*: `indonesia` 12.6 → 1.3 ms/frame; 24
 playing videos 7.6 → 0.76 ms and 8.44 ms (= one vblank) in the live window,
 667 decodes/s, zero spikes over 4000 frames. *Windows/wslop*: 24 playing videos
