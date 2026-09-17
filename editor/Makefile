@@ -99,7 +99,7 @@ LIN_RPATH := $(patsubst -L%,-Wl$(,)-rpath$(,)%,$(filter -L%,$(SDL3_LIBS) $(LIN_F
 OBJL      := $(BUILD)/obj-linux
 LINUX_OUT := $(BUILD)/teidraw
 
-LINUX_BACKENDS := imgui_impl_sdl3.cpp imgui_impl_sdlrenderer3.cpp
+LINUX_BACKENDS := imgui_impl_sdl3.cpp imgui_impl_opengl3.cpp
 LINUX_IMGUI_OBJ := $(addprefix $(OBJL)/,$(IMGUI_CORE:.cpp=.o) $(LINUX_BACKENDS:.cpp=.o) $(IMGUI_MISC:.cpp=.o))
 LINUX_OBJ := $(OBJL)/main.o $(LINUX_IMGUI_OBJ)
 

@@ -64,7 +64,7 @@
 #include "imgui_impl_dx11.h"
 #else
 #include "imgui_impl_sdl3.h"
-#include "imgui_impl_sdlrenderer3.h"
+#include "imgui_impl_opengl3.h"
 #endif
 #include "misc/cpp/imgui_stdlib.h"
 
@@ -98,12 +98,14 @@ struct ProfState {
     double decOpenMs = 0, decOpenMax = 0;  // ffmpeg decoder open cost (the eviction hitch)
     int visVideos = 0, playVideos = 0;     // window sums (avg = /frames)
     int queueDepth = 0;                    // decode queue depth at drain (window max)
+    long long cmds = 0, vtx = 0;           // ImGui draw-data shape (sums over the run)
     int frames = 0;
 };
 static ProfState g_pw;
 static bool g_showProf = false;   // F3 overlay
 static bool g_profile = false;    // --profile: no window reset, summary at exit
 static bool g_forcePlay = false;  // --play: honor play flags headless too (profiling decode load)
+static bool g_forceAsyncImg = false;  // --async-img: use the async image path even headless
 
 struct ProfScope {
     ProfSection* s; std::chrono::steady_clock::time_point t0;
@@ -116,6 +118,16 @@ struct ProfScope {
 
 static void prof_end_frame() {
     if (++g_pw.frames >= kProfWindow && !g_profile) g_pw = ProfState{};
+}
+
+// one draw call costs a state change + a GPU draw on every backend, so the
+// summary carries the frame's draw-data shape (fewer, fatter cmds = better)
+static void prof_note_drawdata(ImDrawData* dd) {
+    if (!dd) return;
+    for (int i = 0; i < dd->CmdListsCount; i++) {
+        g_pw.cmds += dd->CmdLists[i]->CmdBuffer.Size;
+        g_pw.vtx += dd->CmdLists[i]->VtxBuffer.Size;
+    }
 }
 
 // ───────────────────────────── small math bits ─────────────────────────────
@@ -240,36 +252,86 @@ static bool SaveBackbufferPNG(const char* path) {
     return ok && stbi_write_png(path, w, h, 4, px.data(), w * 4) != 0;
 }
 
-#else // ─────────────────────── SDL3 window / renderer ───────────────────────
-// Linux backend: SDL3 window + SDL_Renderer (SDL picks GL/Vulkan; vsynced
-// present). The whole canvas layer only touches textures through the helpers
-// below, so the two backends stay drop-in equivalent.
-static SDL_Window*   g_win = nullptr;
-static SDL_Renderer* g_ren = nullptr;
+#else // ───────────────── SDL3 window + OpenGL 3.3 core ─────────────────────
+// Linux backend: SDL3 owns window/input/clipboard/audio/dialogs; rendering is
+// direct OpenGL through imgui_impl_opengl3. SDL_Renderer was dropped on
+// purpose — its GL path re-uploads the whole vertex buffer *per draw command*
+// (measured ≈62 µs/cmd at ~30k verts: 11.5 ms/frame on a text-heavy board)
+// and it exposes no texture filtering, so mipmaps/anisotropy — the answer to
+// both minification quality and texture bandwidth — were unreachable.
+//
+// GL entry points come from gl_min.h (SDL_GL_GetProcAddress): no GL headers,
+// no -lGL, nothing new to install. imgui_impl_opengl3.cpp carries its own
+// loader for its own subset; the two never share a TU.
+#include "gl_min.h"
+GlMinProcs g_glprocs;
 
-// Read the CURRENT render target (backbuffer or an offscreen target) back as
-// opaque RGBA8. Unlike D3D's post-Present readback, SDL must read BEFORE
-// RenderPresent — call sites order accordingly.
-static bool read_target_rgba(std::vector<unsigned char>& px, int& w, int& h) {
-    SDL_Surface* s = SDL_RenderReadPixels(g_ren, nullptr);
-    if (!s) return false;
-    SDL_Surface* c = SDL_ConvertSurface(s, SDL_PIXELFORMAT_RGBA32);
-    SDL_DestroySurface(s);
-    if (!c) return false;
-    w = c->w; h = c->h;
+static SDL_Window*   g_win = nullptr;
+static SDL_GLContext g_glctx = nullptr;
+static int g_fbW = 0, g_fbH = 0;         // framebuffer size (pixels)
+static int g_maxAniso = 1;               // GL_EXT_texture_filter_anisotropic max, 1 = unsupported
+
+// EGL vendor JSON selection — must run BEFORE anything touches EGL (SDL_Init
+// included): glvnd resolves its vendor list exactly once per process, so a
+// failed first attempt can never be retried in-process. A nix-built binary
+// resolves libEGL from the nix store on non-NixOS hosts, and *that* glvnd's
+// built-in vendor dir is empty — it needs the Mesa JSON that shipped with the
+// same store (dlopen("libEGL_mesa.so.0") does find the system one, so this is
+// not a library-availability problem, it is vendor *registration*).
+static void setup_egl_vendor() {
+    if (getenv("__EGL_VENDOR_LIBRARY_FILENAMES")) return;   // user knows best
+    void* egl = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (!egl) return;
+    Dl_info info = {};
+    const char* lib = (dladdr((void*)dlsym(egl, "eglGetDisplay"), &info) && info.dli_fname) ? info.dli_fname : "";
+    bool nixEgl = strstr(lib, "/nix/store/") != nullptr;
+    dlclose(egl);
+    const char* pattern = nixEgl
+        ? "/nix/store/*-mesa-*/share/glvnd/egl_vendor.d/50_mesa.json"
+        : "/usr/share/glvnd/egl_vendor.d/50_mesa.json";
+    glob_t gl;
+    if (glob(pattern, 0, nullptr, &gl) == 0) {
+        if (gl.gl_pathc > 0) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", gl.gl_pathv[0], 1);
+        globfree(&gl);
+    }
+}
+
+static void gl_detect_limits() {
+    const GLubyte* ext = nullptr;
+    int n = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS_, &n);
+    for (int i = 0; i < n && !ext; i++) {
+        const char* e = (const char*)glGetStringi(GL_EXTENSIONS_, (GLuint)i);
+        if (e && strstr(e, "GL_EXT_texture_filter_anisotropic")) ext = (const GLubyte*)e;
+    }
+    if (ext) {
+        GLfloat m = 1.f;
+        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT_, &m);
+        g_maxAniso = (int)m;
+    }
+}
+
+// Read the current framebuffer back as opaque RGBA8, top-down rows (GL's
+// origin is bottom-left, so rows flip here — every caller wants the same
+// top-down layout the D3D path produces).
+static bool read_fb_rgba(int w, int h, std::vector<unsigned char>& px) {
+    if (w <= 0 || h <= 0) return false;
     px.resize((size_t)w * h * 4);
-    for (int y = 0; y < h; y++)
-        memcpy(&px[(size_t)y * w * 4], (unsigned char*)c->pixels + (size_t)y * c->pitch, (size_t)w * 4);
-    SDL_DestroySurface(c);
+    glPixelStorei(GL_PACK_ALIGNMENT_, 1);
+    glReadPixels(0, 0, w, h, GL_RGBA_, GL_UNSIGNED_BYTE_, px.data());
+    size_t row = (size_t)w * 4;
+    for (int y = 0; y < h / 2; y++)
+        for (size_t i = 0; i < row; i++) std::swap(px[(size_t)y * row + i], px[(size_t)(h - 1 - y) * row + i]);
     for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;   // force opaque alpha
     return true;
 }
 
-// --shot path: reads the drawn frame (call between RenderDrawData and Present)
+// --shot path: the frame is still in the default framebuffer (nothing has
+// swapped yet — SDL reads before present too).
 static bool SaveBackbufferPNG(const char* path) {
-    std::vector<unsigned char> px; int w = 0, h = 0;
-    return read_target_rgba(px, w, h) &&
-           stbi_write_png(path, w, h, 4, px.data(), w * 4) != 0;
+    std::vector<unsigned char> px;
+    return read_fb_rgba(g_fbW, g_fbH, px) &&
+           stbi_write_png(path, g_fbW, g_fbH, 4, px.data(), g_fbW * 4) != 0;
 }
 #endif
 
@@ -1321,6 +1383,7 @@ static void reorder_selected(bool front) {
 #ifdef _WIN32
 static HWND g_hwnd = nullptr;
 typedef ID3D11ShaderResourceView* TexH;
+static const TexH kNoTex = nullptr;
 
 static std::wstring to_w(const std::string& s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
@@ -1350,29 +1413,78 @@ static TexH make_rgba_tex(const unsigned char* px, int w, int h) {
 }
 static void tex_destroy(TexH t) { if (t) t->Release(); }
 #else
-typedef SDL_Texture* TexH;
+typedef unsigned TexH;   // GL texture name (0 = none)
+static const TexH kNoTex = 0;
+
+// Sampling mode is per-texture in GL, so this is where the quality/perf
+// contract lives: a full mip chain + trilinear + anisotropy is what makes
+// minified pages crisp and cheap (no shimmer, no bandwidth blowup); a
+// single-level texture is for streaming media (each frame replaces level 0).
+static void tex_set_params(bool mips) {
+    glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_S_, GL_CLAMP_TO_EDGE_);
+    glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_T_, GL_CLAMP_TO_EDGE_);
+    glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_, GL_LINEAR_);
+    glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, mips ? GL_LINEAR_MIPMAP_LINEAR_ : GL_LINEAR_);
+    if (mips && g_maxAniso > 1)
+        glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAX_ANISOTROPY_EXT_, g_maxAniso > 8 ? 8 : g_maxAniso);
+}
 
 static TexH make_rgba_tex(const unsigned char* px, int w, int h) {
-    SDL_Texture* t = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, w, h);
-    if (!t) return nullptr;
-    SDL_UpdateTexture(t, nullptr, px, w * 4);
-    SDL_SetTextureScaleMode(t, SDL_SCALEMODE_LINEAR);
-    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    TexH t = 0;
+    glGenTextures(1, &t);
+    if (!t) return 0;
+    glBindTexture(GL_TEXTURE_2D_, t);
+    glPixelStorei(GL_UNPACK_ALIGNMENT_, 1);
+    glTexImage2D(GL_TEXTURE_2D_, 0, GL_RGBA8_, w, h, 0, GL_RGBA_, GL_UNSIGNED_BYTE_, px);
+    glGenerateMipmap(GL_TEXTURE_2D_);
+    tex_set_params(true);
     return t;
 }
-static void tex_destroy(TexH t) { if (t) SDL_DestroyTexture(t); }
+
+static void tex_destroy(TexH t) { if (t) glDeleteTextures(1, &t); }
 #endif
 
+// One decoded still, resident in two GPU textures:
+//   srv     full detail, with a mip chain (trilinear + anisotropy): crisp at
+//           every zoom and cheap to minify — the mip chain is why a zoomed-out
+//           board no longer samples 8 MB textures.
+//   lowSrv  a small always-resident LOD (~≤256 px, own mip chain) so a shape
+//           whose full texture was evicted still draws something sharp-ish
+//           while it re-streams.
+// srv is *evictable* under a byte budget (LRU); lowSrv never is. The old
+// design dropped the full texture after 600 undrawn frames and never
+// requested it again, so any image that scrolled off for ten seconds came
+// back permanently stuck at 512 px — the "blurry manga" report.
 struct Tex {
-    TexH srv = nullptr;       // full-resolution GPU texture
-    TexH thumbSrv = nullptr;  // thumbnail GPU texture (LOD)
+    TexH srv = kNoTex;        // full-detail texture (mip chain)
+    TexH lowSrv = kNoTex;     // low-LOD texture (mip chain), always resident
     int w = 0, h = 0;         // source dimensions
-    int tw = 0, th = 0;       // thumbnail dimensions
+    int lw = 0, lh = 0;       // low-LOD dimensions
     bool loading = false;     // in-flight on background worker
     bool failed = false;
     uint64_t lastDrawnFrame = 0;
 };
 static std::map<std::string, Tex> g_texCache;   // project-relative asset path → tex
+
+// GPU bytes held by each resident level (mip chains add ~1/3).
+static size_t g_texFullBytes = 0, g_texLowBytes = 0;
+static size_t tex_full_bytes(const Tex& t) { return t.srv ? (size_t)t.w * t.h * 4 * 4 / 3 : 0; }
+static size_t tex_low_bytes(const Tex& t) { return t.lowSrv ? (size_t)t.lw * t.lh * 4 * 4 / 3 : 0; }
+// Evictable full-detail budget. Board-sized boards (175×1080p ≈ 1.9 GB of
+// level 0) stay bounded; the always-resident LODs cost ~4% of that.
+// TEIDRAW_TEX_BUDGET_MB overrides it (low-VRAM machines, and tests that need
+// eviction to actually happen).
+static const size_t kTexBudgetBytes = 768u << 20;
+static size_t tex_budget_bytes() {
+    static const size_t budget = [] {
+        const char* e = getenv("TEIDRAW_TEX_BUDGET_MB");
+        long mb = e ? atol(e) : 0;
+        return mb > 0 ? (size_t)mb << 20 : kTexBudgetBytes;
+    }();
+    return budget;
+}
+// Low-LOD target: the longest side of the always-resident copy.
+static const int kLowLodMax = 256;
 
 // Fast, high-quality area box-filter downsampling for RGBA image buffers
 static void downsample_box(const unsigned char* src, int sw, int sh,
@@ -1448,9 +1560,9 @@ struct ImgRes {
     std::string asset;
     unsigned gen = 0;
     int w = 0, h = 0;
-    int tw = 0, th = 0;
-    unsigned char* fullPx = nullptr;
-    unsigned char* thumbPx = nullptr;
+    int lw = 0, lh = 0;
+    unsigned char* fullPx = nullptr;   // source resolution (RGBA8)
+    unsigned char* lowPx = nullptr;    // area-filtered ≤kLowLodMax copy
     bool ok = false;
 };
 
@@ -1485,24 +1597,22 @@ static void img_worker() {
             res.w = w; res.h = h;
             res.fullPx = px;
 
-            const int kMaxThumb = 512;
-            int tw = w, th = h;
-            if (tw > kMaxThumb || th > kMaxThumb) {
-                if (tw >= th) {
-                    th = std::max(1, (int)roundf((float)h * kMaxThumb / (float)w));
-                    tw = kMaxThumb;
+            int lw = w, lh = h;
+            if (lw > kLowLodMax || lh > kLowLodMax) {
+                if (lw >= lh) {
+                    lh = std::max(1, (int)roundf((float)h * kLowLodMax / (float)w));
+                    lw = kLowLodMax;
                 } else {
-                    tw = std::max(1, (int)roundf((float)w * kMaxThumb / (float)h));
-                    th = kMaxThumb;
+                    lw = std::max(1, (int)roundf((float)w * kLowLodMax / (float)h));
+                    lh = kLowLodMax;
                 }
             }
-            res.tw = tw; res.th = th;
-            if (tw < w || th < h) {
-                unsigned char* thumb = (unsigned char*)malloc(tw * th * 4);
-                if (thumb) {
-                    downsample_box(px, w, h, thumb, tw, th);
-                    res.thumbPx = thumb;
-                }
+            res.lw = lw; res.lh = lh;
+            unsigned char* low = (unsigned char*)malloc((size_t)lw * lh * 4);
+            if (low) {
+                if (lw < w || lh < h) downsample_box(px, w, h, low, lw, lh);
+                else memcpy(low, px, (size_t)w * h * 4);
+                res.lowPx = low;
             }
         }
 
@@ -1524,16 +1634,18 @@ static void ensure_img_workers() {
     }
 }
 
+// Full-detail uploads are the expensive ones (8 MB RGBA per 1080p image), so
+// they're queued and drained under a per-frame *time* budget: the board fills
+// in over a few frames without a single long frame, and the low LOD is
+// already on screen while that happens.
 struct PendingUpload {
     std::string asset;
     unsigned gen = 0;
     int w = 0, h = 0;
-    int tw = 0, th = 0;
     unsigned char* fullPx = nullptr;
-    unsigned char* thumbPx = nullptr;
-    bool ok = false;
 };
 static std::deque<PendingUpload> g_imgPendingUpload;
+static const double kUploadBudgetMs = 1.6;   // per frame, full-detail uploads
 
 static void drain_image_results() {
     std::vector<ImgRes> done;
@@ -1544,40 +1656,40 @@ static void drain_image_results() {
     for (auto& r : done) {
         if (r.gen != g_imgGen) {
             if (r.fullPx) stbi_image_free(r.fullPx);
-            if (r.thumbPx) free(r.thumbPx);
+            if (r.lowPx) free(r.lowPx);
             continue;
         }
 
         Tex& t = g_texCache[r.asset];
         t.w = r.w; t.h = r.h;
-        t.tw = r.tw; t.th = r.th;
+        t.lw = r.lw; t.lh = r.lh;
         t.loading = false;
 
         if (!r.ok) {
             t.failed = true;
+            if (r.lowPx) free(r.lowPx);
+            if (r.fullPx) stbi_image_free(r.fullPx);
             continue;
         }
 
-        // Always create thumbnail texture immediately! (Sub-100 microsecond upload each)
-        if (!t.thumbSrv) {
-            const unsigned char* tp = r.thumbPx ? r.thumbPx : r.fullPx;
-            t.thumbSrv = make_rgba_tex(tp, r.tw, r.th);
+        // the low LOD goes up first and immediately: it is sub-100 µs and it
+        // is what every zoomed-out shape draws
+        if (!t.lowSrv && r.lowPx) {
+            t.lowSrv = make_rgba_tex(r.lowPx, r.lw, r.lh);
+            g_texLowBytes += tex_low_bytes(t);
         }
-        if (r.thumbPx) { free(r.thumbPx); r.thumbPx = nullptr; }
+        if (r.lowPx) { free(r.lowPx); r.lowPx = nullptr; }
 
-        if (r.tw == r.w && r.th == r.h) {
-            t.srv = t.thumbSrv;
-            stbi_image_free(r.fullPx);
-            r.fullPx = nullptr;
-        } else {
-            g_imgPendingUpload.push_back({ r.asset, r.gen, r.w, r.h, r.tw, r.th, r.fullPx, nullptr, r.ok });
-        }
+        if (r.fullPx) g_imgPendingUpload.push_back({ r.asset, r.gen, r.w, r.h, r.fullPx });
     }
 
-    // Budget full-resolution uploads: up to 4 per frame to prevent hitches while promoting smoothly
-    int fullUploadBudget = 4;
-    while (!g_imgPendingUpload.empty() && fullUploadBudget > 0) {
-        auto item = g_imgPendingUpload.front();
+    // Full-detail uploads under a time budget — one big image may still cost
+    // a couple of ms, so the budget is checked *after* each upload and always
+    // lets one through (guaranteed progress).
+    double t0 = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+    while (!g_imgPendingUpload.empty()) {
+        PendingUpload item = g_imgPendingUpload.front();
         g_imgPendingUpload.pop_front();
 
         if (item.gen != g_imgGen) {
@@ -1586,47 +1698,62 @@ static void drain_image_results() {
         }
 
         Tex& t = g_texCache[item.asset];
+        size_t before = tex_full_bytes(t);
         if (!t.srv && item.fullPx) {
             t.srv = make_rgba_tex(item.fullPx, item.w, item.h);
-            fullUploadBudget--;
+            g_texFullBytes += tex_full_bytes(t) - before;
         }
         if (item.fullPx) stbi_image_free(item.fullPx);
+
+        double t1 = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (t1 - t0 >= kUploadBudgetMs) break;
     }
 }
 
+// Ask the worker pool for this asset (idempotent while a decode is in flight).
+static void tex_request(const std::string& asset) {
+    std::lock_guard<std::mutex> lk(g_imgMx);
+    if (g_imgInFlight.count(asset)) return;
+    g_imgInFlight.insert(asset);
+    g_imgWant.push_back({ asset, g_projDir + "/" + asset, g_imgGen });
+    g_imgCv.notify_one();
+}
+
+// Which texture a shape of this on-screen size should draw, requesting work
+// when the answer is "none of them yet":
+//   - the full-detail texture whenever it is resident (its mip chain picks the
+//     right level for the current zoom for free),
+//   - the low LOD while the full one streams in (or was evicted),
+//   - nothing (a placeholder) only before the first decode lands.
+// A missing full-detail texture when the shape is on screen bigger than the
+// low LOD is a *re-request*, not a permanent downgrade.
 static TexH get_image_srv(const std::string& asset, float screenW, float screenH) {
+    ensure_img_workers();
     auto it = g_texCache.find(asset);
     if (it == g_texCache.end()) {
-        ensure_img_workers();
         Tex& t = g_texCache[asset];
         t.loading = true;
-        std::string path = g_projDir + "/" + asset;
-        {
-            std::lock_guard<std::mutex> lk(g_imgMx);
-            if (!g_imgInFlight.count(asset)) {
-                g_imgInFlight.insert(asset);
-                g_imgWant.push_back({ asset, path, g_imgGen });
-                g_imgCv.notify_one();
-            }
-        }
-        return nullptr;
+        tex_request(asset);
+        return kNoTex;
     }
 
     Tex& t = it->second;
     t.lastDrawnFrame = ImGui::GetFrameCount();
-    if (t.failed) return nullptr;
-    if (t.loading && !t.thumbSrv && !t.srv) return nullptr;
-
-    if (screenW <= 512.f && screenH <= 512.f && t.thumbSrv) {
-        return t.thumbSrv;
-    }
-
+    if (t.failed) return kNoTex;
     if (t.srv) return t.srv;
-    if (t.thumbSrv) return t.thumbSrv;
 
-    return nullptr;
+    // no full detail resident: does the low LOD have the pixels the screen wants?
+    bool needFull = !t.lowSrv || t.lw < (int)screenW || t.lh < (int)screenH;
+    if (needFull && !t.loading) {
+        t.loading = true;
+        tex_request(asset);
+    }
+    return t.lowSrv;
 }
 
+// Synchronous load (--shot --export, clipboard, imports): identical texture
+// shape to the async path, no workers involved. Deterministic on purpose.
 static Tex* get_image_tex(const std::string& asset) {
     auto it = g_texCache.find(asset);
     if (it != g_texCache.end() && (it->second.srv || it->second.failed)) return &it->second;
@@ -1640,28 +1767,29 @@ static Tex* get_image_tex(const std::string& asset) {
     if (px) {
         t.w = w; t.h = h;
         t.srv = make_rgba_tex(px, w, h);
+        g_texFullBytes += tex_full_bytes(t);
 
-        const int kMaxThumb = 512;
-        int tw = w, th = h;
-        if (tw > kMaxThumb || th > kMaxThumb) {
-            if (tw >= th) {
-                th = std::max(1, (int)roundf((float)h * kMaxThumb / (float)w));
-                tw = kMaxThumb;
+        int lw = w, lh = h;
+        if (lw > kLowLodMax || lh > kLowLodMax) {
+            if (lw >= lh) {
+                lh = std::max(1, (int)roundf((float)h * kLowLodMax / (float)w));
+                lw = kLowLodMax;
             } else {
-                tw = std::max(1, (int)roundf((float)w * kMaxThumb / (float)h));
-                th = kMaxThumb;
+                lw = std::max(1, (int)roundf((float)w * kLowLodMax / (float)h));
+                lh = kLowLodMax;
             }
         }
-        t.tw = tw; t.th = th;
-        if (tw < w || th < h) {
-            unsigned char* thumb = (unsigned char*)malloc(tw * th * 4);
-            if (thumb) {
-                downsample_box(px, w, h, thumb, tw, th);
-                t.thumbSrv = make_rgba_tex(thumb, tw, th);
-                free(thumb);
+        t.lw = lw; t.lh = lh;
+        if (lw < w || lh < h) {
+            unsigned char* low = (unsigned char*)malloc((size_t)lw * lh * 4);
+            if (low) {
+                downsample_box(px, w, h, low, lw, lh);
+                t.lowSrv = make_rgba_tex(low, lw, lh);
+                g_texLowBytes += tex_low_bytes(t);
+                free(low);
             }
         } else {
-            t.thumbSrv = t.srv;
+            t.lowSrv = t.srv;   // small image: the full texture IS the low LOD
         }
         stbi_image_free(px);
         t.loading = false;
@@ -1936,6 +2064,9 @@ static void prof_print_summary() {
     sec("frame", g_pw.frame); sec("draw", g_pw.draw); sec("video", g_pw.video);
     sec("drain", g_pw.drain); sec("overlay", g_pw.overlay); sec("sweep", g_pw.sweep);
     sec("chrome", g_pw.chrome); sec("render", g_pw.render); sec("present", g_pw.present); sec("input", g_pw.input);
+    fprintf(stderr, "  draw data: %lld cmds (%.1f/frame), %lld verts (%.0f/frame)\n",
+            g_pw.cmds, g_pw.frames ? (double)g_pw.cmds / g_pw.frames : 0.0,
+            g_pw.vtx, g_pw.frames ? (double)g_pw.vtx / g_pw.frames : 0.0);
     fprintf(stderr, "  decoders %zu resident | %d opens (avg %.2f ms, max %.1f ms) | %d evicts\n",
             g_decoders.size(), g_pw.decOpens,
             g_pw.decOpens ? g_pw.decOpenMs / g_pw.decOpens : 0.0, g_pw.decOpenMax, g_pw.decEvicts);
@@ -2312,11 +2443,11 @@ struct PlayState {
     int w = 0, h = 0;
 #ifdef _WIN32
     ID3D11Texture2D* tex = nullptr;
-    TexH srv = nullptr;
+    TexH srv = kNoTex;
     void release() { if (srv) srv->Release(); if (tex) tex->Release(); srv = nullptr; tex = nullptr; shownIdx = -1; reqIdx = -1; }
 #else
-    TexH srv = nullptr;   // one streaming texture (named like the D3D field: draw sites stay shared)
-    void release() { if (srv) SDL_DestroyTexture(srv); srv = nullptr; shownIdx = -1; reqIdx = -1; }
+    TexH srv = kNoTex;    // one streaming texture (named like the D3D field: draw sites stay shared)
+    void release() { if (srv) tex_destroy(srv); srv = kNoTex; shownIdx = -1; reqIdx = -1; }
 #endif
 };
 static std::map<uint64_t, PlayState> g_play;
@@ -2360,13 +2491,19 @@ static bool upload_rgba(PlayState& ps, const unsigned char* rgba, int w, int h) 
 static bool upload_rgba(PlayState& ps, const unsigned char* rgba, int w, int h) {
     if (!ps.srv || ps.w != w || ps.h != h) {
         ps.release();
-        ps.srv = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, w, h);
+        ps.srv = 0;
+        glGenTextures(1, &ps.srv);
         if (!ps.srv) return false;
-        SDL_SetTextureScaleMode(ps.srv, SDL_SCALEMODE_LINEAR);
-        SDL_SetTextureBlendMode(ps.srv, SDL_BLENDMODE_BLEND);
+        glBindTexture(GL_TEXTURE_2D_, ps.srv);
+        glPixelStorei(GL_UNPACK_ALIGNMENT_, 1);
+        glTexImage2D(GL_TEXTURE_2D_, 0, GL_RGBA8_, w, h, 0, GL_RGBA_, GL_UNSIGNED_BYTE_, nullptr);
+        tex_set_params(false);   // streaming: level 0 is replaced every frame
         ps.w = w; ps.h = h;
     }
-    return SDL_UpdateTexture(ps.srv, nullptr, rgba, w * 4);
+    glBindTexture(GL_TEXTURE_2D_, ps.srv);
+    glPixelStorei(GL_UNPACK_ALIGNMENT_, 1);
+    glTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, w, h, GL_RGBA_, GL_UNSIGNED_BYTE_, rgba);
+    return true;
 }
 #endif
 
@@ -2387,7 +2524,7 @@ static TexH video_srv(const Shape& s, MediaKind mk) {
         // video's decoder every frame — the churn that made dense views
         // choppy).
         d = get_decoder(s.asset);
-        if (!d) return nullptr;
+        if (!d) return kNoTex;
         st.fps = (float)d->fps; st.frames = d->frames; st.dur = d->duration(); st.hasAudio = d->hasAudio;
         st.haveMeta = true;
         if (!st.srv) {   // poster in-line (playhead frame when t>0 — loopA opens at A — else 0)
@@ -2407,7 +2544,7 @@ static TexH video_srv(const Shape& s, MediaKind mk) {
     if (g_interactiveFrame && ImGui::GetFrameCount() == g_activeBudgetFrame && !g_activeVideos.count(s.id))
         return st.srv;
     d = get_decoder(s.asset);   // keep resident while frames are wanted
-    if (!d) return nullptr;
+    if (!d) return kNoTex;
     {
         AudioOut* au = nullptr;
         if (mk == MK_VIDEO && s.sound && st.hasAudio && !g_headless) {
@@ -2482,11 +2619,27 @@ static void sweep_play_states() {
         if (!find_shape(it->first)) it = g_extCache.erase(it);
         else ++it;
     }
-    uint64_t curFrame = ImGui::GetFrameCount();
-    for (auto& [asset, t] : g_texCache) {
-        if (t.srv && t.thumbSrv && t.srv != t.thumbSrv && curFrame > t.lastDrawnFrame + 600) {
+    // ── texture residency ──
+    // Full-detail levels are evictable under a byte budget; the low LOD is
+    // not. Eviction is pure LRU over *undrawn* textures (never one this frame
+    // just used), and dropping is worth nothing unless it is remembered as
+    // "re-request me when I'm needed again" — get_image_srv does exactly that.
+    if (g_texFullBytes > tex_budget_bytes()) {
+        uint64_t curFrame = ImGui::GetFrameCount();
+        struct Cand { const std::string* asset; uint64_t last; };
+        std::vector<Cand> cand;
+        cand.reserve(g_texCache.size());
+        for (auto& [asset, t] : g_texCache)
+            if (t.srv && t.lastDrawnFrame + 1 < curFrame) cand.push_back({ &asset, t.lastDrawnFrame });
+        std::sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.last < b.last; });
+        size_t target = tex_budget_bytes() - tex_budget_bytes() / 10;   // hysteresis
+        for (auto& c : cand) {
+            if (g_texFullBytes <= target) break;
+            Tex& t = g_texCache[*c.asset];
+            size_t bytes = tex_full_bytes(t);
             tex_destroy(t.srv);
-            t.srv = nullptr;
+            t.srv = kNoTex;
+            g_texFullBytes = g_texFullBytes > bytes ? g_texFullBytes - bytes : 0;
         }
     }
 }
@@ -3142,10 +3295,12 @@ static bool switch_board(const std::string& dirIn) {
     g_cam = Camera{}; g_camAnim.active = false;
     g_saveDueAt = 0;
     for (auto& [rel, t] : g_texCache) {
-        if (t.srv) tex_destroy(t.srv);
-        if (t.thumbSrv && t.thumbSrv != t.srv) tex_destroy(t.thumbSrv);
+        if (t.srv && t.srv != t.lowSrv) tex_destroy(t.srv);
+        if (t.lowSrv) tex_destroy(t.lowSrv);
     }
     g_texCache.clear();
+    g_texFullBytes = 0;
+    g_texLowBytes = 0;
     {
         std::lock_guard<std::mutex> lk(g_imgMx);
         g_imgGen++;
@@ -3155,7 +3310,6 @@ static bool switch_board(const std::string& dirIn) {
     }
     for (auto& p : g_imgPendingUpload) {
         if (p.fullPx) stbi_image_free(p.fullPx);
-        if (p.thumbPx) free(p.thumbPx);
     }
     g_imgPendingUpload.clear();
     for (auto& [id, ps] : g_play) ps.release();
@@ -3645,14 +3799,14 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
             // tiny media grayboxes (and stops decoding) until zoomed in —
             // same contract as the offscreen cull: playback pauses offstage
             if ((mx.x - mn.x) < kMediaGrayPx && !is_selected(s.id)) { draw_gray_box(dl, s); break; }
-            TexH srv = nullptr;
+            TexH srv = kNoTex;
             MediaKind mk = media_kind(s.asset);
             float screenW = fabsf(mx.x - mn.x);
             float screenH = fabsf(mx.y - mn.y);
             if (mk == MK_STILL) {
-                if (!g_interactiveFrame || g_headless) {
+                if ((!g_interactiveFrame || g_headless) && !g_forceAsyncImg) {
                     Tex* t = get_image_tex(s.asset);
-                    srv = (screenW <= 512.f && screenH <= 512.f && t->thumbSrv) ? t->thumbSrv : t->srv;
+                    srv = t->srv ? t->srv : t->lowSrv;
                 } else {
                     srv = get_image_srv(s.asset, screenW, screenH);
                 }
@@ -3749,7 +3903,7 @@ static bool render_rect_rgba(const WRect& r, const std::vector<uint64_t>* only,
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
 #else
-    ImGui_ImplSDLRenderer3_NewFrame();
+    ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
 #endif
     ImGuiIO& io = ImGui::GetIO();
@@ -3784,16 +3938,30 @@ static bool render_rect_rgba(const WRect& r, const std::vector<uint64_t>* only,
     if (tex) tex->Release();
     return ok;
 #else
-    SDL_Texture* target = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, w, h);
-    if (!target) return false;
-    SDL_SetRenderTarget(g_ren, target);
-    ImVec4 bg = ImGui::ColorConvertU32ToFloat4(g_th.canvasBg);
-    SDL_SetRenderDrawColorFloat(g_ren, bg.x, bg.y, bg.z, 1.f);
-    SDL_RenderClear(g_ren);
-    ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_ren);
-    bool ok = read_target_rgba(px, w, h);   // reads the CURRENT target
-    SDL_SetRenderTarget(g_ren, nullptr);
-    SDL_DestroyTexture(target);
+    // offscreen at an arbitrary size: an FBO with one RGBA8 color attachment
+    // (the swapchain backbuffer can't be resized per export), rendered with
+    // the same imgui draw data the window path uses.
+    GLuint tex = 0, fbo = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D_, tex);
+    glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, GL_LINEAR_);
+    glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_, GL_LINEAR_);
+    glTexImage2D(GL_TEXTURE_2D_, 0, GL_RGBA8_, w, h, 0, GL_RGBA_, GL_UNSIGNED_BYTE_, nullptr);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER_, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_, tex, 0);
+    bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER_) == GL_FRAMEBUFFER_COMPLETE_;
+    if (ok) {
+        ImVec4 bg = ImGui::ColorConvertU32ToFloat4(g_th.canvasBg);
+        glViewport(0, 0, w, h);
+        glClearColor(bg.x, bg.y, bg.z, 1.f);
+        glClear(GL_COLOR_BUFFER_BIT_);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        ok = read_fb_rgba(w, h, px);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER_, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
     return ok;
 #endif
 }
@@ -6405,6 +6573,8 @@ int main(int argc, char** argv) {
     struct QkEv { int frame; ImGuiKey key; bool shift; };   // dev: injected quick-video-control key
     std::vector<QkEv> qkEvs;
     float panY = 0.f;      // dev: shift camera Y per frame (profiling panning)
+    float panTri = 0.f;    // dev: vertical triangle pan (down for the first half of the run, back up)
+    bool noVsync = false;  // dev: --novsync — measure true frame cost, not the vblank wait
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
         else if (!strcmp(argv[i], "--export") && i + 1 < argc) exportPng = argv[++i];
@@ -6432,7 +6602,10 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-') profFrames = atoi(argv[++i]);
         }
         else if (!strcmp(argv[i], "--pan-y") && i + 1 < argc) panY = strtof(argv[++i], nullptr);
+        else if (!strcmp(argv[i], "--pan-t") && i + 1 < argc) panTri = strtof(argv[++i], nullptr);
+        else if (!strcmp(argv[i], "--novsync")) noVsync = true;
         else if (!strcmp(argv[i], "--play")) g_forcePlay = true;   // dev: play state persists headless (profiling)
+        else if (!strcmp(argv[i], "--async-img")) g_forceAsyncImg = true;   // dev: async image path headless
         else if (!strcmp(argv[i], "--qk") && i + 2 < argc) {
             int f = atoi(argv[++i]);
             const char* kn = argv[++i];
@@ -6472,26 +6645,13 @@ int main(int argc, char** argv) {
     ShowWindow(hwnd, SW_SHOWMAXIMIZED);
     UpdateWindow(hwnd);
 #else
-    if (!headless && !getenv("__EGL_VENDOR_LIBRARY_FILENAMES")) {
-        void* testEgl = dlopen("libEGL_mesa.so.0", RTLD_LAZY);
-        if (testEgl) {
-            dlclose(testEgl);
-        } else {
-            glob_t gl;
-            if (glob("/nix/store/*-mesa-*/share/glvnd/egl_vendor.d/50_mesa.json", 0, nullptr, &gl) == 0) {
-                if (gl.gl_pathc > 0) {
-                    setenv("__EGL_VENDOR_LIBRARY_FILENAMES", gl.gl_pathv[0], 1);
-                }
-                globfree(&gl);
-            }
-        }
-    }
     // Headless runs render on the "offscreen" video driver when it's usable:
     // no window opens, nothing steals focus (the session-9 postmortem), and
     // shots are a deterministic 1600×1000. Falls back to a real window.
     // OVERRIDE priority, or an exported SDL_VIDEODRIVER (WSLg sets =wayland)
     // silently outranks the hint and headless runs try a real display.
     if (headless) SDL_SetHintWithPriority(SDL_HINT_VIDEO_DRIVER, "offscreen", SDL_HINT_OVERRIDE);
+    setup_egl_vendor();   // BEFORE SDL_Init: glvnd picks its vendors exactly once
     bool vidOk = SDL_Init(SDL_INIT_VIDEO);
     if (!vidOk && headless) {   // no offscreen driver in this SDL: use a real window
         SDL_ResetHint(SDL_HINT_VIDEO_DRIVER);
@@ -6499,16 +6659,38 @@ int main(int argc, char** argv) {
     }
     if (!vidOk) { fprintf(stderr, "teidraw: SDL init failed: %s\n", SDL_GetError()); return 1; }
     if (!headless) SDL_Init(SDL_INIT_AUDIO);   // best-effort: no device = silent videos
+
+    // ── GL context ──
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+    SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 0);
     g_win = SDL_CreateWindow("teidraw", 1600, 1000,
-                             SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
-                             (headless ? SDL_WINDOW_HIDDEN : SDL_WINDOW_MAXIMIZED));
-    if (!g_win) { fprintf(stderr, "teidraw: window failed: %s\n", SDL_GetError()); return 1; }
-    g_ren = SDL_CreateRenderer(g_win, nullptr);
-    if (!g_ren) { fprintf(stderr, "teidraw: renderer failed: %s\n", SDL_GetError()); return 1; }
-    fprintf(stderr, "teidraw: SDL video driver '%s', renderer '%s'\n",
-            SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "(null)",
-            SDL_GetRendererName(g_ren) ? SDL_GetRendererName(g_ren) : "(null)");
-    SDL_SetRenderVSync(g_ren, headless ? 0 : 1);
+                             SDL_WINDOW_OPENGL | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+                             (headless ? SDL_WINDOW_HIDDEN
+                                       : SDL_WINDOW_RESIZABLE | SDL_WINDOW_MAXIMIZED));
+    if (g_win) g_glctx = SDL_GL_CreateContext(g_win);
+    if (!g_glctx) {
+        fprintf(stderr, "teidraw: no OpenGL 3.3 context: %s\n", SDL_GetError());
+        if (!getenv("__EGL_VENDOR_LIBRARY_FILENAMES"))
+            fprintf(stderr, "teidraw: (tried no EGL vendor override; set "
+                            "__EGL_VENDOR_LIBRARY_FILENAMES to your Mesa vendor JSON if EGL is misconfigured)\n");
+        return 1;
+    }
+    SDL_GL_MakeCurrent(g_win, g_glctx);
+    SDL_GL_SetSwapInterval(headless || noVsync ? 0 : 1);
+    if (!gl_min_load()) { fprintf(stderr, "teidraw: incomplete OpenGL entry points\n"); return 1; }
+    gl_detect_limits();
+    {   // who is rasterizing? (llvmpipe/softpipe make every sampling decision
+        // a CPU cost — worth knowing before blaming the app for frame time)
+        auto s = [](GLenum e) { const GLubyte* p = glGetString(e); return p ? (const char*)p : "?"; };
+        fprintf(stderr, "teidraw: SDL video driver '%s', GL '%s' by '%s' (GL %s), aniso %d\n",
+                SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "(null)",
+                s(GL_RENDERER_), s(GL_VENDOR_), s(GL_VERSION_), g_maxAniso);
+    }
     {   // window icon from the embedded PNG
         int iw = 0, ih = 0, n = 0;
         unsigned char* ip = stbi_load_from_memory(icon_png, (int)icon_png_len, &iw, &ih, &n, 4);
@@ -6532,8 +6714,8 @@ int main(int argc, char** argv) {
 #else
     g_dpi = SDL_GetWindowDisplayScale(g_win);
     if (g_dpi <= 0.f) g_dpi = 1.f;
-    ImGui_ImplSDL3_InitForSDLRenderer(g_win, g_ren);
-    ImGui_ImplSDLRenderer3_Init(g_ren);
+    ImGui_ImplSDL3_InitForOpenGL(g_win, g_glctx);
+    if (!ImGui_ImplOpenGL3_Init("#version 150")) { fprintf(stderr, "teidraw: imgui GL init failed\n"); return 1; }
 #endif
     LoadFonts();
     ImGui::GetStyle().FontSizeBase = 15.f * g_dpi;
@@ -6587,7 +6769,7 @@ int main(int argc, char** argv) {
         // pumping here samples input as late as possible — same contract.
         if (!sdl_pump_events()) break;
 
-        ImGui_ImplSDLRenderer3_NewFrame();
+        ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
 #endif
         }
@@ -6615,6 +6797,10 @@ int main(int argc, char** argv) {
             dropPath = nullptr;
         }
         if (panY != 0.f) g_cam.pan.y += panY;
+        if (panTri != 0.f) {   // triangle: down the first half of the run, back up
+            int half = profFrames / 2 > 0 ? profFrames / 2 : 1;
+            g_cam.pan.y += panTri * (framesDone < half ? 1.f : -1.f);
+        }
 
 #ifdef TEI_LIBAV
         drain_video_results();   // worker-decoded frames land before the draw pass
@@ -6666,10 +6852,11 @@ int main(int argc, char** argv) {
         g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
         g_ctx->ClearRenderTargetView(g_rtv, bg);
         { ProfScope psec(&g_pw.render);
+        prof_note_drawdata(ImGui::GetDrawData());
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         }
         { ProfScope psec(&g_pw.present);
-        g_sc->Present(headless ? 0 : 1, 0);
+        g_sc->Present(headless || noVsync ? 0 : 1, 0);
         framesDone++;
         }
         if (shotPath && framesDone >= shotFrames) {
@@ -6678,19 +6865,23 @@ int main(int argc, char** argv) {
             done = true;
         }
 #else
-        SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 255);
-        SDL_RenderClear(g_ren);
+        SDL_GetWindowSizeInPixels(g_win, &g_fbW, &g_fbH);
+        glViewport(0, 0, g_fbW, g_fbH);
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT_);
         { ProfScope psec(&g_pw.render);
-        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_ren);
+        prof_note_drawdata(ImGui::GetDrawData());
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         }
-        // SDL reads the backbuffer BEFORE present (D3D reads it after)
+        // read the frame back BEFORE the swap (GL backbuffer contents after a
+        // swap are undefined; SDL_Renderer had the same ordering)
         if (shotPath && framesDone + 1 >= shotFrames) {
             bool ok = SaveBackbufferPNG(shotPath);
             fprintf(stderr, "teidraw: shot %s -> %s\n", shotPath, ok ? "ok" : "FAILED");
             done = true;
         }
         { ProfScope psec(&g_pw.present);
-        SDL_RenderPresent(g_ren);
+        SDL_GL_SwapWindow(g_win);
         framesDone++;
         }
 #endif
@@ -6734,10 +6925,10 @@ int main(int argc, char** argv) {
     DestroyWindow(hwnd);
     UnregisterClassW(L"teidraw", wc.hInstance);
 #else
-    ImGui_ImplSDLRenderer3_Shutdown();
+    ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
-    SDL_DestroyRenderer(g_ren);   // takes the cached SDL textures with it
+    SDL_GL_DestroyContext(g_glctx);   // takes the cached GL textures with it
     SDL_DestroyWindow(g_win);
     SDL_Quit();
 #endif
