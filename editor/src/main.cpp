@@ -94,9 +94,14 @@ struct ProfSection { double sum = 0, max = 0; int n = 0; };
 static const int kProfWindow = 180;
 struct ProfState {
     ProfSection frame, draw, video, overlay, drain, sweep, chrome, render, present, input;
+    ProfSection videoOpen, videoPoster;   // video_srv sub-steps (UI thread cost)
     int decOpens = 0, decEvicts = 0;       // window/run totals (UI thread)
     double decOpenMs = 0, decOpenMax = 0;  // ffmpeg decoder open cost (the eviction hitch)
     int visVideos = 0, playVideos = 0;     // window sums (avg = /frames)
+    long long decoded = 0;                 // frames that came off the decode pool
+    long long decSeeks = 0, decFrames = 0; // decoder work: seeks issued, frames walked
+    long long vqReqs = 0, vqRes = 0, vqStale = 0, vqBudget = 0, vqWanted = 0;  // request/result plumbing
+    double decWorkMs = 0, decWorkMax = 0;  // wall time inside decode_index
     int queueDepth = 0;                    // decode queue depth at drain (window max)
     long long cmds = 0, vtx = 0;           // ImGui draw-data shape (sums over the run)
     int frames = 0;
@@ -106,6 +111,8 @@ static bool g_showProf = false;   // F3 overlay
 static bool g_profile = false;    // --profile: no window reset, summary at exit
 static bool g_forcePlay = false;  // --play: honor play flags headless too (profiling decode load)
 static bool g_forceAsyncImg = false;  // --async-img: use the async image path even headless
+static std::chrono::steady_clock::time_point g_profStart{};   // --profile run timer
+static double g_profT0 = 0;
 
 struct ProfScope {
     ProfSection* s; std::chrono::steady_clock::time_point t0;
@@ -1823,6 +1830,55 @@ extern "C" {
 #include <libavutil/mem.h>
 }
 
+static std::atomic<long long> g_decWorkUs{0};   // summed decode wall time (all workers)
+static std::atomic<int> g_metaFallbacks{0};     // first-touch fell back to inline decode
+
+// Decoded frame packed for the GPU: full-res Y followed by half-res U/V
+// (YUV420P). Video decoders emit that natively, so the common case is a row
+// copy with no swscale at all; the GPU then samples 1.5 bytes/px instead of
+// the 4 a converted RGBA frame costs, and does chroma upsampling, the
+// BT.601/709 matrix and the range conversion in the fragment shader.
+struct YuvFrame {
+    int w = 0, h = 0;                  // Y plane size (chroma is w/2 × h/2)
+    std::vector<unsigned char> y, u, v;
+    float m[9] = {1,0,0, 0,1,0, 0,0,1};   // column-major YUV → RGB matrix
+    float off[3] = {0, 0, 0};             // subtracted before the matrix
+};
+
+// matrix + offsets for the frame's color space / range
+static void yuv_coeffs(const AVFrame* f, float* m, float* off) {
+    bool full = f->color_range == AVCOL_RANGE_JPEG ||
+                f->format == AV_PIX_FMT_YUVJ420P || f->format == AV_PIX_FMT_YUVJ422P ||
+                f->format == AV_PIX_FMT_YUVJ444P;
+    bool bt709;
+    switch (f->colorspace) {
+    case AVCOL_SPC_BT709: bt709 = true; break;
+    case AVCOL_SPC_SMPTE170M: case AVCOL_SPC_BT470BG: case AVCOL_SPC_FCC:
+    case AVCOL_SPC_SMPTE240M: bt709 = false; break;
+    default: bt709 = f->height > 576; break;   // unspecified: SD = 601, HD = 709
+    }
+    // GLSL mat3 is column-major: columns = (kr, kr, kr), (0, kg, kb), (r, g, 0)
+    if (full) {
+        if (bt709) {
+            const float c[9] = {1.f, 1.f, 1.f, 0.f, -0.1873f, 1.8556f, 1.5748f, -0.4681f, 0.f};
+            memcpy(m, c, sizeof(c));
+        } else {
+            const float c[9] = {1.f, 1.f, 1.f, 0.f, -0.3441f, 1.772f, 1.402f, -0.7141f, 0.f};
+            memcpy(m, c, sizeof(c));
+        }
+        off[0] = 0.f; off[1] = 0.5f; off[2] = 0.5f;
+    } else {
+        if (bt709) {
+            const float c[9] = {1.1644f, 1.1644f, 1.1644f, 0.f, -0.2132f, 2.1124f, 1.7927f, -0.5329f, 0.f};
+            memcpy(m, c, sizeof(c));
+        } else {
+            const float c[9] = {1.1644f, 1.1644f, 1.1644f, 0.f, -0.3917f, 2.0172f, 1.5958f, -0.8129f, 0.f};
+            memcpy(m, c, sizeof(c));
+        }
+        off[0] = 16.f / 255.f; off[1] = 128.f / 255.f; off[2] = 128.f / 255.f;
+    }
+}
+
 struct VideoDecoder {
     AVFormatContext* fmt = nullptr;
     AVCodecContext*  dec = nullptr;
@@ -1833,6 +1889,9 @@ struct VideoDecoder {
     // overrun for widths such as 426 (coded as 432), corrupting the heap.
     uint8_t*          rgbaData[4]{};
     int               rgbaStride[4]{};
+    uint8_t*          yuvData[4]{};     // staging for the swscale→YUV420P cases
+    int               yuvStride[4]{};
+    int               yuvW = 0, yuvH = 0;
     int        vstream = -1;
     AVRational tb{0, 1};
     double     fps = 0;
@@ -1842,6 +1901,7 @@ struct VideoDecoder {
     bool       ok = false;
     bool       hasAudio = false;
     unsigned long long lru = 0;
+    uint64_t   lastUsedFrame = 0;   // UI frame this decoder was last needed on
     std::mutex mx;   // held around every libav call — decode runs on the worker thread
 
     bool open(const std::string& path) {
@@ -1855,7 +1915,14 @@ struct VideoDecoder {
         if (!codec) return false;
         dec = avcodec_alloc_context3(codec);
         if (!dec || avcodec_parameters_to_context(dec, st->codecpar) < 0) return false;
-        dec->thread_count = 0;                       // auto multithreaded decode
+        {   // frame threading costs pipeline latency and a full set of
+            // buffers per decoder (~14 MB at auto=10 threads on 1080p); with
+            // several playing videos the pool, not the codec, is the
+            // parallelism — 2 threads keeps one stream ahead of real time
+            // without the memory.
+            const char* tc = getenv("TEIDRAW_DEC_THREADS");
+            dec->thread_count = tc ? atoi(tc) : 2;
+        }
         if (avcodec_open2(dec, codec, nullptr) < 0) return false;
         tb = st->time_base;
         AVRational r = st->avg_frame_rate.num ? st->avg_frame_rate : st->r_frame_rate;
@@ -1877,6 +1944,7 @@ struct VideoDecoder {
     void close() {
         if (sws) sws_freeContext(sws);
         av_freep(&rgbaData[0]);
+        av_freep(&yuvData[0]);
         if (frame) av_frame_free(&frame);
         if (pkt) av_packet_free(&pkt);
         if (dec) avcodec_free_context(&dec);
@@ -1884,7 +1952,9 @@ struct VideoDecoder {
         sws = nullptr; frame = nullptr; pkt = nullptr; dec = nullptr; fmt = nullptr; ok = false;
     }
     double duration() const { return fps > 0 ? frames / fps : 0; }
-    bool to_rgba(std::vector<unsigned char>& out) {
+    // `frame` → packed RGBA (GIFs: keeps alpha; also the fallback when the
+    // YUV shader is unavailable)
+    bool emit_rgba(std::vector<unsigned char>& out) {
         if (!frame || !frame->data[0]) return false;
         sws = sws_getCachedContext(sws, frame->width, frame->height, (AVPixelFormat)frame->format,
                                    w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
@@ -1898,17 +1968,62 @@ struct VideoDecoder {
                    rgbaData[0] + (size_t)y * rgbaStride[0], rowBytes);
         return true;
     }
-    bool decode_index(int idx, std::vector<unsigned char>& out, bool retried = false) {
+    // `frame` → YUV420P planes (the fast path: normally a straight row copy)
+    bool emit_planes(YuvFrame& out) {
+        if (!frame || !frame->data[0]) return false;
+        yuv_coeffs(frame, out.m, out.off);
+        out.w = w; out.h = h;
+        int cw = (w + 1) / 2, ch = (h + 1) / 2;
+        bool native420 = (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVJ420P) &&
+                         frame->width == w && frame->height == h && !frame->crop_top && !frame->crop_bottom;
+        if (native420) {
+            out.y.resize((size_t)w * h);
+            out.u.resize((size_t)cw * ch);
+            out.v.resize((size_t)cw * ch);
+            for (int r = 0; r < h; r++)
+                memcpy(out.y.data() + (size_t)r * w, frame->data[0] + (size_t)r * frame->linesize[0], (size_t)w);
+            for (int r = 0; r < ch; r++) {
+                memcpy(out.u.data() + (size_t)r * cw, frame->data[1] + (size_t)r * frame->linesize[1], (size_t)cw);
+                memcpy(out.v.data() + (size_t)r * cw, frame->data[2] + (size_t)r * frame->linesize[2], (size_t)cw);
+            }
+            return true;
+        }
+        // anything else (10-bit, 4:4:4, RGB sources): one swscale pass to
+        // YUV420P — still no per-pixel RGB conversion, and 2.7× less to upload
+        sws = sws_getCachedContext(sws, frame->width, frame->height, (AVPixelFormat)frame->format,
+                                   w, h, AV_PIX_FMT_YUV420P, SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!sws) return false;
+        if (!yuvData[0] && av_image_alloc(yuvData, yuvStride, w, h, AV_PIX_FMT_YUV420P, 32) < 0) return false;
+        if (sws_scale(sws, frame->data, frame->linesize, 0, frame->height, yuvData, yuvStride) != h) return false;
+        out.y.resize((size_t)w * h); out.u.resize((size_t)cw * ch); out.v.resize((size_t)cw * ch);
+        for (int r = 0; r < h; r++)
+            memcpy(out.y.data() + (size_t)r * w, yuvData[0] + (size_t)r * yuvStride[0], (size_t)w);
+        for (int r = 0; r < ch; r++) {
+            memcpy(out.u.data() + (size_t)r * cw, yuvData[1] + (size_t)r * yuvStride[1], (size_t)cw);
+            memcpy(out.v.data() + (size_t)r * cw, yuvData[2] + (size_t)r * yuvStride[2], (size_t)cw);
+        }
+        return true;
+    }
+    // decode loop: leaves `frame` holding (the nearest reachable) index idx
+    bool decode_index(int idx, bool retried = false) {
+        auto t0 = std::chrono::steady_clock::now();
+        struct TmScope {
+            std::chrono::steady_clock::time_point t0;
+            ~TmScope() {
+                double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                g_pw.decWorkMs += ms; if (ms > g_pw.decWorkMax) g_pw.decWorkMax = ms;
+                g_decWorkUs.fetch_add((long long)(ms * 1000.0), std::memory_order_relaxed);
+            }
+        } tms{t0};
         if (!ok) return false;
         if (idx < 0) idx = 0;
         if (frames > 0 && idx >= frames) idx = frames - 1;
-        if (idx == cur_idx) {
-            if (to_rgba(out)) return true;
-            cur_idx = -1;
-        }
+        if (idx == cur_idx) return true;
+        int startIdx = cur_idx < 0 ? 0 : cur_idx;
         int64_t target = (int64_t)((double)idx / fps / av_q2d(tb) + 0.5);
         bool needSeek = (cur_idx < 0) || (idx < cur_idx) || (idx - cur_idx > 30);
         if (needSeek) {
+            g_pw.decSeeks++;
             if (av_seek_frame(fmt, vstream, target, AVSEEK_FLAG_BACKWARD) < 0)
                 av_seek_frame(fmt, vstream, target, AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY);
             avcodec_flush_buffers(dec);
@@ -1929,18 +2044,76 @@ struct VideoDecoder {
                 if (pts == AV_NOPTS_VALUE || cur_idx >= idx || (frames > 0 && cur_idx >= frames - 1)) { reached = true; break; }
             }
         }
+        g_pw.decFrames += (cur_idx - startIdx > 0) ? (cur_idx - startIdx) : 1;
         // container metadata can overpromise: learn the REAL frame count at EOF
         if (eof && !reached && cur_idx >= 0 && cur_idx + 1 < frames) frames = cur_idx + 1;
-        if (to_rgba(out)) return true;
+        if (frame && frame->data[0]) return true;
         cur_idx = -1;
-        if (!retried && frames > 0) return decode_index(frames - 1, out, true);
+        if (!retried && frames > 0) return decode_index(frames - 1, true);
+        return false;
+    }
+    // Decode straight to a fraction of the source size. A video that shows at
+    // 150 px on screen does not need 1280 px of frame uploaded 30×/s (4× less
+    // data at K=2, 16× at K=4), and sampling a full-res frame that far down
+    // aliases badly without mips — the scaler is the mip chain here. Integer
+    // ratios go through SWS_AREA (a real box filter); anything else bilinear.
+    bool emit_planes_scaled(YuvFrame& out, int K) {
+        if (!frame || !frame->data[0]) return false;
+        int dw = (w / K) & ~1, dh = (h / K) & ~1;   // 4:2:0 wants even dims
+        if (K <= 1 || dw < 4 || dh < 4) return emit_planes(out);
+        sws = sws_getCachedContext(sws, frame->width, frame->height, (AVPixelFormat)frame->format,
+                                   dw, dh, AV_PIX_FMT_YUV420P,
+                                   (w % K == 0 && h % K == 0) ? SWS_AREA : SWS_BILINEAR,
+                                   nullptr, nullptr, nullptr);
+        if (!sws) return false;
+        if (yuvW != dw || yuvH != dh) {
+            av_freep(&yuvData[0]);
+            if (av_image_alloc(yuvData, yuvStride, dw, dh, AV_PIX_FMT_YUV420P, 32) < 0) { yuvW = yuvH = 0; return false; }
+            yuvW = dw; yuvH = dh;
+        }
+        if (sws_scale(sws, frame->data, frame->linesize, 0, frame->height, yuvData, yuvStride) != dh) return false;
+        yuv_coeffs(frame, out.m, out.off);
+        int cw = (dw + 1) / 2, ch = (dh + 1) / 2;
+        out.w = dw; out.h = dh;
+        out.y.resize((size_t)dw * dh); out.u.resize((size_t)cw * ch); out.v.resize((size_t)cw * ch);
+        for (int r = 0; r < dh; r++)
+            memcpy(out.y.data() + (size_t)r * dw, yuvData[0] + (size_t)r * yuvStride[0], (size_t)dw);
+        for (int r = 0; r < ch; r++) {
+            memcpy(out.u.data() + (size_t)r * cw, yuvData[1] + (size_t)r * yuvStride[1], (size_t)cw);
+            memcpy(out.v.data() + (size_t)r * cw, yuvData[2] + (size_t)r * yuvStride[2], (size_t)cw);
+        }
+        return true;
+    }
+
+    // convenience wrappers: decode + convert in one call
+    bool decode_index(int idx, std::vector<unsigned char>& out, bool retried = false) {
+        if (!decode_index(idx, retried)) return false;
+        if (emit_rgba(out)) return true;
+        cur_idx = -1;
+        return false;
+    }
+    bool decode_index_planes(int idx, YuvFrame& out, int scaleK = 1) {
+        if (!decode_index(idx)) return false;
+        if ((scaleK > 1 ? emit_planes_scaled(out, scaleK) : emit_planes(out))) return true;
+        cur_idx = -1;
         return false;
     }
 };
 
 static std::map<std::string, VideoDecoder*> g_decoders;   // asset rel path → resident decoder
 static unsigned long long g_decoderClock = 0;
-static const size_t kMaxDecoders = 16;   // resident decoder cache; must cover a view's working set
+// Decoder residency. A decoder is only needed while its media DECODES, but a
+// dense view can easily hold more distinct players than any fixed cap, and a
+// hard cap then thrashes: every frame evicts one and re-opens another
+// (~8 ms of file parse each, on whichever thread asked). So the cap is soft —
+// beyond it, only decoders that have been idle for a while are dropped, and
+// the cache is allowed to grow to a hard ceiling that bounds memory. Playing
+// videos touch their decoder every frame, so they never look idle.
+static const size_t kMaxDecodersSoft = 16;
+static const size_t kMaxDecodersHard = 40;
+static const int    kDecoderIdleFrames = 300;   // ~2.5 s at 120 Hz
+static std::atomic<uint64_t> g_uiFrame{0};      // UI frame counter, readable off-thread
+static VideoDecoder* get_decoder(const std::string& asset);   // defined below (worker + UI both open)   // resident decoder cache; must cover a view's working set
 // (was 6: the NES board's "fake 3d" region shows 9 DISTINCT videos at once,
 // so every frame evicted and re-opened ~9 ffmpeg decoders on the UI thread
 // — ~17ms/frame of pure churn, choppy even with every video stopped, since
@@ -1958,51 +2131,99 @@ static const size_t kMaxDecoders = 16;   // resident decoder cache; must cover a
 //     so a video that misses its slot just shows its last frame and catches
 //     up. (A per-frame global budget was tried first: it starved every video
 //     after the first N in doc order — frozen tiles.)
-static const float kVideoRateSmallW = 96.f, kVideoRateMedW = 220.f;
-static const int   kVideoReqEvery = 3;
-// Interactive decode budget: only the kVideoActiveBudget PLAYING media
-// nearest the cursor decode new frames; the rest freeze on their cached
-// texture (poster/last decoded frame — free, we already own it) until the
-// cursor comes near. decode demand is the hard limit with many players, so
-// instead of stuttering everything we give full speed to the few the user
-// is actually looking at. Computed once per interactive frame in
-// draw_doc_shapes; exports/shots run their own frames and skip the budget.
-static const int   kVideoActiveBudget = 6;
+// (thresholds tightened once decode went parallel: the pool sits ~90% idle
+// even with a dozen playing videos, so decimation now costs smoothness it
+// doesn't have to — it only kicks in for media small enough that the pixels
+// saved are real, and requests are no longer spaced by UI frames at all)
+static const float kVideoRateSmallW = 48.f, kVideoRateMedW = 110.f;
+static const int   kVideoReqEvery = 1;
+// Interactive decode budget: at most g_videoActiveBudget PLAYING media decode
+// new frames at a time; the rest freeze on their cached texture (poster/last
+// decoded frame — free, we already own it) until they get a slot. It is a
+// fairness valve, not a throughput limit: the pool decodes on several
+// threads, and the budget *follows the pool's measured utilization* — grows
+// while there is headroom (a desktop with 24 players runs them all), shrinks
+// when decode is the bottleneck (a 4-core laptop throttles itself, keeping
+// the UI at full rate instead of stuttering every player). The set is rebuilt
+// once per interactive frame in draw_doc_shapes, nearest-cursor first;
+// exports/shots run their own frames and skip the budget entirely.
+static int         g_videoActiveBudget = 16;
+static const int   kVideoActiveBudgetMin = 4, kVideoActiveBudgetMax = 32;
+static long long   g_budgetSampleUs = 0;        // last feedback sample
+static std::chrono::steady_clock::time_point g_budgetSampleT{};
 static std::unordered_set<uint64_t> g_activeVideos;   // ids decoding this frame
 static int           g_activeBudgetFrame = -1;        // frame the set was built for
 static bool          g_interactiveFrame = false;      // set by CanvasFrame, cleared by exports
 static std::mutex g_decMx;   // guards g_decoders itself (lock order: g_decMx → decoder.mx)
 
 // ── async decode (M4 "keep the UI thread pure") ──
-// One worker thread runs every decode: seeks + forward-decode of long GOPs
-// used to hitch the frame loop. The UI thread still OPENS decoders (imports
-// need w/h synchronously) and decodes a shape's FIRST frame in-line (the
-// poster shows the instant a video lands; --shot stays deterministic) —
-// every later frame change is a request here. Latest-wins per shape, so
-// scrubbing coalesces to the newest index instead of queueing every step.
-struct DecodeReq { std::string asset; int idx = 0; unsigned gen = 0; };
-struct DecodeRes { uint64_t shape = 0; std::string asset; int idx = 0, w = 0, h = 0;
-                   unsigned gen = 0; std::vector<unsigned char> rgba; };
+// A small worker pool runs every decode: seeks + forward-decode of long GOPs
+// used to hitch the frame loop, and (for a shape's first touch) the decoder
+// open + poster decode too. Latest-wins per shape, so scrubbing coalesces to
+// the newest index instead of queueing every step; one worker per file at a
+// time, N files in parallel. Headless/exports keep the synchronous path so
+// --shot stays deterministic.
+// A request is either "give me frame idx" (playback) or "open the file, tell
+// me its metadata, and decode frame idx" (first touch — the poster). The
+// second kind is what keeps the ~20 ms decoder open and the first decode off
+// the UI thread; the shape draws a placeholder for the frame or two it takes.
+struct DecodeReq { std::string asset; int idx = 0; bool wantMeta = false; int scaleK = 1;
+                  unsigned seq = 0, gen = 0; };
+struct DecodeRes {
+    uint64_t shape = 0; std::string asset; int idx = 0, w = 0, h = 0;
+    unsigned gen = 0;
+    bool ok = false;
+    bool wantMeta = false;
+    unsigned seq = 0;                  // request serial: results never land out of order
+    // metadata (wantMeta requests only)
+    float fps = 0; int frames = 0; double dur = 0; bool hasAudio = false;
+    std::vector<unsigned char> rgba;   // Windows/GIF/fallback payload
+    YuvFrame yuv;                      // Linux video payload
+};
 static std::mutex g_vqMx;                       // guards the queues below
 static std::condition_variable g_vqCv;
 static std::map<uint64_t, DecodeReq> g_vqWant;  // shape id → newest wanted frame
 static std::vector<DecodeRes> g_vqDone;         // worker → UI (drained each frame)
 static unsigned g_vqGen = 0;                    // bumped per board — stale results dropped
+static unsigned g_vqSeq = 0;                    // request serial (per-shape ordering guard)
 static bool g_vqQuit = false;
-static std::thread g_vqWorker;
+static std::vector<std::thread> g_vqWorkers;
+static std::unordered_set<std::string> g_vqBusy;   // assets a worker is decoding right now
 
+// Requests are per shape (latest wins), and a worker only ever takes one
+// whose asset no other worker is decoding — so N videos decode in parallel
+// while a single file's decodes stay serialized (libav contexts are not
+// thread-safe, and their per-file state is what makes seeking cheap).
 static void video_worker() {
     for (;;) {
         uint64_t shape; DecodeReq req;
         {
             std::unique_lock<std::mutex> lk(g_vqMx);
-            g_vqCv.wait(lk, [] { return g_vqQuit || !g_vqWant.empty(); });
+            g_vqCv.wait(lk, [&] {
+                if (g_vqQuit) return true;
+                for (auto& kv : g_vqWant)
+                    if (!g_vqBusy.count(kv.second.asset)) return true;
+                return false;
+            });
             if (g_vqQuit) return;
-            auto it = g_vqWant.begin();
+            // first-touch (meta+poster) requests jump the queue: a playing
+            // video re-requests a frame on almost every pass, so a plain
+            // lowest-id scan would starve the one request that lets a shape
+            // draw at all
+            auto it = g_vqWant.end();
+            for (auto i = g_vqWant.begin(); i != g_vqWant.end(); ++i)
+                if (i->second.wantMeta && !g_vqBusy.count(i->second.asset)) { it = i; break; }
+            if (it == g_vqWant.end()) {
+                it = g_vqWant.begin();
+                while (it != g_vqWant.end() && g_vqBusy.count(it->second.asset)) ++it;
+            }
+            if (it == g_vqWant.end()) continue;   // woke for another worker's request
             shape = it->first; req = std::move(it->second);
             g_vqWant.erase(it);
+            g_vqBusy.insert(req.asset);
         }
         DecodeRes res; res.shape = shape; res.asset = req.asset; res.idx = req.idx; res.gen = req.gen;
+        res.wantMeta = req.wantMeta; res.seq = req.seq;
         VideoDecoder* d = nullptr;
         std::unique_lock<std::mutex> dlk;
         {
@@ -2015,28 +2236,73 @@ static void video_worker() {
                 dlk = std::unique_lock<std::mutex>(d->mx);
             }
         }
+        if (!d && req.wantMeta) {
+            // first touch: the open happens HERE, not on the UI thread
+            d = get_decoder(req.asset);
+            if (d) dlk = std::unique_lock<std::mutex>(d->mx);
+        }
+        if (d) d->lastUsedFrame = g_uiFrame.load(std::memory_order_relaxed);
         if (d) {
             res.w = d->w; res.h = d->h;
-            if (!d->decode_index(req.idx, res.rgba)) res.rgba.clear();
+            if (d->decode_index(req.idx)) {
+#ifdef _WIN32
+                if (d->emit_rgba(res.rgba)) res.ok = true;
+#else
+                // GIFs keep RGBA (palette alpha); videos go through the GPU
+                // conversion — 1.5 B/px and no swscale
+                bool gif = media_kind(req.asset) == MK_GIF;
+                if (gif ? d->emit_rgba(res.rgba) : d->emit_planes_scaled(res.yuv, req.scaleK)) res.ok = true;
+#endif
+                if (req.wantMeta) {
+                    res.fps = (float)d->fps; res.frames = d->frames;
+                    res.dur = d->duration(); res.hasAudio = d->hasAudio;
+                }
+            }
             dlk.unlock();
+            if (res.ok) g_pw.decoded++;
         }
-        {   // failures report back too (empty rgba): the UI clears its
-            // pending mark so the frame can be re-requested
+        {   // failures report back too (not ok): the UI clears its pending
+            // mark so the frame can be re-requested
             std::lock_guard<std::mutex> lk(g_vqMx);
+            g_vqBusy.erase(req.asset);
             g_vqDone.push_back(std::move(res));
         }
+        g_vqCv.notify_all();   // the freed asset may unblock another worker
     }
 }
 
-static VideoDecoder* get_decoder(const std::string& asset) {
+static std::atomic<bool> g_vqStarted{false};
+
+static void video_workers_start() {
+    if (g_vqStarted.load(std::memory_order_acquire)) return;   // fast path (called per drawn video)
     std::lock_guard<std::mutex> lk(g_decMx);
-    if (!g_vqWorker.joinable()) g_vqWorker = std::thread(video_worker);
+    if (!g_vqWorkers.empty()) { g_vqStarted.store(true, std::memory_order_release); return; }
+    unsigned n = std::thread::hardware_concurrency();
+    if (n < 2) n = 2;
+    if (n > 4) n = 4;   // beyond this the decoders fight over memory bandwidth
+    for (unsigned i = 0; i < n; i++) g_vqWorkers.emplace_back(video_worker);
+    g_vqStarted.store(true, std::memory_order_release);
+}
+
+static VideoDecoder* get_decoder(const std::string& asset) {
+    video_workers_start();
+    std::lock_guard<std::mutex> lk(g_decMx);
+    uint64_t nowFrame = g_uiFrame.load(std::memory_order_relaxed);
     auto it = g_decoders.find(asset);
-    if (it != g_decoders.end()) { it->second->lru = ++g_decoderClock; return it->second->ok ? it->second : nullptr; }
-    if (g_decoders.size() >= kMaxDecoders) {
-        auto v = g_decoders.end();
-        for (auto i = g_decoders.begin(); i != g_decoders.end(); ++i)
-            if (v == g_decoders.end() || i->second->lru < v->second->lru) v = i;
+    if (it != g_decoders.end()) {
+        it->second->lru = ++g_decoderClock;
+        it->second->lastUsedFrame = nowFrame;
+        return it->second->ok ? it->second : nullptr;
+    }
+    if (g_decoders.size() >= kMaxDecodersSoft) {
+        auto lruIt = g_decoders.end(), idleIt = g_decoders.end();
+        for (auto i = g_decoders.begin(); i != g_decoders.end(); ++i) {
+            if (lruIt == g_decoders.end() || i->second->lru < lruIt->second->lru) lruIt = i;
+            if (nowFrame > i->second->lastUsedFrame + (uint64_t)kDecoderIdleFrames &&
+                (idleIt == g_decoders.end() || i->second->lru < idleIt->second->lru)) idleIt = i;
+        }
+        auto v = idleIt != g_decoders.end() ? idleIt
+               : (g_decoders.size() >= kMaxDecodersHard ? lruIt : g_decoders.end());
         if (v != g_decoders.end()) {
             { std::lock_guard<std::mutex> dl(v->second->mx); v->second->close(); }   // wait out an in-flight decode
             delete v->second; g_decoders.erase(v);
@@ -2060,8 +2326,12 @@ static void prof_print_summary() {
         double avg = s.n ? s.sum / s.n : 0;
         fprintf(stderr, "  %-8s avg %7.3f ms  max %7.3f ms\n", name, avg, s.max);
     };
-    fprintf(stderr, "prof: %d frames\n", g_pw.frames);
+    const double secs = g_profT0 > 0
+        ? std::chrono::duration<double>(std::chrono::steady_clock::now() - g_profStart).count() : 0;
+    fprintf(stderr, "prof: %d frames over %.2f s (%.0f UI fps)\n", g_pw.frames, secs,
+            secs > 0 ? g_pw.frames / secs : 0.0);
     sec("frame", g_pw.frame); sec("draw", g_pw.draw); sec("video", g_pw.video);
+    sec("v-open", g_pw.videoOpen); sec("v-postr", g_pw.videoPoster);
     sec("drain", g_pw.drain); sec("overlay", g_pw.overlay); sec("sweep", g_pw.sweep);
     sec("chrome", g_pw.chrome); sec("render", g_pw.render); sec("present", g_pw.present); sec("input", g_pw.input);
     fprintf(stderr, "  draw data: %lld cmds (%.1f/frame), %lld verts (%.0f/frame)\n",
@@ -2070,6 +2340,21 @@ static void prof_print_summary() {
     fprintf(stderr, "  decoders %zu resident | %d opens (avg %.2f ms, max %.1f ms) | %d evicts\n",
             g_decoders.size(), g_pw.decOpens,
             g_pw.decOpens ? g_pw.decOpenMs / g_pw.decOpens : 0.0, g_pw.decOpenMax, g_pw.decEvicts);
+    // decode throughput — the number that says whether the pool keeps up with
+    // (visible playing media × their fps); below that, players show older
+    // frames (smooth but slower), above it there is headroom
+    // decode throughput — the number that says whether the pool keeps up with
+    // (visible playing media × their fps); below that, players show older
+    // frames (smooth but slower), above it there is headroom
+    fprintf(stderr, "  decode: %lld frames (%.0f/s) | %lld wanted (%.0f/s) -> %lld requests (%.0f/s) -> %lld results, %lld stale"
+            " | seeks %lld, walked %lld | %.2f ms/frame (max %.2f)\n",
+            g_pw.decoded, secs > 0 ? (double)g_pw.decoded / secs : 0.0,
+            g_pw.vqWanted, secs > 0 ? (double)g_pw.vqWanted / secs : 0.0,
+            g_pw.vqReqs, secs > 0 ? (double)g_pw.vqReqs / secs : 0.0,
+            g_pw.vqRes, g_pw.vqStale, g_pw.decSeeks, g_pw.decFrames,
+            g_pw.decoded ? g_pw.decWorkMs / (double)g_pw.decoded : 0.0, g_pw.decWorkMax);
+    fprintf(stderr, "  decode budget %d (adaptive, %zu workers) | inline meta fallbacks %d\n",
+            g_videoActiveBudget, g_vqWorkers.size(), g_metaFallbacks.load());
     fprintf(stderr, "  videos %d visible, %d playing per frame | queue depth max %d\n",
             g_pw.frames ? g_pw.visVideos / g_pw.frames : 0,
             g_pw.frames ? g_pw.playVideos / g_pw.frames : 0, g_pw.queueDepth);
@@ -2436,18 +2721,40 @@ struct PlayState {
     // get_decoder for EVERY visible video EVERY frame, so a view with more
     // distinct assets than the cache re-opened ~all of them per frame.
     bool haveMeta = false;
+    bool metaWanted = false;   // async first-touch request in flight
+    std::chrono::steady_clock::time_point metaReqTime{};   // inline fallback after ~2 s
+    bool failed = false;       // open/decode gave up: draw the placeholder, stop asking
     float fps = 0;
     int frames = 0;
     double dur = 0;
     bool hasAudio = false;
     int w = 0, h = 0;
+    // Backends differ in *where* frames live (an RGBA texture vs YUV planes),
+    // not in how the stream is driven — these belong to both.
+    int scaleK = 1;        // source-size divisor the resident frames were decoded at
+    unsigned reqSeq = 0;   // serial of the newest request issued for this shape
+    unsigned doneSeq = 0;  // serial of the newest frame actually on the GPU
 #ifdef _WIN32
     ID3D11Texture2D* tex = nullptr;
     TexH srv = kNoTex;
     void release() { if (srv) srv->Release(); if (tex) tex->Release(); srv = nullptr; tex = nullptr; shownIdx = -1; reqIdx = -1; }
 #else
-    TexH srv = kNoTex;    // one streaming texture (named like the D3D field: draw sites stay shared)
-    void release() { if (srv) tex_destroy(srv); srv = kNoTex; shownIdx = -1; reqIdx = -1; }
+    // Linux: video frames live in three R8 planes (YUV420) drawn through the
+    // conversion shader; GIFs (alpha) and the shader-unavailable fallback use
+    // the RGBA texture. `srv` stays the field draw sites share.
+    TexH srv = kNoTex;
+    TexH yTex = kNoTex, uTex = kNoTex, vTex = kNoTex;
+    float yuvM[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    float yuvOff[3] = {0, 0, 0};
+    int yw = 0, yh = 0;
+    void release() {
+        if (srv) tex_destroy(srv);
+        if (yTex) tex_destroy(yTex);
+        if (uTex) tex_destroy(uTex);
+        if (vTex) tex_destroy(vTex);
+        srv = yTex = uTex = vTex = kNoTex;
+        shownIdx = -1; reqIdx = -1;
+    }
 #endif
 };
 static std::map<uint64_t, PlayState> g_play;
@@ -2505,46 +2812,242 @@ static bool upload_rgba(PlayState& ps, const unsigned char* rgba, int w, int h) 
     glTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, w, h, GL_RGBA_, GL_UNSIGNED_BYTE_, rgba);
     return true;
 }
+
+// ── YUV420 video frames: three R8 planes, converted on the GPU ─────────────
+// 1.5 bytes/px to upload instead of 4, no swscale in the decode path, and no
+// per-pixel CPU work at all. Drawn via an ImDrawList callback so imgui's own
+// pipeline (VAO, vertex layout, scissor, blending) is untouched: the callback
+// just binds this program + the three planes before imgui issues the draw.
+static unsigned g_yuvProg = 0;
+static GLint g_yuvProjLoc = -1, g_yuvYLoc = -1, g_yuvULoc = -1, g_yuvVLoc = -1,
+             g_yuvMLoc = -1, g_yuvOffLoc = -1;
+static float g_glProj[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+static unsigned gl_build_shader(unsigned type, const char* src) {
+    unsigned sh = glCreateShader(type);
+    glShaderSource(sh, 1, &src, nullptr);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS_, &ok);
+    if (!ok) {
+        char log[512] = {};
+        glGetShaderInfoLog(sh, sizeof(log) - 1, nullptr, log);
+        fprintf(stderr, "teidraw: video shader compile failed: %s\n", log);
+        glDeleteShader(sh);
+        return 0;
+    }
+    return sh;
+}
+
+static bool gl_init_video_shader() {
+    static const char* vs =
+        "#version 330 core\n"
+        "layout (location = 0) in vec2 Position;\n"
+        "layout (location = 1) in vec2 UV;\n"
+        "layout (location = 2) in vec4 Color;\n"
+        "uniform mat4 ProjMtx;\n"
+        "out vec2 Frag_UV;\n"
+        "out vec4 Frag_Color;\n"
+        "void main() { Frag_UV = UV; Frag_Color = Color;\n"
+        "  gl_Position = ProjMtx * vec4(Position.xy, 0, 1); }\n";
+    static const char* fs =
+        "#version 330 core\n"
+        "uniform sampler2D YTex, UTex, VTex;\n"
+        "uniform mat3 YuvM;\n"
+        "uniform vec3 YuvOff;\n"
+        "in vec2 Frag_UV;\n"
+        "in vec4 Frag_Color;\n"
+        "out vec4 Out_Color;\n"
+        "void main() {\n"
+        "  vec3 yuv = vec3(texture(YTex, Frag_UV).r, texture(UTex, Frag_UV).r, texture(VTex, Frag_UV).r);\n"
+        "  vec3 rgb = clamp(YuvM * (yuv - YuvOff), 0.0, 1.0);\n"
+        "  Out_Color = vec4(rgb * Frag_Color.rgb, Frag_Color.a);\n"
+        "}\n";
+    unsigned vsh = gl_build_shader(GL_VERTEX_SHADER_, vs);
+    unsigned fsh = vsh ? gl_build_shader(GL_FRAGMENT_SHADER_, fs) : 0;
+    if (!fsh) { if (vsh) glDeleteShader(vsh); return false; }
+    g_yuvProg = glCreateProgram();
+    glAttachShader(g_yuvProg, vsh);
+    glAttachShader(g_yuvProg, fsh);
+    glLinkProgram(g_yuvProg);
+    glDeleteShader(vsh);
+    glDeleteShader(fsh);
+    GLint linked = 0;
+    glGetProgramiv(g_yuvProg, GL_LINK_STATUS_, &linked);
+    if (!linked) {
+        char log[512] = {};
+        glGetProgramInfoLog(g_yuvProg, sizeof(log) - 1, nullptr, log);
+        fprintf(stderr, "teidraw: video shader link failed: %s\n", log);
+        glDeleteProgram(g_yuvProg);
+        g_yuvProg = 0;
+        return false;
+    }
+    g_yuvProjLoc = glGetUniformLocation(g_yuvProg, "ProjMtx");
+    g_yuvYLoc = glGetUniformLocation(g_yuvProg, "YTex");
+    g_yuvULoc = glGetUniformLocation(g_yuvProg, "UTex");
+    g_yuvVLoc = glGetUniformLocation(g_yuvProg, "VTex");
+    g_yuvMLoc = glGetUniformLocation(g_yuvProg, "YuvM");
+    g_yuvOffLoc = glGetUniformLocation(g_yuvProg, "YuvOff");
+    return true;
+}
+
+// imgui's own projection for the current frame (same formula as the backend,
+// which is why reusing imgui's vertices works)
+static void gl_update_proj(ImVec2 dpos, ImVec2 dsize) {
+    float L = dpos.x, R = dpos.x + dsize.x, T = dpos.y, B = dpos.y + dsize.y;
+    if (R == L) R = L + 1;
+    if (B == T) B = T + 1;
+    const float m[16] = { 2.f / (R - L), 0, 0, 0,
+                          0, 2.f / (T - B), 0, 0,
+                          0, 0, -1.f, 0,
+                          (R + L) / (L - R), (T + B) / (B - T), 0, 1 };
+    memcpy(g_glProj, m, sizeof(m));
+}
+
+static void video_yuv_cb(const ImDrawList*, const ImDrawCmd* cmd) {
+    const PlayState* ps = (const PlayState*)cmd->UserCallbackData;
+    if (!ps || !g_yuvProg) return;
+    glUseProgram(g_yuvProg);
+    glUniformMatrix4fv(g_yuvProjLoc, 1, 0, g_glProj);
+    glUniformMatrix3fv(g_yuvMLoc, 1, 0, ps->yuvM);
+    glUniform3f(g_yuvOffLoc, ps->yuvOff[0], ps->yuvOff[1], ps->yuvOff[2]);
+    glUniform1i(g_yuvYLoc, 0);
+    glUniform1i(g_yuvULoc, 1);
+    glUniform1i(g_yuvVLoc, 2);
+    glActiveTexture(GL_TEXTURE1_); glBindTexture(GL_TEXTURE_2D_, ps->uTex);
+    glActiveTexture(GL_TEXTURE2_); glBindTexture(GL_TEXTURE_2D_, ps->vTex);
+    glActiveTexture(GL_TEXTURE0_); glBindTexture(GL_TEXTURE_2D_, ps->yTex);
+}
+
+static TexH make_r8_tex(int w, int h) {
+    TexH t = 0;
+    glGenTextures(1, &t);
+    if (!t) return 0;
+    glBindTexture(GL_TEXTURE_2D_, t);
+    glPixelStorei(GL_UNPACK_ALIGNMENT_, 1);
+    glTexImage2D(GL_TEXTURE_2D_, 0, GL_R8_, w, h, 0, GL_RED_, GL_UNSIGNED_BYTE_, nullptr);
+    tex_set_params(false);
+    return t;
+}
+
+static bool upload_planes(PlayState& ps, const YuvFrame& f) {
+    int cw = (f.w + 1) / 2, ch = (f.h + 1) / 2;
+    if (!ps.yTex || ps.yw != f.w || ps.yh != f.h) {
+        ps.release();
+        ps.yTex = make_r8_tex(f.w, f.h);
+        ps.uTex = make_r8_tex(cw, ch);
+        ps.vTex = make_r8_tex(cw, ch);
+        if (!ps.yTex || !ps.uTex || !ps.vTex) { ps.release(); return false; }
+        ps.yw = f.w; ps.yh = f.h;
+    }
+    memcpy(ps.yuvM, f.m, sizeof(ps.yuvM));
+    memcpy(ps.yuvOff, f.off, sizeof(ps.yuvOff));
+    glPixelStorei(GL_UNPACK_ALIGNMENT_, 1);
+    glBindTexture(GL_TEXTURE_2D_, ps.yTex);
+    glTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, f.w, f.h, GL_RED_, GL_UNSIGNED_BYTE_, f.y.data());
+    glBindTexture(GL_TEXTURE_2D_, ps.uTex);
+    glTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, cw, ch, GL_RED_, GL_UNSIGNED_BYTE_, f.u.data());
+    glBindTexture(GL_TEXTURE_2D_, ps.vTex);
+    glTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, cw, ch, GL_RED_, GL_UNSIGNED_BYTE_, f.v.data());
+    return true;
+}
 #endif
 
 // Advance playback + return the texture for this video/gif shape (poster
 // frame 0 when idle). Called from the draw pass every frame the shape is
 // visible.
-static TexH video_srv(const Shape& s, MediaKind mk) {
+static TexH video_srv(const Shape& s, MediaKind mk, const PlayState** yuvOut) {
     ProfScope ps(&g_pw.video);
     PlayState& st = play_state(s);
     g_pw.visVideos++;
     if (mk == MK_GIF) st.playing = true;   // gifs just loop, no controls
     if (st.playing) g_pw.playVideos++;
+    if (st.failed) return kNoTex;
+    video_workers_start();   // a queued request must not wait for someone else to open a file
+    // whichever texture this video currently has (YUV planes on Linux once a
+    // frame has landed, else the RGBA fallback) — every early return goes
+    // through here so a paused/budget-excluded video still draws its frame
+    auto current = [&]() -> TexH {
+#ifndef _WIN32
+        if (st.yTex) { *yuvOut = &st; return st.yTex; }
+#endif
+        return st.srv;
+    };
     VideoDecoder* d = nullptr;
     if (!st.haveMeta) {
-        // first touch: open the decoder ONCE for metadata + the poster.
-        // Afterwards a stopped video draws its cached texture without ever
-        // touching get_decoder again (the old code re-opened every visible
-        // video's decoder every frame — the churn that made dense views
-        // choppy).
+        // First touch. The open is ~20 ms and the poster decode can be worse,
+        // so the live view asks a worker and draws its placeholder for the
+        // frame or two that takes; headless/exports (--shot, clipboard,
+        // --export) keep the synchronous path, which is what makes those
+        // renders deterministic. Once metadata is in, a STOPPED video never
+        // touches its decoder again — the cached GPU texture outlives it.
+        // (headless counts as deterministic: a shot renders the same frame
+        // whether or not a worker happened to finish first)
+        if (g_interactiveFrame && !g_headless) {
+            if (!st.metaWanted) {
+                st.metaWanted = true;
+                st.metaReqTime = std::chrono::steady_clock::now();
+                st.reqIdx = st.t > 0 ? (int)(st.t * st.fps + 0.5) : 0;
+                std::lock_guard<std::mutex> lk(g_vqMx);
+                DecodeReq rq; rq.asset = s.asset; rq.idx = st.reqIdx; rq.wantMeta = true;
+                rq.seq = ++g_vqSeq; rq.gen = g_vqGen;
+                st.reqSeq = rq.seq;
+                g_vqWant[s.id] = rq;
+                g_vqCv.notify_one();
+            }
+            // safety net: if the pool never delivers (all workers stuck on
+            // other files), decode inline after a couple of seconds rather
+            // than staying blank forever — one video per frame at most, since
+            // the inline open+decode is exactly what we moved off the UI
+            // thread in the first place
+            if (std::chrono::steady_clock::now() - st.metaReqTime < std::chrono::seconds(2))
+                return kNoTex;
+            st.metaWanted = false;
+            g_metaFallbacks++;
+        }
+        { ProfScope os(&g_pw.videoOpen);
         d = get_decoder(s.asset);
-        if (!d) return kNoTex;
+        }
+        if (!d) { st.failed = true; return kNoTex; }
         st.fps = (float)d->fps; st.frames = d->frames; st.dur = d->duration(); st.hasAudio = d->hasAudio;
+        st.w = d->w; st.h = d->h;
         st.haveMeta = true;
-        if (!st.srv) {   // poster in-line (playhead frame when t>0 — loopA opens at A — else 0)
+        bool haveFrame = st.srv != kNoTex;
+#ifndef _WIN32
+        haveFrame = haveFrame || st.yTex != kNoTex;
+#endif
+        if (!haveFrame) {   // poster (playhead frame when t>0 — loopA opens at A — else 0)
+            ProfScope pst(&g_pw.videoPoster);
             int pidx = st.t > 0 ? (int)(st.t * st.fps + 0.5) : 0;
             if (st.frames > 0 && pidx >= st.frames) pidx = st.frames - 1;
+            std::lock_guard<std::mutex> lk(d->mx);
+#ifdef _WIN32
             std::vector<unsigned char> rgba;
-            bool ok;
-            { std::lock_guard<std::mutex> lk(d->mx); ok = d->decode_index(pidx, rgba); }
-            if (ok && !rgba.empty() && upload_rgba(st, rgba.data(), d->w, d->h)) st.shownIdx = pidx;
+            if (d->decode_index(pidx, rgba) && !rgba.empty() && upload_rgba(st, rgba.data(), d->w, d->h))
+                st.shownIdx = pidx;
+#else
+            if (mk == MK_GIF) {
+                std::vector<unsigned char> rgba;
+                if (d->decode_index(pidx, rgba) && !rgba.empty() && upload_rgba(st, rgba.data(), d->w, d->h))
+                    st.shownIdx = pidx;
+            } else {
+                YuvFrame yf;
+                if (d->decode_index_planes(pidx, yf) && upload_planes(st, yf)) st.shownIdx = pidx;
+            }
+#endif
         }
     }
-    if (!st.playing) return st.srv;   // stopped: cached texture only; the decoder may already be evicted
+    if (!st.playing) return current();   // stopped: cached texture only; the decoder may already be evicted
     // decode budget: only the active (cursor-nearest) playing media decode
     // new frames; the rest freeze on their cached texture (static thumb).
     // Exports/shots run their own frames (g_interactiveFrame false) and skip
     // the budget — everything stays live for them.
     if (g_interactiveFrame && ImGui::GetFrameCount() == g_activeBudgetFrame && !g_activeVideos.count(s.id))
-        return st.srv;
-    d = get_decoder(s.asset);   // keep resident while frames are wanted
-    if (!d) return kNoTex;
+        return current();
+    // NOTE: no get_decoder() on the UI thread here. It used to keep the
+    // decoder resident, but the decode workers already touch it on every
+    // request, and the call can block behind another thread's open or an
+    // eviction — measured at 114 ms once, on a 24-video board.
     {
         AudioOut* au = nullptr;
         if (mk == MK_VIDEO && s.sound && st.hasAudio && !g_headless) {
@@ -2570,36 +3073,116 @@ static TexH video_srv(const Shape& s, MediaKind mk) {
     else if (sw < kVideoRateMedW) rateK = 2;
     if (rateK > 1) idx = (idx / rateK) * rateK;
     if (st.frames > 0 && idx >= st.frames) idx = st.frames - 1;
+    // Decode scale: pick the source-size divisor that still covers the
+    // on-screen size, with hysteresis so a slow zoom doesn't re-decode every
+    // frame (and so the texture is only reallocated when it is worth it).
+    {
+        float screenW = fmaxf(1.f, s.size.x * g_cam.zoom);
+        float ratio = (float)st.w / screenW;   // source px per screen px
+        int want = st.scaleK;
+        if (ratio >= 3.0f) want = 4;
+        else if (ratio >= 1.6f) want = 2;
+        else if (ratio < 1.3f) want = 1;
+        st.scaleK = want;
+    }
+    if (idx != st.shownIdx) g_pw.vqWanted++;
     if (idx != st.shownIdx && idx != st.reqIdx) {
         unsigned fc = ImGui::GetFrameCount();
         if (fc - st.lastReqFrame >= (unsigned)kVideoReqEvery) {
             st.lastReqFrame = fc;
             {
                 std::lock_guard<std::mutex> lk(g_vqMx);
-                g_vqWant[s.id] = { s.asset, idx, g_vqGen };
+                g_pw.vqReqs++;
+                DecodeReq rq; rq.asset = s.asset; rq.idx = idx; rq.scaleK = st.scaleK;
+                rq.seq = ++g_vqSeq; rq.gen = g_vqGen;
+                st.reqSeq = rq.seq;
+                g_vqWant[s.id] = rq;
             }
             g_vqCv.notify_one();
             st.reqIdx = idx;
         }
     }
-    return st.srv;
+    return current();
 }
 
 // apply worker-decoded frames (called once per frame, before the draw pass)
+// once a second: grow the decode budget while the pool has headroom, shrink it
+// when decode is the bottleneck (utilization is summed decode time over
+// workers × wall time)
+static void video_budget_feedback() {
+    auto now = std::chrono::steady_clock::now();
+    if (g_budgetSampleT.time_since_epoch().count() == 0) { g_budgetSampleT = now; g_budgetSampleUs = g_decWorkUs.load(); return; }
+    double secs = std::chrono::duration<double>(now - g_budgetSampleT).count();
+    if (secs < 1.0) return;
+    long long nowUs = g_decWorkUs.load();
+    double busy = (double)(nowUs - g_budgetSampleUs) / 1.0e6;
+    g_budgetSampleUs = nowUs;
+    g_budgetSampleT = now;
+    double workers = g_vqWorkers.empty() ? 1.0 : (double)g_vqWorkers.size();
+    double util = busy / (secs * workers);
+    if (util < 0.55) g_videoActiveBudget = g_videoActiveBudget + 4 > kVideoActiveBudgetMax
+                                           ? kVideoActiveBudgetMax : g_videoActiveBudget + 4;
+    else if (util > 0.80) g_videoActiveBudget = g_videoActiveBudget - 4 < kVideoActiveBudgetMin
+                                              ? kVideoActiveBudgetMin : g_videoActiveBudget - 4;
+}
+
+// Uploads are the UI-thread half of video decode, so they get a per-frame
+// time budget like image uploads: a board that loads (or seeks) 24 videos at
+// once spreads their frames over a few frames instead of one long one.
+static const double kVideoUploadBudgetMs = 1.5;
+static std::vector<DecodeRes> g_vqPending;   // drained but not yet uploaded
+
 static void drain_video_results() {
     ProfScope ps(&g_pw.drain);
+    video_budget_feedback();
     std::vector<DecodeRes> done;
-    { std::lock_guard<std::mutex> lk(g_vqMx); done.swap(g_vqDone); if ((int)g_vqWant.size() > g_pw.queueDepth) g_pw.queueDepth = (int)g_vqWant.size(); }
-    for (auto& r : done) {
-        if (r.gen != g_vqGen) continue;   // board switched while this decoded
+    {
+        std::lock_guard<std::mutex> lk(g_vqMx);
+        done.swap(g_vqDone);
+        if ((int)g_vqWant.size() > g_pw.queueDepth) g_pw.queueDepth = (int)g_vqWant.size();
+    }
+    if (!g_vqPending.empty()) {   // leftovers from the previous frame go first
+        done.insert(done.begin(), std::make_move_iterator(g_vqPending.begin()), std::make_move_iterator(g_vqPending.end()));
+        g_vqPending.clear();
+    }
+    g_pw.vqRes += (long long)done.size();
+    auto uploadT0 = std::chrono::steady_clock::now();
+    for (size_t di = 0; di < done.size(); di++) {
+        auto& r = done[di];
+        if (di && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - uploadT0).count() >= kVideoUploadBudgetMs) {
+            g_vqPending.insert(g_vqPending.end(), std::make_move_iterator(done.begin() + di), std::make_move_iterator(done.end()));
+            break;
+        }
+        if (r.gen != g_vqGen) { g_pw.vqStale++; continue; }   // board switched while this decoded
         auto pit = g_play.find(r.shape);
         Shape* s = find_shape(r.shape);
         if (pit == g_play.end() || !s || s->asset != r.asset) continue;   // shape deleted/replaced
         PlayState& ps = pit->second;
         if (r.idx == ps.reqIdx) ps.reqIdx = -1;
-        if (r.rgba.empty()) continue;     // decode failed; a later frame may retry
-        // stale (superseded) results still upload — progressive scrub feedback
-        if (upload_rgba(ps, r.rgba.data(), r.w, r.h)) ps.shownIdx = r.idx;
+        if (r.wantMeta) {   // first-touch: either the metadata landed…
+            ps.metaWanted = false;
+            if (r.ok) {
+                ps.fps = r.fps; ps.frames = r.frames; ps.dur = r.dur; ps.hasAudio = r.hasAudio;
+                ps.w = r.w; ps.h = r.h;
+                ps.haveMeta = true;
+            } else {
+                ps.failed = true;   // …or this file is not decodable at all
+                continue;
+            }
+        }
+        if (!r.ok) continue;   // decode failed; a later frame may retry
+        // a result older than what is already on the GPU is dropped (a newer
+        // request superseded it); same-request results still upload, which is
+        // what makes scrubbing feel progressive
+        if (r.seq && r.seq < ps.doneSeq) continue;
+        ps.doneSeq = r.seq;
+#ifdef _WIN32
+        bool up = !r.rgba.empty() && upload_rgba(ps, r.rgba.data(), r.w, r.h);
+#else
+        bool up = (!r.yuv.y.empty() && upload_planes(ps, r.yuv)) ||
+                  (!r.rgba.empty() && upload_rgba(ps, r.rgba.data(), r.w, r.h));
+#endif
+        if (up) ps.shownIdx = r.idx;
     }
 }
 #endif
@@ -3741,8 +4324,9 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
         std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
             return a.dist < b.dist || (a.dist == b.dist && a.area > b.area);
         });
-        for (size_t i = 0; i < cands.size() && i < (size_t)kVideoActiveBudget; i++)
+        for (size_t i = 0; i < cands.size() && i < (size_t)g_videoActiveBudget; i++)
             g_activeVideos.insert(cands[i].id);
+        g_pw.vqBudget += (long long)g_activeVideos.size();
     }
     // zoomed-out cluster view: each group's biggest text member earns the
     // truncated label; the rest of the group grayboxes. Only needed when the
@@ -3800,6 +4384,7 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
             // same contract as the offscreen cull: playback pauses offstage
             if ((mx.x - mn.x) < kMediaGrayPx && !is_selected(s.id)) { draw_gray_box(dl, s); break; }
             TexH srv = kNoTex;
+            const PlayState* yuvPs = nullptr;
             MediaKind mk = media_kind(s.asset);
             float screenW = fabsf(mx.x - mn.x);
             float screenH = fabsf(mx.y - mn.y);
@@ -3812,9 +4397,15 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
                 }
             }
 #ifdef TEI_LIBAV
-            else srv = video_srv(s, mk);
+            else srv = video_srv(s, mk, &yuvPs);
 #endif
             ImU32 tint = with_opacity(IM_COL32_WHITE, s.opacity);
+            // a YUV video binds its own shader (the callback runs right before
+            // this range's draw, leaving imgui's VAO/scissor/blending alone)
+#ifndef _WIN32
+            bool useYuv = yuvPs != nullptr;
+            if (useYuv) dl->AddCallback(video_yuv_cb, (void*)yuvPs);
+#endif
             if (srv && s.rot == 0.f) {
                 float rpx = 5.f * g_cam.zoom;
                 if (rpx >= 1.0f) {
@@ -3837,6 +4428,9 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
                 dl->AddRect(mn, mx, IM_COL32(120, 120, 128, 120), 5.f);
                 dl->AddText(nullptr, 0.f, mn + ImVec2(10, 10), g_th.textDim, s.asset.c_str());
             }
+#ifndef _WIN32
+            if (useYuv) dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+#endif
         } break;
         case SH_GROUP: break;
         }
@@ -3956,6 +4550,7 @@ static bool render_rect_rgba(const WRect& r, const std::vector<uint64_t>* only,
         glViewport(0, 0, w, h);
         glClearColor(bg.x, bg.y, bg.z, 1.f);
         glClear(GL_COLOR_BUFFER_BIT_);
+        gl_update_proj(ImGui::GetDrawData()->DisplayPos, ImGui::GetDrawData()->DisplaySize);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         ok = read_fb_rgba(w, h, px);
     }
@@ -4720,7 +5315,7 @@ static void DrawProfOverlay() {
                 g_pw.overlay.n ? g_pw.overlay.sum / g_pw.overlay.n : 0.0,
                 g_pw.present.n ? g_pw.present.sum / g_pw.present.n : 0.0);
     ImGui::Text("decoders %d/%d | opens %d (avg %.1f ms) | evicts %d",
-                (int)g_decoders.size(), (int)kMaxDecoders, g_pw.decOpens,
+                (int)g_decoders.size(), (int)kMaxDecodersSoft, g_pw.decOpens,
                 g_pw.decOpens ? g_pw.decOpenMs / g_pw.decOpens : 0.0, g_pw.decEvicts);
     ImGui::Text("videos %d vis, %d playing | queue %d",
                 g_pw.frames ? g_pw.visVideos / g_pw.frames : 0,
@@ -6716,6 +7311,8 @@ int main(int argc, char** argv) {
     if (g_dpi <= 0.f) g_dpi = 1.f;
     ImGui_ImplSDL3_InitForOpenGL(g_win, g_glctx);
     if (!ImGui_ImplOpenGL3_Init("#version 150")) { fprintf(stderr, "teidraw: imgui GL init failed\n"); return 1; }
+    if (!gl_init_video_shader())   // YUV videos fall back to RGBA uploads if this fails
+        fprintf(stderr, "teidraw: video YUV shader unavailable, using RGBA uploads\n");
 #endif
     LoadFonts();
     ImGui::GetStyle().FontSizeBase = 15.f * g_dpi;
@@ -6791,6 +7388,8 @@ int main(int argc, char** argv) {
                 if (qe.shift) io.AddKeyEvent(ImGuiKey_LeftShift, false);
             }
         }
+        if (g_profile && g_profT0 == 0) { g_profStart = std::chrono::steady_clock::now(); g_profT0 = 1; }
+        g_uiFrame.store((uint64_t)ImGui::GetFrameCount(), std::memory_order_relaxed);
         ImGui::NewFrame();
         if (dropPath && framesDone == 2) {
             import_files_at({ dropPath }, S2W(ImVec2(800, 500)));
@@ -6871,6 +7470,7 @@ int main(int argc, char** argv) {
         glClear(GL_COLOR_BUFFER_BIT_);
         { ProfScope psec(&g_pw.render);
         prof_note_drawdata(ImGui::GetDrawData());
+        gl_update_proj(ImGui::GetDrawData()->DisplayPos, ImGui::GetDrawData()->DisplaySize);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         }
         // read the frame back BEFORE the swap (GL backbuffer contents after a
@@ -6897,10 +7497,11 @@ int main(int argc, char** argv) {
 
 #ifdef TEI_LIBAV
     audio_destroy_all();
-    if (g_vqWorker.joinable()) {
+    if (!g_vqWorkers.empty()) {
         { std::lock_guard<std::mutex> lk(g_vqMx); g_vqQuit = true; }
         g_vqCv.notify_all();
-        g_vqWorker.join();
+        for (auto& w : g_vqWorkers) if (w.joinable()) w.join();
+        g_vqWorkers.clear();
     }
 #endif
     if (!g_imgWorkers.empty()) {

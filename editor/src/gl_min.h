@@ -55,7 +55,25 @@ typedef ptrdiff_t     GLsizeiptr;
     X(void,    GetIntegerv,  (GLenum pname, GLint* out))                                             \
     X(void,    GetFloatv,    (GLenum pname, GLfloat* out))                                           \
     X(GLenum,  GetError,     (void))                                                                 \
-    X(void,    Finish,       (void))
+    X(void,    Finish,       (void))                                                                 \
+    X(GLuint,  CreateShader, (GLenum type))                                                          \
+    X(void,    ShaderSource, (GLuint sh, GLsizei count, const char* const* src, const GLint* len))  \
+    X(void,    CompileShader,(GLuint sh))                                                            \
+    X(void,    GetShaderiv,  (GLuint sh, GLenum pname, GLint* out))                                  \
+    X(void,    GetShaderInfoLog,(GLuint sh, GLsizei buf, GLsizei* len, char* log))                   \
+    X(void,    DeleteShader, (GLuint sh))                                                            \
+    X(GLuint,  CreateProgram,(void))                                                                 \
+    X(void,    AttachShader, (GLuint prog, GLuint sh))                                               \
+    X(void,    LinkProgram,  (GLuint prog))                                                          \
+    X(void,    GetProgramiv, (GLuint prog, GLenum pname, GLint* out))                                \
+    X(void,    GetProgramInfoLog,(GLuint prog, GLsizei buf, GLsizei* len, char* log))                \
+    X(void,    DeleteProgram,(GLuint prog))                                                          \
+    X(void,    UseProgram,   (GLuint prog))                                                          \
+    X(GLint,   GetUniformLocation,(GLuint prog, const char* name))                                   \
+    X(void,    Uniform1i,    (GLint loc, GLint v))                                                   \
+    X(void,    UniformMatrix3fv,(GLint loc, GLsizei n, GLboolean transpose, const GLfloat* m))       \
+    X(void,    Uniform3f,    (GLint loc, GLfloat a, GLfloat b, GLfloat c))                          \
+    X(void,    UniformMatrix4fv,(GLint loc, GLsizei n, GLboolean transpose, const GLfloat* m))
 
 struct GlMinProcs {
 #define TEI_GL_X(ret, name, args) ret (*name) args;
@@ -89,6 +107,24 @@ extern GlMinProcs g_glprocs;
 #define glGetFloatv           g_glprocs.GetFloatv
 #define glGetError            g_glprocs.GetError
 #define glFinish              g_glprocs.Finish
+#define glCreateShader        g_glprocs.CreateShader
+#define glShaderSource        g_glprocs.ShaderSource
+#define glCompileShader       g_glprocs.CompileShader
+#define glGetShaderiv         g_glprocs.GetShaderiv
+#define glGetShaderInfoLog    g_glprocs.GetShaderInfoLog
+#define glDeleteShader        g_glprocs.DeleteShader
+#define glCreateProgram       g_glprocs.CreateProgram
+#define glAttachShader        g_glprocs.AttachShader
+#define glLinkProgram         g_glprocs.LinkProgram
+#define glGetProgramiv        g_glprocs.GetProgramiv
+#define glGetProgramInfoLog   g_glprocs.GetProgramInfoLog
+#define glDeleteProgram       g_glprocs.DeleteProgram
+#define glUseProgram          g_glprocs.UseProgram
+#define glGetUniformLocation  g_glprocs.GetUniformLocation
+#define glUniform1i           g_glprocs.Uniform1i
+#define glUniformMatrix3fv    g_glprocs.UniformMatrix3fv
+#define glUniform3f           g_glprocs.Uniform3f
+#define glUniformMatrix4fv    g_glprocs.UniformMatrix4fv
 
 // GL constants used by the backend (core 3.3 + the anisotropy extension).
 #define GL_TEXTURE_2D_            0x0DE1
@@ -108,6 +144,9 @@ extern GlMinProcs g_glprocs;
 #define GL_RGBA8_                 0x8058
 #define GL_UNSIGNED_BYTE_         0x1401
 #define GL_UNPACK_ALIGNMENT_      0x0CF5
+#define GL_TEXTURE0_              0x84C0
+#define GL_TEXTURE1_              0x84C1
+#define GL_TEXTURE2_              0x84C2
 #define GL_PACK_ALIGNMENT_        0x0D05
 #define GL_COLOR_BUFFER_BIT_      0x00004000
 #define GL_FRAMEBUFFER_           0x8D40
@@ -119,6 +158,10 @@ extern GlMinProcs g_glprocs;
 #define GL_RENDERER_              0x1F01
 #define GL_VERSION_                0x1F02
 #define GL_TEXTURE_MAX_ANISOTROPY_EXT_ 0x84FE
+#define GL_FRAGMENT_SHADER_       0x8B30
+#define GL_VERTEX_SHADER_         0x8B31
+#define GL_COMPILE_STATUS_        0x8B81
+#define GL_LINK_STATUS_           0x8B82
 #define GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT_ 0x84FF
 
 // Resolve every entry point against the current context. False if any is
