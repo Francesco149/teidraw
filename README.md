@@ -17,7 +17,7 @@ https://github.com/user-attachments/assets/52881db0-0aff-48bb-91ca-2afc95dce8fe
 Nightly builds, auto-published from `master`:
 
 - **Windows (x64)** — [teidraw-windows-x64.zip](../../releases/latest/download/teidraw-windows-x64.zip) — single self-contained exe, the daily-driven build.
-- **Linux (x64)** — [teidraw-linux-x64.tar.gz](../../releases/latest/download/teidraw-linux-x64.tar.gz) — ⚠️ **new and not battle-tested** (fresh SDL3 port); feedback via issues/PRs is very welcome. Single binary, static SDL3 + ffmpeg, X11/Wayland picked at runtime.
+- **Linux (x64)** — [teidraw-linux-x64.tar.gz](../../releases/latest/download/teidraw-linux-x64.tar.gz) — ⚠️ **new and not battle-tested** (fresh SDL3 port); feedback via issues/PRs is very welcome. Single binary, static SDL3 + ffmpeg, X11/Wayland picked at runtime, rendering through OpenGL 3.3 (any Mesa/AMD/NVIDIA driver has it; installed by default on desktop distros).
 
 No installer: unzip and run. Boards and settings stay in plain folders you own.
 
@@ -128,7 +128,11 @@ imgui ≥1.92 (`IMGUI=`), stb (`STBI=`) and nlohmann json (`JSON_INC=`) — see
 non-nix recipe.
 
 Dev verification is screenshot-driven: `teidraw <board> --shot out.png`
-renders headless (on Linux truly headless via SDL's offscreen driver).
+renders headless (on Linux truly headless via SDL's offscreen driver + EGL,
+which needs a GL driver present — `LIBGL_ALWAYS_SOFTWARE=1` forces llvmpipe on
+a machine without a GPU). Perf work is measured, not guessed: `tools/mkboard.py`
+generates deterministic stress boards and `--profile N [--novsync] [--pan-t px]`
+prints the frame breakdown — see session 13 in docs/STATUS.md.
 
 ## More
 

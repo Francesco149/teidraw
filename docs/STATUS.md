@@ -1,7 +1,87 @@
 # STATUS — live front
 
-*Updated: 2026-09-04 (session 12). History lives in
+*Updated: 2026-09-17 (session 13). History lives in
 `git log` — this file only describes NOW.*
+
+## Session 13 — the render-path/perf ceiling pass (Linux GL backend, mipmapped images, parallel video)
+Driven by two asks: "the manga pages on my board render at a lower mip level,
+quite blurry" and "absolute performance ceiling with many images/text/videos on
+screen, also while moving". Measured first, on copies of the real boards —
+nothing here is a guess.
+
+**The blur bug (fixed, reproduced, both platforms).** `sweep_play_states()`
+destroyed an image's full-res texture after 600 undrawn frames and *nothing
+ever re-requested it*: the interactive draw path fell through to the 512 px
+thumbnail and stayed there forever. On a long vertical board that is exactly
+"scroll away for ten seconds, come back blurry". Repro: same camera, one
+1144×1600 page, pan it off screen for 600+ frames and back — crop
+high-frequency energy 31.6 (blurry) vs 110.8 (fixed) on Windows and 31.6 vs
+112.9 on Linux; the 3.5× gap is the upscaled thumbnail vs the real thing.
+
+**Linux rendering is now direct OpenGL 3.3 (`imgui_impl_opengl3`), not
+SDL_Renderer.** SDL's GL path re-uploads the whole ImGui vertex buffer *per
+draw command* — measured ≈62 µs/cmd at ~30k verts: 11.5 ms of a 12.3 ms frame
+on `indonesia` (a text-heavy board), ~90 % of everything. With GL: render
+11.55 → 0.19 ms, frame 12.6 → 1.3 ms. Entry points come from a 45-function
+loader in `editor/src/gl_min.h` (SDL_GL_GetProcAddress — no GL headers, no
+`-lGL`, no new build deps); EGL vendor selection happens *before* `SDL_Init`
+because glvnd resolves vendors exactly once per process (a nix-built binary on
+a non-NixOS host needs the Mesa JSON from its own store — that is why plain
+"try SDL first" cannot work).
+
+**Images: real mip chains, an always-resident low LOD, and a budget that
+re-promotes.** Full-detail textures carry a mip chain (trilinear + anisotropic)
+instead of the old 512 px "thumbnail LOD" hard switch: crisp at every zoom, no
+minification shimmer, and a zoomed-out board samples small mips instead of
+8 MB level 0. A separate ≤256 px always-resident copy draws while the full one
+streams in. Full-detail textures are evicted under a byte budget (LRU, 768 MB
+default, `TEIDRAW_TEX_BUDGET_MB` override) and **re-requested when the shape
+needs the detail again** — with the budget forced to 1 MB (constant
+evict/re-promote) the render is byte-identical to the unthrottled one. Uploads
+are time-budgeted (1.6 ms/frame) instead of "4 images per frame".
+
+**Video: GPU YUV, parallel decode, decode-at-scale.** Frames upload as three R8
+planes (1.5 bytes/px, native decoder output — usually no swscale at all) and a
+shader converts with the frame's own BT.601/709 + range tags (verified against
+ffmpeg's decode: 253,0,0 vs 251,0,0 on a flat red BT.709 source). Decode runs on
+a worker pool (≤4, one file at a time each); decoder opens, metadata and the
+poster moved off the UI thread (first-touch requests jump the queue; the
+`--shot`/`--export` path stays synchronous so those renders stay deterministic).
+A video shown 150 px wide decodes at 1/4 size (SWS_AREA) — uploads drop 16× and
+minification stops aliasing. The decode budget (how many playing media decode
+at once) follows the pool's measured utilization: 8 → 32 as headroom allows.
+Decoder cache residency is soft-capped (only decoders idle ≥300 frames are
+dropped, hard ceiling 40) — a 24-video view used to evict/re-open ~40 decoders
+per run, now it opens 24 and evicts 0.
+
+**Numbers (1600×1000, iGPU).** *Linux*: `indonesia` 12.6 → 1.3 ms/frame; 24
+playing videos 7.6 → 0.76 ms and 8.44 ms (= one vblank) in the live window,
+667 decodes/s, zero spikes over 4000 frames. *Windows/wslop*: 24 playing videos
+at the display's 60 Hz with 1.25 ms of work per frame, 694 decodes/s; an
+image+text board panning uses 0.09 ms/frame. Text/layout is *not* the
+bottleneck any more (300 texts: 0.09 ms draw), so no layout cache was added.
+
+**Measurement harness (kept):** `tools/mkboard.py` builds deterministic stress
+boards (procedural manga pages, texts, videos, strokes; `--cols/--cam-z/--play`);
+`--novsync` measures real frame cost instead of the vblank wait; `--pan-t` pans
+down and back (the "while moving" case); `--async-img` exercises the interactive
+image path head-lessly; `--profile` now also reports draw-call/vertex counts,
+decode throughput, request/result/stale plumbing, budget size and inline
+fallbacks. Windows builds write a backtrace to `teidraw-crash.txt` on a fault
+(there is no debugger attached on the Windows host).
+
+**Windows parity:** D3D11 stills get the same mip chains + the residency policy
+(the logic is shared), plus a draw-callback sampler override — imgui's D3D11
+sampler pins `MaxLOD = 0`, so the chains would otherwise never be sampled.
+Video on Windows uploads scaled RGBA (the Linux YUV shader is not ported yet);
+`decode-at-scale` works there too, which is what the "24 videos" numbers above
+are.
+
+**Known follow-ups:** Windows video still converts to RGBA on the CPU (port the
+YUV shader when it matters); images keep their decoded pixels only in GPU
+memory (an evicted image re-decodes from disk — a RAM LRU would trade memory
+for it); GL 3.3 is now a hard requirement on Linux (any Mesa/AMD/NVIDIA driver
+provides it; headless uses EGL surfaceless, CI pins llvmpipe).
 
 ## Session 12 — image pipeline overhaul: async worker pool + dual-LOD thumbnails + Linux hardware acceleration
 **Async image decoding pool:** synchronous main-thread `stbi_load` was the root
@@ -124,7 +204,7 @@ only a ceiling for the PLAYING set.
 the single worker thread, so ~20 playing videos saturate it and everything
 stutters. Per the user's proposal, only the `kVideoActiveBudget` (6)
 PLAYING media NEAREST THE CURSOR decode new frames; the rest freeze on
-their cached texture (poster/last frame — a static thumbnail, free) and
+their cached texture (poster/last frame — a static image, free) and
 resume when the cursor comes near. The set is rebuilt per interactive frame
 in `draw_doc_shapes`; exports/shots run their own frames and bypass the
 budget. Profile, 22 playing videos: queue depth max 6 (exactly the budget),
@@ -380,11 +460,20 @@ deletion is ever needed.
 ## Build & verify
 ```
 nix develop --command make -C editor            # build/teidraw.exe
+nix develop --command make -C editor linux      # build/teidraw (SDL3 + OpenGL 3.3)
 ./build/teidraw.exe scratch                     # interactive on the Win host
 ./build/teidraw.exe scratch --shot build/s.png --frames 8   # headless verify
 ./build/teidraw.exe dir --export out.png        # board bounds → PNG, then exit
 ./build/teidraw.exe dir --export-txt out.txt    # text outline, then exit
 ```
+Perf harness (session 13): `--profile N` prints the frame breakdown + decode
+stats; add `--novsync` for real frame costs, `--pan-t <px>` to pan down and
+back, `--play` to run videos headless, `--async-img` to exercise the
+interactive image path. `python3 tools/mkboard.py DIR --images 24 --videos 12
+--texts 60 --cols 5 --cam-z 0.4 --play` generates a deterministic stress board.
+Linux headless (`--shot`/`--export`) needs a GL 3.3 context: SDL's offscreen
+driver + EGL surfaceless, which on a GPU-less machine means Mesa's llvmpipe
+(`LIBGL_ALWAYS_SOFTWARE=1` pins it deliberately).
 `scratch/` is the user's live test board — do NOT script-edit it (and NEVER
 write nextId from a script; the load-time sanitizer exists because that
 minted duplicate ids once). Use a throwaway dir under the scratchpad for

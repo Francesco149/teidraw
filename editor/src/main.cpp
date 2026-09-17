@@ -248,6 +248,45 @@ static bool read_texture_rgba(ID3D11Texture2D* tex, std::vector<unsigned char>& 
     return true;
 }
 
+// Windows has no gdb here: on a fault, dump the exception and a heuristic
+// backtrace (stack words that point inside our own image, as module+offset)
+// so the crash can be mapped with `nm`/`objdump` without a debugger attached.
+static void crash_log(const char* text) {   // written with Win32 (stderr may be buffered/lost)
+    HANDLE f = CreateFileA("teidraw-crash.txt", FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD n = 0;
+    WriteFile(f, text, (DWORD)strlen(text), &n, nullptr);
+    CloseHandle(f);
+}
+
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS* ep) {
+    const auto* er = ep->ExceptionRecord;
+    uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+    char buf[256];
+    snprintf(buf, sizeof(buf), "CRASH code=0x%08lx offset=0x%llx\n",
+             (unsigned long)er->ExceptionCode,
+             (unsigned long long)((uintptr_t)er->ExceptionAddress - base));
+    crash_log(buf);
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
+        snprintf(buf, sizeof(buf), "  %s at %p\n",
+                 er->ExceptionInformation[0] ? "write" : "read", (void*)er->ExceptionInformation[1]);
+        crash_log(buf);
+    }
+    const uintptr_t* sp = (const uintptr_t*)ep->ContextRecord->Rsp;
+    int shown = 0;
+    for (int i = 0; i < 8192 && shown < 32; i++) {
+        uintptr_t v = sp[i];
+        if (v > base && v < base + (64u << 20)) {
+            snprintf(buf, sizeof(buf), "  frame[%d] teidraw+0x%llx\n", i, (unsigned long long)(v - base));
+            crash_log(buf);
+            shown++;
+        }
+    }
+    fflush(nullptr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 // Save the current backbuffer as a PNG (the --shot verification path).
 static bool SaveBackbufferPNG(const char* path) {
     ID3D11Texture2D* bb = nullptr;
@@ -1405,18 +1444,48 @@ static std::string from_w(const wchar_t* w) {
     return s;
 }
 
+// Full mip chain (level 0 uploaded, the rest generated on the GPU): the same
+// minification story as the Linux backend — crisp at every zoom, no shimmer,
+// and a zoomed-out board samples small mips instead of 8 MB level 0.
+// IMMUTABLE can't generate mips, so this is a DEFAULT texture + GenerateMips.
 static TexH make_rgba_tex(const unsigned char* px, int w, int h) {
     D3D11_TEXTURE2D_DESC td = {};
-    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Width = w; td.Height = h; td.MipLevels = 0; td.ArraySize = 1;
     td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA sd = { px, (UINT)(w * 4), 0 };
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
     ID3D11Texture2D* tex = nullptr;
-    if (FAILED(g_dev->CreateTexture2D(&td, &sd, &tex))) return nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &tex))) return nullptr;
+    g_ctx->UpdateSubresource(tex, 0, nullptr, px, (UINT)(w * 4), 0);
     ID3D11ShaderResourceView* srv = nullptr;
     g_dev->CreateShaderResourceView(tex, nullptr, &srv);
+    if (srv) g_ctx->GenerateMips(srv);
     tex->Release();
     return srv;
+}
+
+// imgui's D3D11 sampler pins MaxLOD = 0 (mip level 0 only), which would make
+// the chains above pointless. Images therefore push this sampler through a
+// draw callback and reset the render state afterwards — same trick the Linux
+// YUV path uses, no third-party patch.
+static ID3D11SamplerState* g_imgSampler = nullptr;
+static void img_sampler_cb(const ImDrawList*, const ImDrawCmd*) {
+    if (g_imgSampler) g_ctx->PSSetSamplers(0, 1, &g_imgSampler);
+}
+static void ensure_img_sampler() {
+    if (g_imgSampler) return;
+    D3D11_SAMPLER_DESC sd = {};
+    sd.Filter = D3D11_FILTER_ANISOTROPIC;
+    sd.MaxAnisotropy = 8;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.ComparisonFunc = D3D11_COMPARISON_ALWAYS;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(g_dev->CreateSamplerState(&sd, &g_imgSampler))) {
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.MaxAnisotropy = 1;
+        g_dev->CreateSamplerState(&sd, &g_imgSampler);
+    }
 }
 static void tex_destroy(TexH t) { if (t) t->Release(); }
 #else
@@ -1889,6 +1958,7 @@ struct VideoDecoder {
     // overrun for widths such as 426 (coded as 432), corrupting the heap.
     uint8_t*          rgbaData[4]{};
     int               rgbaStride[4]{};
+    int               rgbaW = 0, rgbaH = 0;
     uint8_t*          yuvData[4]{};     // staging for the swscale→YUV420P cases
     int               yuvStride[4]{};
     int               yuvW = 0, yuvH = 0;
@@ -1935,10 +2005,7 @@ struct VideoDecoder {
             frames = dur > 0 ? (int)(dur * fps + 0.5) : 0;
         }
         frame = av_frame_alloc(); pkt = av_packet_alloc();
-        int rgbaBytes = w > 0 && h > 0
-                      ? av_image_alloc(rgbaData, rgbaStride, w, h, AV_PIX_FMT_RGBA, 32)
-                      : -1;
-        ok = frame && pkt && rgbaBytes >= 0;
+        ok = frame && pkt && w > 0 && h > 0;
         return ok;
     }
     void close() {
@@ -1954,18 +2021,39 @@ struct VideoDecoder {
     double duration() const { return fps > 0 ? frames / fps : 0; }
     // `frame` → packed RGBA (GIFs: keeps alpha; also the fallback when the
     // YUV shader is unavailable)
-    bool emit_rgba(std::vector<unsigned char>& out) {
+    // scaleK > 1 decodes straight to a fraction of the source size: a video
+    // shown 150 px wide has no use for 1280 px of frame uploaded 30×/s, and
+    // sampling a full-res frame that far down aliases (no mip chain on
+    // streaming video — the scaler is the mip chain). Integer ratios use
+    // SWS_AREA, a real box filter.
+    bool emit_rgba(std::vector<unsigned char>& out, int scaleK = 1,
+                   int* outW = nullptr, int* outH = nullptr) {
         if (!frame || !frame->data[0]) return false;
+        int dw = w, dh = h;
+        if (scaleK > 1) {
+            dw = (w / scaleK) & ~1; dh = (h / scaleK) & ~1;
+            if (dw < 8 || dh < 8) { dw = w; dh = h; }
+        }
+        bool scaled = dw != w || dh != h;
         sws = sws_getCachedContext(sws, frame->width, frame->height, (AVPixelFormat)frame->format,
-                                   w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+                                   dw, dh, AV_PIX_FMT_RGBA,
+                                   (scaled && w % scaleK == 0 && h % scaleK == 0) ? SWS_AREA : SWS_BILINEAR,
+                                   nullptr, nullptr, nullptr);
         if (!sws) return false;
+        if (rgbaW != dw || rgbaH != dh) {
+            av_freep(&rgbaData[0]);
+            if (av_image_alloc(rgbaData, rgbaStride, dw, dh, AV_PIX_FMT_RGBA, 32) < 0) { rgbaW = rgbaH = 0; return false; }
+            rgbaW = dw; rgbaH = dh;
+        }
         if (sws_scale(sws, frame->data, frame->linesize, 0, frame->height,
-                      rgbaData, rgbaStride) != h) return false;
-        size_t rowBytes = (size_t)w * 4;
-        out.resize(rowBytes * h);
-        for (int y = 0; y < h; y++)
+                      rgbaData, rgbaStride) != dh) return false;
+        size_t rowBytes = (size_t)dw * 4;
+        out.resize(rowBytes * dh);
+        for (int y = 0; y < dh; y++)
             memcpy(out.data() + (size_t)y * rowBytes,
                    rgbaData[0] + (size_t)y * rgbaStride[0], rowBytes);
+        if (outW) *outW = dw;
+        if (outH) *outH = dh;
         return true;
     }
     // `frame` → YUV420P planes (the fast path: normally a straight row copy)
@@ -2092,6 +2180,13 @@ struct VideoDecoder {
         cur_idx = -1;
         return false;
     }
+    // scaled variant used by the decode pool (see emit_rgba)
+    bool decode_index_rgba(int idx, std::vector<unsigned char>& out, int scaleK, int* outW, int* outH) {
+        if (!decode_index(idx)) return false;
+        if (emit_rgba(out, scaleK, outW, outH)) return true;
+        cur_idx = -1;
+        return false;
+    }
     bool decode_index_planes(int idx, YuvFrame& out, int scaleK = 1) {
         if (!decode_index(idx)) return false;
         if ((scaleK > 1 ? emit_planes_scaled(out, scaleK) : emit_planes(out))) return true;
@@ -2171,6 +2266,7 @@ struct DecodeReq { std::string asset; int idx = 0; bool wantMeta = false; int sc
                   unsigned seq = 0, gen = 0; };
 struct DecodeRes {
     uint64_t shape = 0; std::string asset; int idx = 0, w = 0, h = 0;
+    int pw = 0, ph = 0;                // payload size (video may decode at 1/K)
     unsigned gen = 0;
     bool ok = false;
     bool wantMeta = false;
@@ -2245,12 +2341,13 @@ static void video_worker() {
         if (d) {
             res.w = d->w; res.h = d->h;
             if (d->decode_index(req.idx)) {
-#ifdef _WIN32
-                if (d->emit_rgba(res.rgba)) res.ok = true;
-#else
-                // GIFs keep RGBA (palette alpha); videos go through the GPU
-                // conversion — 1.5 B/px and no swscale
+                // GIFs keep RGBA (palette alpha) and their own scale; videos
+                // either go through the GPU conversion (Linux: 1.5 B/px, no
+                // swscale) or upload scaled RGBA (Windows).
                 bool gif = media_kind(req.asset) == MK_GIF;
+#ifdef _WIN32
+                if (d->emit_rgba(res.rgba, gif ? 1 : req.scaleK, &res.pw, &res.ph)) res.ok = true;
+#else
                 if (gif ? d->emit_rgba(res.rgba) : d->emit_planes_scaled(res.yuv, req.scaleK)) res.ok = true;
 #endif
                 if (req.wantMeta) {
@@ -3177,10 +3274,12 @@ static void drain_video_results() {
         if (r.seq && r.seq < ps.doneSeq) continue;
         ps.doneSeq = r.seq;
 #ifdef _WIN32
-        bool up = !r.rgba.empty() && upload_rgba(ps, r.rgba.data(), r.w, r.h);
+        // payload dims, not source dims: a video may have decoded at 1/K
+        bool up = !r.rgba.empty() && upload_rgba(ps, r.rgba.data(),
+                                                 r.pw ? r.pw : r.w, r.ph ? r.ph : r.h);
 #else
         bool up = (!r.yuv.y.empty() && upload_planes(ps, r.yuv)) ||
-                  (!r.rgba.empty() && upload_rgba(ps, r.rgba.data(), r.w, r.h));
+                  (!r.rgba.empty() && upload_rgba(ps, r.rgba.data(), r.pw ? r.pw : r.w, r.ph ? r.ph : r.h));
 #endif
         if (up) ps.shownIdx = r.idx;
     }
@@ -4406,6 +4505,12 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
             bool useYuv = yuvPs != nullptr;
             if (useYuv) dl->AddCallback(video_yuv_cb, (void*)yuvPs);
 #endif
+            // (D3D11: imgui's sampler stops at mip 0, so image draws borrow a
+            // mip-capable one and reset the render state right after)
+#ifdef _WIN32
+            bool preSampler = srv != kNoTex;
+            if (preSampler) { ensure_img_sampler(); dl->AddCallback(img_sampler_cb, nullptr); }
+#endif
             if (srv && s.rot == 0.f) {
                 float rpx = 5.f * g_cam.zoom;
                 if (rpx >= 1.0f) {
@@ -4428,7 +4533,9 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
                 dl->AddRect(mn, mx, IM_COL32(120, 120, 128, 120), 5.f);
                 dl->AddText(nullptr, 0.f, mn + ImVec2(10, 10), g_th.textDim, s.asset.c_str());
             }
-#ifndef _WIN32
+#ifdef _WIN32
+            if (preSampler) dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+#else
             if (useYuv) dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
 #endif
         } break;
@@ -7152,6 +7259,9 @@ static bool sdl_pump_events() {
 #endif
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    setvbuf(stderr, nullptr, _IONBF, 0);   // never lose diagnostics to a crash
+#endif
     // teidraw [projectDir] [--shot out.png | --export out.png | --export-txt out.txt] [--frames N]
     // No projectDir: reopen the last board (recent[0]); first run = the picker.
     const char* shotPath = nullptr; int shotFrames = 8;
@@ -7236,7 +7346,9 @@ int main(int argc, char** argv) {
                               CW_USEDEFAULT, CW_USEDEFAULT, 1600, 1000, nullptr, nullptr, wc.hInstance, nullptr);
     if (!CreateDeviceD3D(hwnd)) { fprintf(stderr, "teidraw: D3D11 init failed\n"); return 1; }
     g_hwnd = hwnd;
+    fprintf(stderr, "teidraw: D3D11 device ready\n");
     DragAcceptFiles(hwnd, TRUE);
+    SetUnhandledExceptionFilter(crash_filter);
     ShowWindow(hwnd, SW_SHOWMAXIMIZED);
     UpdateWindow(hwnd);
 #else

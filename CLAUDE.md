@@ -5,8 +5,11 @@ one purpose, complexity hidden, heuristics that guess intent, and an obsessively
 smooth/responsive canvas. Native **C++ · Dear ImGui 1.92**, two backends in one
 TU behind `#ifdef _WIN32`: **D3D11 · Win32** (primary; cross-compiled to a Win64
 PE with **mingw-w64 from the nix flake** — the proven slopstudio pattern — run
-on the Win11 host via WSLInterop) and **SDL3 · SDL_Renderer** for Linux
-(`make -C editor linux`; newer, less battle-tested). Primary primitives:
+on the Win11 host via WSLInterop) and **SDL3 · OpenGL 3.3 core** for Linux
+(`make -C editor linux`; newer, less battle-tested). SDL_Renderer was dropped in
+session 13: its GL path re-uploads the whole vertex buffer per draw command
+(~62 µs/cmd ⇒ ~90 % of a frame on text-heavy boards) and it cannot set texture
+filtering, which mipmapped images/video need. Primary primitives:
 **text, arrows, images/gifs/videos, groups, freehand strokes** — deliberately
 NOT every tldraw feature.
 
@@ -24,6 +27,13 @@ This file auto-loads every session. The repo is the source of truth.
   crisp at every zoom; glyphs cap at `kMaxGlyphPx` then scale geometrically.
 - **Scroll = zoom at cursor. Always.** (The one deliberate tldraw departure.)
   Pan = middle-drag / space+drag / right-DRAG (right-CLICK = context menu).
+- **Media:** images/video carry real mip chains (+ anisotropy) so minification is
+  crisp; each image keeps an always-resident ≤256 px LOD, full detail is LRU
+  evicted under a GPU byte budget and *re-requested* when needed
+  (`TEIDRAW_TEX_BUDGET_MB`), uploads are time-budgeted. Video decodes on a worker
+  pool and (Linux) uploads YUV planes the shader converts; it decodes at display
+  scale. Numbers + how to re-measure: session 13 in docs/STATUS.md
+  (`tools/mkboard.py`, `--profile`, `--novsync`, `--pan-t`, `--play`).
 - Anything that isn't an immediate primitive lives in the right-click menu.
 
 ## Interaction heuristics implemented (the "guess what I want" list)

@@ -92,6 +92,7 @@ jobs:
             libxfixes-dev libxss-dev libxtst-dev libxinerama-dev libxkbcommon-dev \
             libwayland-dev wayland-protocols libdecor-0-dev \
             libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev libegl1-mesa-dev \
+            libgl1-mesa-dri \
             libdbus-1-dev libibus-1.0-dev libudev-dev liburing-dev \
             libasound2-dev libpulse-dev libpipewire-0.3-dev libjack-dev libsndio-dev
       - name: cache static SDL3 + ffmpeg
@@ -137,6 +138,11 @@ jobs:
             LIN_FFMPEG_LIBS="$(pkg-config --static --libs libavformat libavcodec libswscale libswresample libavutil)"
           strip build/teidraw
       - name: smoke test (offscreen --shot + --export-txt, no display needed)
+        # headless rendering goes through a real GL context (SDL's offscreen
+        # driver + EGL surfaceless); LIBGL_ALWAYS_SOFTWARE pins it to llvmpipe
+        # so the test never depends on a GPU being present on the runner.
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
         run: |
           ./build/teidraw /tmp/ciboard --shot /tmp/ci-shot.png --frames 4
           ./build/teidraw /tmp/ciboard --export-txt /tmp/ci-outline.txt
