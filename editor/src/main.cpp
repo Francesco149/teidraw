@@ -56,6 +56,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <regex>          // find (Ctrl+F): user patterns over text shapes
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -386,6 +387,10 @@ static bool SaveBackbufferPNG(const char* path) {
 struct Theme {
     ImU32 canvasBg, gridDot, panelBg, panelBorder, accent, textMain, textDim;
     ImU32 selStroke, selFill, handleFill;
+    // find (Ctrl+F) marks: a marker-pen yellow, independent of the ink palette
+    // so a hit reads as a hit whatever color the text is. The current hit gets
+    // the stronger fill + the ring.
+    ImU32 findHl, findHlCur, findEdge;
 };
 static bool  g_darkMode = true;
 static Theme g_th;
@@ -402,6 +407,9 @@ static void ApplyTheme() {
         g_th.selStroke   = IM_COL32(76, 146, 255, 255);
         g_th.selFill     = IM_COL32(76, 146, 255, 26);
         g_th.handleFill  = IM_COL32(28, 30, 34, 255);
+        g_th.findHl      = IM_COL32(250, 204, 21, 58);    // a streak under every hit
+        g_th.findHlCur   = IM_COL32(250, 204, 21, 132);   // the one you're on
+        g_th.findEdge    = IM_COL32(250, 204, 21, 255);
     } else {
         g_th.canvasBg    = IM_COL32(249, 250, 251, 255);
         g_th.gridDot     = IM_COL32(0, 0, 0, 30);
@@ -413,6 +421,9 @@ static void ApplyTheme() {
         g_th.selStroke   = IM_COL32(46, 116, 235, 255);
         g_th.selFill     = IM_COL32(46, 116, 235, 22);
         g_th.handleFill  = IM_COL32(255, 255, 255, 255);
+        g_th.findHl      = IM_COL32(255, 208, 0, 96);     // white paper needs more ink
+        g_th.findHlCur   = IM_COL32(255, 196, 0, 190);
+        g_th.findEdge    = IM_COL32(196, 142, 0, 255);
     }
     ImGuiStyle& s = ImGui::GetStyle();
     ImGui::StyleColorsDark(&s);
@@ -612,6 +623,7 @@ struct Doc {
 static Doc g_doc;
 static std::string g_projDir;    // project dir (board.json + assets/ + undo.jsonl)
 static bool g_headless = false;  // --shot/--export: no recents, no audio
+static bool g_interactiveFrame = false;   // set by CanvasFrame, cleared by exports/shots
 
 static void delete_shapes(const std::vector<uint64_t>& ids);   // fwd (load-time sanitize)
 // id → doc index, memoized: arrows resolve their bind target every frame, so
@@ -1421,6 +1433,303 @@ static void reorder_selected(bool front) {
     g_doc.shapes.clear();
     if (front) { for (auto& s : rest) g_doc.shapes.push_back(s); for (auto& s : moved) g_doc.shapes.push_back(s); }
     else       { for (auto& s : moved) g_doc.shapes.push_back(s); for (auto& s : rest) g_doc.shapes.push_back(s); }
+}
+
+// ───────────────────── find (Ctrl+F): regex over text shapes ────────────────
+// Find searches every text shape's string as you type, marks every hit under
+// its glyphs (the current one brighter, ringed) and flies the camera to it.
+// Ctrl+G / Ctrl+Shift+G — or enter / prev / next — cycle; esc or "close"
+// dismisses (the query is remembered, so Ctrl+F resumes where you stopped).
+// The pattern is a regex, ECMAScript (the JS flavor, the one people know),
+// matched case-insensitively unless "Aa" is on.
+//
+// Matching runs on ONE worker thread, latest query wins, because a hand-typed
+// pattern can backtrack pathologically: libstdc++'s std::regex spends 13 ms on
+// "(a+)+b" against 16 a's, 3.3 s against 24 and 54 s against 28 — on the UI
+// thread that is a frozen canvas while you type the next character. The worker
+// only ever sees a snapshot of (id, text) pairs, never the document. Its state
+// is leaked on purpose: a runaway match may still be running at quit, and
+// joining it would hang the exit.
+struct FindHit { uint64_t id = 0; int b = 0, e = 0; };   // byte range in a shape's text
+static const int   kFindMaxHits = 2000;   // pathological-pattern ceiling ("a?" × a wall of text)
+static const float kFindLandPx  = 16.f;   // screen px a landing keeps the text at
+
+struct FindWorker {
+    std::mutex mx; std::condition_variable cv;
+    bool started = false, want = false, quit = false;
+    std::string query; bool icase = false;
+    std::vector<std::pair<uint64_t, std::string>> texts;   // snapshot, taken on the main thread
+    std::vector<FindHit> hits; std::string err; bool capped = false;
+    uint64_t serial = 0;   // bumps when a result lands; the UI adopts unseen serials
+};
+static FindWorker& g_find = *new FindWorker;   // never destroyed (see above)
+static std::thread g_findThread;
+
+static void find_worker() {
+    std::unique_lock<std::mutex> lk(g_find.mx);
+    for (;;) {
+        g_find.cv.wait(lk, [] { return g_find.want || g_find.quit; });
+        if (g_find.quit) return;
+        std::string q = g_find.query;
+        bool ic = g_find.icase;
+        std::vector<std::pair<uint64_t, std::string>> texts = std::move(g_find.texts);
+        g_find.want = false;
+        lk.unlock();
+        std::vector<FindHit> hits;
+        std::string err;
+        bool capped = false;
+        if (!q.empty()) {
+            try {
+                auto flags = std::regex::ECMAScript | std::regex::optimize;
+                std::regex re(q, ic ? flags | std::regex::icase : flags);
+                for (auto& t : texts) {
+                    for (auto it = std::sregex_iterator(t.second.begin(), t.second.end(), re),
+                              end = std::sregex_iterator(); it != end; ++it) {
+                        int b = (int)it->position(), n = (int)it->length();
+                        if (n <= 0) continue;   // zero-width match: nothing to highlight
+                        int e = b + n;
+                        // std::regex walks bytes: snap the ends onto UTF-8
+                        // boundaries so a hit can't slice a multibyte glyph
+                        while (b > 0 && ((unsigned char)t.second[b] & 0xC0) == 0x80) b--;
+                        while (e < (int)t.second.size() && ((unsigned char)t.second[e] & 0xC0) == 0x80) e++;
+                        hits.push_back({ t.first, b, e });
+                        if ((int)hits.size() >= kFindMaxHits) { capped = true; break; }
+                    }
+                    if (capped) break;
+                }
+            } catch (const std::regex_error& ex) { err = ex.what(); }
+        }
+        lk.lock();
+        if (!g_find.want) {   // a newer query landed while we matched: drop this one
+            g_find.hits = std::move(hits); g_find.err = std::move(err);
+            g_find.capped = capped; g_find.serial++;
+        }
+    }
+}
+
+static std::vector<FindHit> g_findHits;   // doc order: shape order, then offset
+static std::unordered_map<uint64_t, std::vector<std::pair<int, int>>> g_findRanges;   // id → ranges (highlights)
+static int          g_findCur = 0;        // index into g_findHits
+static uint64_t     g_findSeen = 0;       // worker serial the UI has adopted
+static std::string  g_findErr;            // pattern error ("" = the pattern compiles)
+static bool         g_findCapped = false;
+static bool         g_findActive = false; // panel is up → mark hits
+static bool         g_findWant = false;   // Ctrl+F pressed → open this frame
+static bool         g_findRefocus = false;// put the caret back in the query box
+static std::string  g_findQuery;          // the live pattern (what the box shows)
+static bool         g_findCase = false;   // "Aa": match case (default: ignore it)
+static std::string  g_findDispatched;     // pattern the worker was last handed
+static bool         g_findDispatchedCase = false;
+static const char*  kFindPopup = "find";
+
+// hand the current pattern + a text snapshot to the worker (main thread only)
+static void find_dispatch() {
+    std::lock_guard<std::mutex> lk(g_find.mx);
+    g_find.query = g_findQuery;
+    g_find.icase = !g_findCase;
+    g_find.texts.clear();
+    for (auto& s : g_doc.shapes)
+        if (s.type == SH_TEXT && !s.text.empty()) g_find.texts.emplace_back(s.id, s.text);
+    g_find.want = true;
+    if (!g_find.started) {   // one worker for the session; never joined (see above)
+        g_find.started = true;
+        g_findThread = std::thread(find_worker);
+        g_findThread.detach();
+    }
+    g_findDispatched = g_findQuery; g_findDispatchedCase = g_findCase;
+    g_find.cv.notify_one();
+}
+// drop hits that point into a document that is no longer loaded
+static void find_forget_hits() {
+    g_findHits.clear(); g_findRanges.clear(); g_findCur = 0;
+    g_findDispatched.clear(); g_findDispatchedCase = !g_findCase;   // → re-dispatch
+}
+
+// world-px width of text[b..e) at the shape's own size (layouts measure in
+// world units; the glyphs are only scaled up later)
+static float find_run_w(ImFont* f, float px, const std::string& t, int b, int e) {
+    ImGui::PushFont(f, px);
+    float w = ImGui::CalcTextSize(t.c_str() + b, t.c_str() + e).x;
+    ImGui::PopFont();
+    return w;
+}
+// fly the camera to hit i: pan only, unless the text would land unreadably
+// small — then zoom in to the readable floor, never out (the zoom you chose
+// stays yours)
+static void find_fly(int i) {
+    if (i < 0 || i >= (int)g_findHits.size()) return;
+    Shape* s = find_shape(g_findHits[i].id);
+    if (!s || s->type != SH_TEXT) return;
+    float px = text_px(*s);
+    static TextLayout lay;
+    layout_text(s->text, g_fonts[s->family], px, s->align, s->wrapW, lay);
+    ImFont* f = g_fonts[s->family];
+    ImVec2 mn(0, 0), mx(0, 0);
+    bool any = false;
+    for (int li = 0; li < (int)lay.lines.size(); li++) {
+        const TextLine& ln = lay.lines[li];
+        if (ln.e <= g_findHits[i].b || ln.b >= g_findHits[i].e) continue;
+        int sa = g_findHits[i].b > ln.b ? g_findHits[i].b : ln.b;
+        int sb = g_findHits[i].e < ln.we ? g_findHits[i].e : ln.we;
+        if (sb <= sa) continue;
+        ImVec2 a(ln.x + find_run_w(f, px, s->text, ln.b, sa), li * px);
+        ImVec2 b2(ln.x + find_run_w(f, px, s->text, ln.b, sb), (li + 1) * px);
+        if (!any) { mn = a; mx = b2; any = true; }
+        else { mn.x = fminf(mn.x, a.x); mn.y = fminf(mn.y, a.y);
+               mx.x = fmaxf(mx.x, b2.x); mx.y = fmaxf(mx.y, b2.y); }
+    }
+    if (!any) return;
+    ImVec2 wc = s->pos + (mn + mx) * 0.5f;
+    if (s->rot != 0.f) wc = rot_about(wc, shape_local_rect(*s).center(), s->rot);
+    float z = g_cam.zoom;
+    if (px * z < kFindLandPx) z = fminf(kFindLandPx / px, 4.f);
+    ImVec2 vpSize = ImGui::GetMainViewport()->Size;
+    // a touch above the middle: the find panel and the toolbox own the bottom
+    start_cam_anim(ImVec2(vpSize.x * 0.5f - wc.x * z, vpSize.y * 0.45f - wc.y * z), z);
+}
+static void find_step(int dir) {
+    int n = (int)g_findHits.size();
+    if (n <= 0) return;
+    g_findCur = ((g_findCur + dir) % n + n) % n;
+    find_fly(g_findCur);
+}
+// adopt a landed result (once per publish) — the camera flies to the first hit
+static void find_poll() {
+    std::vector<FindHit> hits; std::string err; bool capped;
+    {
+        std::lock_guard<std::mutex> lk(g_find.mx);
+        if (g_find.serial == g_findSeen) return;
+        g_findSeen = g_find.serial;
+        hits = g_find.hits; err = g_find.err; capped = g_find.capped;
+    }
+    g_findHits = std::move(hits);
+    g_findErr = std::move(err);
+    g_findCapped = capped;
+    g_findRanges.clear();
+    for (auto& h : g_findHits) g_findRanges[h.id].emplace_back(h.b, h.e);
+    g_findCur = 0;
+    find_fly(0);
+}
+
+// mark every hit under a text shape's glyphs — drawn right before them so it
+// reads as a marker streak (the current hit gets the ring)
+static void draw_find_hits(ImDrawList* dl, const Shape& s) {
+    if (!g_findActive) return;
+    if (!g_interactiveFrame) return;   // exports/copies carry no search marks
+    auto it = g_findRanges.find(s.id);
+    if (it == g_findRanges.end()) return;
+    float px = text_px(s);
+    static TextLayout lay;
+    layout_text(s.text, g_fonts[s.family], px, s.align, s.wrapW, lay);
+    ImFont* f = g_fonts[s.family];
+    ImVec2 ctr = shape_local_rect(s).center();
+    auto to_s = [&](ImVec2 p) {           // local text coords → screen
+        ImVec2 w = s.pos + p;
+        if (s.rot != 0.f) w = rot_about(w, ctr, s.rot);
+        return W2S(w);
+    };
+    const FindHit* cur = (g_findCur >= 0 && g_findCur < (int)g_findHits.size()) ? &g_findHits[g_findCur] : nullptr;
+    for (auto& r : it->second) {
+        bool isCur = cur && cur->id == s.id && cur->b == r.first && cur->e == r.second;
+        for (int li = 0; li < (int)lay.lines.size(); li++) {
+            const TextLine& ln = lay.lines[li];
+            if (ln.e <= r.first || ln.b >= r.second) continue;
+            int sa = r.first > ln.b ? r.first : ln.b;
+            int sb = r.second < ln.we ? r.second : ln.we;
+            if (sb <= sa) continue;
+            float x0 = ln.x + find_run_w(f, px, s.text, ln.b, sa);
+            float x1 = ln.x + find_run_w(f, px, s.text, ln.b, sb);
+            if (x1 <= x0) continue;
+            ImVec2 p0 = to_s(ImVec2(x0, li * px)),       p1 = to_s(ImVec2(x1, li * px));
+            ImVec2 p2 = to_s(ImVec2(x1, (li + 1) * px)), p3 = to_s(ImVec2(x0, (li + 1) * px));
+            dl->AddQuadFilled(p0, p1, p2, p3, isCur ? g_th.findHlCur : g_th.findHl);
+            if (isCur) dl->AddQuad(p0, p1, p2, p3, g_th.findEdge, fmaxf(1.f, 1.5f * g_cam.zoom));
+        }
+    }
+}
+
+// the find panel: a modal bar docked directly above the toolbox (16 px screen
+// margin + 36 px buttons + 2×8 px window padding own the very bottom edge)
+static void DrawFindPanel() {
+    g_findActive = ImGui::IsPopupOpen(kFindPopup);
+    if (g_findWant && !g_findActive) {
+        ImGui::OpenPopup(kFindPopup);
+        g_findRefocus = true;
+        g_findActive = true;
+        find_dispatch();   // fresh text snapshot: the board changed since last time
+    }
+    g_findWant = false;
+    if (!g_findActive) return;
+    if (g_findDispatched != g_findQuery || g_findDispatchedCase != g_findCase) find_dispatch();
+    find_poll();
+
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->Size.x * 0.5f, vp->Size.y - 76.f), ImGuiCond_Always, ImVec2(0.5f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg,
+                          g_darkMode ? ImVec4(0.f, 0.f, 0.f, 0.16f)   // enough to read as modal,
+                                     : ImVec4(0.f, 0.f, 0.f, 0.07f));  // not enough to hide the board
+    if (ImGui::BeginPopupModal(kFindPopup, nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                               ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove)) {
+        ImGuiIO& io = ImGui::GetIO();
+        ImVec4 dim = ImGui::ColorConvertU32ToFloat4(g_th.textDim);
+        ImGui::TextColored(dim, "find · regex · esc to close");
+        ImGui::Spacing();
+
+        bool esc = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) g_findRefocus = true;   // Ctrl+F again = back to the box
+        ImGui::SetNextItemWidth(300.f);
+        if (g_findRefocus) { ImGui::SetKeyboardFocusHere(); g_findRefocus = false; }
+        std::string typed = g_findQuery;   // esc dismisses, but imgui would also revert
+        ImGui::InputTextWithHint("##findq", "text or regex", &g_findQuery);
+        if (esc) {                         // the box to its focus-time text: keep what
+            g_findQuery = std::move(typed);   // you typed — Ctrl+F resumes on it
+            ImGui::CloseCurrentPopup();
+        }
+        bool enter = ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
+        bool back = io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_G, false);
+        bool fwd = enter || (io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_G, false));
+        if (back || fwd) { find_step(back ? -1 : 1); g_findRefocus = true; }
+
+        ImGui::SameLine();
+        ImGui::BeginDisabled(g_findHits.empty());
+        if (ImGui::Button("prev")) { find_step(-1); g_findRefocus = true; }
+        ImGui::SameLine();
+        if (ImGui::Button("next")) { find_step(1); g_findRefocus = true; }
+        ImGui::EndDisabled();
+        if (!g_findHits.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("Ctrl+G · Ctrl+Shift+G for the previous one");
+        ImGui::SameLine();
+        if (g_findCase) {   // "Aa" lit while it matches case
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::ColorConvertU32ToFloat4(g_th.accent));
+            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, 255));
+        }
+        if (ImGui::Button("Aa")) { g_findCase = !g_findCase; g_findRefocus = true; }
+        if (g_findCase) ImGui::PopStyleColor(2);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) ImGui::SetTooltip("match case");
+        ImGui::SameLine();
+
+        char cnt[48];
+        bool bad = !g_findErr.empty();
+        ImVec4 col = dim;
+        ImVec4 badCol = g_darkMode ? ImVec4(1.f, 0.45f, 0.45f, 1.f) : ImVec4(0.78f, 0.12f, 0.12f, 1.f);
+        if (bad) { snprintf(cnt, sizeof cnt, "bad regex"); col = badCol; }
+        else if (g_findQuery.empty()) snprintf(cnt, sizeof cnt, "type to search");
+        else if (g_findHits.empty())  snprintf(cnt, sizeof cnt, "no matches");
+        else                   snprintf(cnt, sizeof cnt, "%d / %d%s", g_findCur + 1,
+                                         (int)g_findHits.size(), g_findCapped ? "+" : "");
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(col, "%s", cnt);
+        ImGui::SameLine();
+        if (ImGui::Button("close")) ImGui::CloseCurrentPopup();
+        if (bad) {
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 420.f);
+            ImGui::TextColored(badCol, "%s", g_findErr.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleColor();
 }
 
 // ───────────────────────────── media / textures ────────────────────────────
@@ -2249,7 +2558,6 @@ static long long   g_budgetSampleUs = 0;        // last feedback sample
 static std::chrono::steady_clock::time_point g_budgetSampleT{};
 static std::unordered_set<uint64_t> g_activeVideos;   // ids decoding this frame
 static int           g_activeBudgetFrame = -1;        // frame the set was built for
-static bool          g_interactiveFrame = false;      // set by CanvasFrame, cleared by exports
 static std::mutex g_decMx;   // guards g_decoders itself (lock order: g_decMx → decoder.mx)
 
 // ── async decode (M4 "keep the UI thread pure") ──
@@ -3999,6 +4307,7 @@ static bool switch_board(const std::string& dirIn) {
     g_play.clear();
     g_extCache.clear();
     g_idIndex.clear();
+    find_forget_hits();   // hits point into a document that is being replaced
 #ifdef TEI_LIBAV
     audio_destroy_all();
     {   // invalidate in-flight decodes (gen bump) before touching the decoders
@@ -4470,7 +4779,7 @@ static void draw_doc_shapes(ImDrawList* dl, uint64_t skipId,
         case SH_TEXT: {
             float spx = text_px(s) * g_cam.zoom;
             bool interactive = s.id == g_editText || s.id == g_editLabelArrow || is_selected(s.id);
-            if (spx >= kTextGrayPx || interactive) { draw_text_shape(dl, s); break; }
+            if (spx >= kTextGrayPx || interactive) { draw_find_hits(dl, s); draw_text_shape(dl, s); break; }
             WRect gb = shape_bounds(s);
             float gw = W2S(gb.mx).x - W2S(gb.mn).x;
             bool label = gw >= kLabelMinW &&
@@ -6671,9 +6980,11 @@ static void CanvasFrame() {
         else hoverHandle = draw_selection_ui(dl, true);
     }
 
-    // ── keyboard ── (all off while editing text or the board picker is up;
-    // io.WantTextInput lags the editor's open by a frame, so gate on both)
-    if (!io.WantTextInput && !editing && !ImGui::IsPopupOpen("boards")) {
+    // ── keyboard ── (all off while editing text, or the board picker / find
+    // panel is up; io.WantTextInput lags the editor's open by a frame, so gate
+    // on both — the find panel keeps Ctrl+G for cycling, not grouping, while
+    // it is up)
+    if (!io.WantTextInput && !editing && !ImGui::IsPopupOpen("boards") && !ImGui::IsPopupOpen(kFindPopup)) {
         // single selected video: quick-control keys claim space/a/b/←→/,./m,
         // and the arrow keys stop nudging it (seeking wins)
         Shape* qv = nullptr;
@@ -6686,6 +6997,7 @@ static void CanvasFrame() {
             }
         }
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) g_pickerWant = true;
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F)) g_findWant = true;
         if (ImGui::IsKeyPressed(ImGuiKey_F3)) g_showProf = !g_showProf;   // prof overlay
         if (ImGui::IsKeyPressed(ImGuiKey_V)) g_tool = TOOL_SELECT;
         if (ImGui::IsKeyPressed(ImGuiKey_H)) g_tool = TOOL_HAND;
@@ -7284,6 +7596,9 @@ int main(int argc, char** argv) {
     float panY = 0.f;      // dev: shift camera Y per frame (profiling panning)
     float panTri = 0.f;    // dev: vertical triangle pan (down for the first half of the run, back up)
     bool noVsync = false;  // dev: --novsync — measure true frame cost, not the vblank wait
+    const char* findQuery = nullptr;   // dev: open find (Ctrl+F) on this pattern
+    int findStep = 0;                  // dev: cycle that many hits (negative = back) before the shot
+    int findEsc = -1;                  // dev: press esc (dismiss find) on this frame
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
         else if (!strcmp(argv[i], "--export") && i + 1 < argc) exportPng = argv[++i];
@@ -7313,6 +7628,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--pan-y") && i + 1 < argc) panY = strtof(argv[++i], nullptr);
         else if (!strcmp(argv[i], "--pan-t") && i + 1 < argc) panTri = strtof(argv[++i], nullptr);
         else if (!strcmp(argv[i], "--novsync")) noVsync = true;
+        else if (!strcmp(argv[i], "--find") && i + 1 < argc) findQuery = argv[++i];
+        else if (!strcmp(argv[i], "--find-step") && i + 1 < argc) findStep = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--find-esc") && i + 1 < argc) findEsc = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--play")) g_forcePlay = true;   // dev: play state persists headless (profiling)
         else if (!strcmp(argv[i], "--async-img")) g_forceAsyncImg = true;   // dev: async image path headless
         else if (!strcmp(argv[i], "--qk") && i + 2 < argc) {
@@ -7337,11 +7655,13 @@ int main(int argc, char** argv) {
     g_headless = headless;
     g_devHarness = g_profile || noVsync || panY != 0.f || panTri != 0.f || g_forcePlay ||
                    g_forceAsyncImg || dropPath || bsFrame >= 0 || enterFrame >= 0 ||
-                   caretIdx >= 0 || editId != 0 || selId != 0 || haveMarquee || forcePicker;
+                   caretIdx >= 0 || editId != 0 || selId != 0 || haveMarquee || forcePicker ||
+                   findQuery != nullptr;
     load_settings();
     if (boardArg.empty() && headless && !forcePicker) boardArg = "scratch";
     if (boardArg.empty() && !forcePicker && !g_recentBoards.empty()) boardArg = g_recentBoards[0];
     g_pickerWant = forcePicker;
+    if (findQuery) { g_findQuery = findQuery; g_findWant = true; }   // dev: shot the find panel
 
 #ifdef _WIN32
     ImGui_ImplWin32_EnableDpiAwareness();
@@ -7499,13 +7819,31 @@ int main(int argc, char** argv) {
         }
         for (auto& qe : qkEvs) {   // dev: scripted quick-video-control keys
             if (framesDone == qe.frame) {
-                if (qe.shift) io.AddKeyEvent(ImGuiKey_LeftShift, true);
-                io.AddKeyEvent(qe.key, true);
+                if (qe.shift) io.AddKeyEvent(ImGuiMod_Shift, true);   // the MOD key: io.KeyShift is
+                io.AddKeyEvent(qe.key, true);                         // derived from it, not LeftShift
             }
             if (framesDone == qe.frame + 1) {
                 io.AddKeyEvent(qe.key, false);
-                if (qe.shift) io.AddKeyEvent(ImGuiKey_LeftShift, false);
+                if (qe.shift) io.AddKeyEvent(ImGuiMod_Shift, false);
             }
+        }
+        if (findStep != 0 && findQuery) {   // dev: cycle the find hits before the shot
+            for (int k = 1; k <= (findStep < 0 ? -findStep : findStep); k++) {
+                if (framesDone == 40 + k * 2) {
+                    io.AddKeyEvent(ImGuiMod_Ctrl, true);
+                    if (findStep < 0) io.AddKeyEvent(ImGuiMod_Shift, true);
+                    io.AddKeyEvent(ImGuiKey_G, true);
+                }
+                if (framesDone == 41 + k * 2) {
+                    io.AddKeyEvent(ImGuiKey_G, false);
+                    io.AddKeyEvent(ImGuiMod_Ctrl, false);
+                    if (findStep < 0) io.AddKeyEvent(ImGuiMod_Shift, false);
+                }
+            }
+        }
+        if (findEsc >= 0 && findQuery) {   // dev: dismiss the find panel mid-run
+            if (framesDone == findEsc) io.AddKeyEvent(ImGuiKey_Escape, true);
+            if (framesDone == findEsc + 1) io.AddKeyEvent(ImGuiKey_Escape, false);
         }
         if (g_profile && g_profT0 == 0) { g_profStart = std::chrono::steady_clock::now(); g_profT0 = 1; }
         g_uiFrame.store((uint64_t)ImGui::GetFrameCount(), std::memory_order_relaxed);
@@ -7533,6 +7871,7 @@ int main(int argc, char** argv) {
         DrawStylePanel();
         DrawZoomPill();
         DrawBoardPicker();
+        DrawFindPanel();
         DrawProfOverlay();
         }
         sweep_play_states();
@@ -7614,6 +7953,13 @@ int main(int argc, char** argv) {
         if (g_profile && framesDone >= profFrames) { prof_print_summary(); done = true; }
     }
 
+    if (g_find.started) {   // detached thread: flag it and go (a runaway pattern
+        {                   // must not be able to hang the exit — see the section)
+            std::lock_guard<std::mutex> lk(g_find.mx);
+            g_find.quit = true;
+        }
+        g_find.cv.notify_one();
+    }
 #ifdef TEI_LIBAV
     audio_destroy_all();
     if (!g_vqWorkers.empty()) {

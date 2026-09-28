@@ -230,7 +230,11 @@ backspace-join, clipboard in/out, autosave + cross-session undo, dark/light,
 **style panel** (12 theme-aware palette indices · S/M/L/XL = 24/40/56/80 with
 M default · text align L/C/R · opacity 5–100%), zoom commands (Shift+1 fit /
 Shift+2 selection / Shift+0 100%) flying an ease-in-out-quart 0.28s camera
-(context-menu toggle, persisted), flip-model low-latency swapchain, **LLM
+(context-menu toggle, persisted), **find** (Ctrl+F: regex over every text
+shape, live marker highlights under the glyphs, camera flight to each hit,
+Ctrl+G / Ctrl+Shift+G cycle, esc or "close" dismisses; matching runs on a
+worker thread so a pathological pattern like "(a+)+b" — 54 s on 28 a's in
+libstdc++ — can never freeze the canvas), flip-model low-latency swapchain, **LLM
 export** (copy board/selection as PNG at 2× — offscreen render, clipboard PNG
 + CF_DIB — Ctrl+Shift+C or context menu; "copy as text" = reading-order
 outline with texts verbatim, media placeholders, group nesting, arrows as a

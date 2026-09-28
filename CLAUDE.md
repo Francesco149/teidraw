@@ -51,6 +51,13 @@ Draw tool (D): stroke fast → thinner ink (real pen pressure wins when a
 tablet reports it); shift+press chains a straight segment onto the LAST
 stroke, and toggling shift mid-drag flips straight/freehand — one shape.
 Strokes are baked ink: move/scale/rotate/delete, never reshape.
+Find (Ctrl+F): regex over every text shape, live as you type; every hit gets a
+marker streak under its glyphs and the current one a ring, the camera flies to
+it (pan only — it zooms in just enough when the text would land unreadable).
+Ctrl+G / Ctrl+Shift+G cycle while the panel is up (they group/ungroup when it
+is not), enter = next, esc or "close" dismisses and the query is remembered for
+the next Ctrl+F. Matching runs on a worker thread, latest query wins — a
+hand-typed pattern can backtrack for minutes and must never freeze the canvas.
 
 ## Layout
 - `editor/src/main.cpp` — the whole app, single TU (slopstudio pattern; split
@@ -80,6 +87,9 @@ nix develop --command make -C editor linux    # → build/teidraw (native SDL3)
 ./build/teidraw.exe scratch --shot build/shot.png --frames 8   # headless screenshot
 ./build/teidraw.exe dir --export out.png       # render board bounds → PNG, exit
 ./build/teidraw.exe dir --export-txt out.txt   # reading-order text outline, exit
+./build/teidraw.exe dir --find "tick" --find-step 1 --frames 600 --shot build/find.png
+                                               # find panel + marks (--find-step = Ctrl+G,
+                                               # negative = Ctrl+Shift+G, --find-esc F)
 ```
 
 **Deploy the two system-wide installs after every change under `editor/` or
