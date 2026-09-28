@@ -77,6 +77,8 @@ Pan with middle-drag, space+drag, right-*drag* (right-*click* = menu), or
 | `Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y` | undo / redo |
 | `Ctrl+C/X/V`, `Ctrl+D` | copy/cut/paste (shapes, PNGs, files, plain text), duplicate |
 | `Ctrl+G` / `Ctrl+Shift+G`, `Ctrl+A`, `Del` | group / ungroup, select all, delete |
+| `Ctrl+F` | find in every text shape — live regex, hits highlighted, camera flies to each |
+| in the find bar: `Ctrl+G` / `Ctrl+Shift+G` · `Enter` · `Esc` | next / previous match · next · close (those keys group/ungroup once it's closed) |
 | `[` `]` | send backward / bring forward |
 | `Shift+1` / `Shift+2` / `Shift+0` | zoom to fit / to selection / to 100% |
 | corner drag · ring just outside a corner | scale · rotate (`Shift` = 15° steps) |
