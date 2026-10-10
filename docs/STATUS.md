@@ -414,6 +414,20 @@ the load sanitizer, zeroed w/h re-derives from ink). A board corrupted by the
 pre-fix binary heals itself on open — the user's test2-remastered did (bad
 stroke lost, all other shapes intact; `.bak-corrupt-20260711` copies of the
 poisoned files left in the board dir).
+**Recurrence via the camera (fixed same session)**: the same −FLT_MAX
+pointer reached the WHEEL-zoom handler (a touchpad micro-scroll while typing,
+pointer outside the window on Wayland — no click needed, so no capture guard
+ran). ZoomAt pivoted on the sentinel: `pivot * factor` is already > FLT_MAX,
+so ONE tick overflowed g_cam.pan to ±inf, the view went blank (screen coords
+±inf), and the autosave wrote `"cam":{"x":null,"y":null}` — which then threw
+type_error.302 on every boot (the SH_DRAW loader was null-tolerant, the cam
+restore used j.value() and was not). The undo journal caught the first
+poisoned frame: a single micro tick (z 1.0 → 1.0000001) with both pans null.
+Guards now: `pt_ok` (shared with draw_pt_ok) rejects invalid pivots in ZoomAt
+and garbage MouseDeltas in the pan drags, the cam serializer never writes a
+non-finite number, and the cam restore reads tolerantly (null/negative/over-
+range zoom → sane default). `operation-slopsmith` unbricked: cam nulls
+hand-repaired to 0,0; the fixed binary opens it and re-renders all 7 shapes.
 
 Session-10 = **the Linux port (M5)**. SDL3 + SDL_Renderer (imgui's
 sdlrenderer3 backend has the 1.92 dynamic-font support) behind `#ifdef _WIN32`

@@ -526,14 +526,25 @@ static Camera g_cam;
 static ImVec2 W2S(ImVec2 w) { return ImVec2(w.x * g_cam.zoom + g_cam.pan.x, w.y * g_cam.zoom + g_cam.pan.y); }
 static ImVec2 S2W(ImVec2 s) { return ImVec2((s.x - g_cam.pan.x) / g_cam.zoom, (s.y - g_cam.pan.y) / g_cam.zoom); }
 
+// finite, non-sentinel point. imgui reports the pointer as (-FLT_MAX,-FLT_MAX)
+// whenever it is "not in the window" (pointer leave, Wayland focus transitions
+// — a touchpad scroll while typing reaches the wheel handler with exactly this
+// pos), and comparisons also reject NaN. One ZoomAt pivoted on the sentinel
+// overflows the pan to ±inf (pivot*factor already exceeds FLT_MAX), which
+// blanks the view and — since nlohmann dumps non-finite floats as null —
+// bricks the board file on the next load.
+static bool pt_ok(ImVec2 v) { return fabsf(v.x) < 1e30f && fabsf(v.y) < 1e30f; }
+
 // short eased camera flights for the zoom commands (wheel/pan stay immediate
 // and cancel any flight in progress — direct input always wins)
 struct CamAnim { bool active = false; double t0 = 0; ImVec2 pan0, pan1; float z0 = 1, z1 = 1; };
 static CamAnim g_camAnim;
 
 static void ZoomAt(ImVec2 pivot, float factor) {
+    if (!pt_ok(pivot)) return;                 // sentinel/NaN pivot = the inf-pan brick path
     g_camAnim.active = false;
     float z = g_cam.zoom * factor;
+    if (!(fabsf(z) < 1e30f)) return;           // garbage factor (inf/NaN wheel) must not stick
     z = z < 0.02f ? 0.02f : (z > 64.f ? 64.f : z);
     factor = z / g_cam.zoom;
     g_cam.pan.x = pivot.x - (pivot.x - g_cam.pan.x) * factor;
@@ -684,7 +695,7 @@ static float draw_radius(const Shape& s, float p) { return draw_width(s) * 0.5f 
 // whole stroke through draw_recalc_bounds' renormalization (inf − inf), and
 // nlohmann serializes NaN as null, corrupting the board file. Capture guards
 // with this, and the (de)serializers below never trust a stroke number.
-static bool draw_pt_ok(ImVec2 v) { return fabsf(v.x) < 1e30f && fabsf(v.y) < 1e30f; }
+static bool draw_pt_ok(ImVec2 v) { return pt_ok(v); }
 
 // list lines ("• foo", "12. foo", optionally indented) pin to the left edge
 // even when the text block is centered/right-aligned
@@ -1189,7 +1200,11 @@ static bool g_settingsFromFile = false;   // %APPDATA% settings.json existed at 
 static std::string doc_to_json_string() {
     json j;
     j["v"] = 2; j["nextId"] = g_doc.nextId;
-    j["cam"] = { {"x", g_cam.pan.x}, {"y", g_cam.pan.y}, {"z", g_cam.zoom} };
+    // non-finite backstop (same NaN/inf→null trap as SH_DRAW below): a poisoned
+    // camera must never reach the file — a null where a number belongs makes
+    // the NEXT load throw and the board unopenable
+    auto fin = [](float v, float def) { return fabsf(v) < 1e30f ? v : def; };
+    j["cam"] = { {"x", fin(g_cam.pan.x, 0.f)}, {"y", fin(g_cam.pan.y, 0.f)}, {"z", fin(g_cam.zoom, 1.f)} };
     json arr = json::array();
     for (auto& s : g_doc.shapes) arr.push_back(shape_to_json(s));
     j["shapes"] = std::move(arr);
@@ -1239,15 +1254,27 @@ static bool doc_from_json_string(const std::string& str, bool restoreCam) {
         float r;
         if (members_common_rot(s.id, &r) && fabsf(r) > 0.0001f) s.rot = r;
     }
-    if (restoreCam && j.contains("cam")) {
-        g_cam.pan = ImVec2(j["cam"].value("x", 0.f), j["cam"].value("y", 0.f));
-        g_cam.zoom = j["cam"].value("z", 1.f);
+    if (restoreCam && j.contains("cam") && j["cam"].is_object()) {
+        // tolerant read, same contract as SH_DRAW's: j.value() THROWS on a
+        // present-but-null key, and boards written by the pre-fix inf-pan bug
+        // (or hand edits) carry "cam":{"x":null,…} — that must load at the
+        // default camera, not abort the app at boot
+        const json& c = j["cam"];
+        auto num = [&](const char* k, float def) {
+            auto it = c.find(k);
+            return it != c.end() && it->is_number() ? (float)*it : def;
+        };
+        g_cam.pan = ImVec2(num("x", 0.f), num("y", 0.f));
+        float z = num("z", 1.f);
+        g_cam.zoom = z < 0.02f ? 0.02f : (z > 64.f ? 64.f : z);   // same range ZoomAt enforces
     }
+    if (restoreCam) g_camAnim.active = false;   // a stale flight must not overwrite the loaded camera
     // theme prefs are global now (%APPDATA% settings.json); boards written
     // before that still carry them — adopt once when no settings file exists
     if (restoreCam && !g_settingsFromFile) {
-        if (j.contains("dark")) g_darkMode = j["dark"];
-        g_zoomAnim = j.value("zoomAnim", true);
+        if (j.contains("dark") && j["dark"].is_boolean()) g_darkMode = j["dark"];
+        auto za = j.find("zoomAnim");
+        if (za != j.end() && za->is_boolean()) g_zoomAnim = *za;
     }
     // drop selection entries that no longer exist
     std::vector<uint64_t> keep;
@@ -7125,14 +7152,14 @@ static void CanvasFrame() {
         (altPan && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.f)) ||
         (handActive && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.f))) {
         g_camAnim.active = false;
-        g_cam.pan = g_cam.pan + io.MouseDelta;
+        if (pt_ok(io.MouseDelta)) g_cam.pan = g_cam.pan + io.MouseDelta;   // focus regain can report a garbage delta
         return;
     }
     if (handActive) return;
 
     // ── right button: drag = pan, click = context menu ──
     if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !uiHot) g_rDrag = false;
-    if (ImGui::IsMouseDragging(ImGuiMouseButton_Right, 4.f)) { g_camAnim.active = false; g_cam.pan = g_cam.pan + io.MouseDelta; g_rDrag = true; }
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Right, 4.f)) { g_camAnim.active = false; if (pt_ok(io.MouseDelta)) g_cam.pan = g_cam.pan + io.MouseDelta; g_rDrag = true; }
     if (ImGui::IsMouseReleased(ImGuiMouseButton_Right) && !g_rDrag && !uiHot) {
         uint64_t leaf = hit_test(mw);
         uint64_t target = resolve_target(leaf);
